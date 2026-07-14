@@ -8,7 +8,8 @@ version = "0.2.0"
 description = "Mathematically perfect knowledge base local manager"
 readme = "README.md"
 requires-python = ">=3.8"
-license = {text = "CC0-1.0"}
+license = "CC0-1.0"
+license-files = ["LICENSE"]
 authors = [
     {name = "M. François-Xavier 'Doc FX' Briollais"},
 ]
@@ -27,7 +28,6 @@ keywords = [
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: End Users/Desktop",
-    "License :: CC0 1.0 Universal (CC0 1.0) Public Domain Dedication",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.8",
