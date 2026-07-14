@@ -1,0 +1,87 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "knowledge-base-builder"
+version = "0.2.0"
+description = "Mathematically perfect knowledge base local manager"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "CC0-1.0"}
+authors = [
+    {name = "M. François-Xavier 'Doc FX' Briollais"},
+]
+keywords = [
+    "internet-archive",
+    "wikipedia",
+    "zim",
+    "openzim",
+    "knowledge-base",
+    "offline",
+    "sync",
+    "cli",
+    "usb",
+    "wikimedia",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: End Users/Desktop",
+    "License :: CC0 1.0 Universal (CC0 1.0) Public Domain Dedication",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Internet :: WWW/HTTP",
+    "Topic :: System :: Archiving",
+    "Topic :: Utilities",
+]
+dependencies = [
+    "internetarchive[speedups]>=3.0.0",
+    "typer>=0.9.0",
+    "rich>=13.0.0",
+    "requests>=2.28.0",
+    "libzim>=3.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "black>=23.0.0",
+    "isort>=5.12.0",
+    "mypy>=1.0.0",
+    "build>=0.10.0",
+    "twine>=4.0.0",
+    "tomli>=2.0.0; python_version<'3.11'",
+]
+
+[project.urls]
+Homepage = "https://github.com/realdocfx/knowledge_base_builder"
+Repository = "https://github.com/realdocfx/knowledge_base_builder"
+Issues = "https://github.com/realdocfx/knowledge_base_builder/issues"
+Changelog = "https://github.com/realdocfx/knowledge_base_builder/releases"
+
+[project.scripts]
+kb-builder = "knowledge_base_builder.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.black]
+line-length = 88
+target-version = ['py38']
+
+[tool.isort]
+profile = "black"
+line_length = 88
+
+[tool.mypy]
+python_version = "3.8"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true

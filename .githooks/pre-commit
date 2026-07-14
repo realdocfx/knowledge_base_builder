@@ -1,0 +1,35 @@
+#!/usr/bin/env python
+"""Pre-commit hook: keep version in sync and run the test suite."""
+
+import subprocess
+import sys
+from pathlib import Path
+
+
+def run(command, cwd=None):
+    """Run a command and exit non-zero on failure."""
+    print(f"[pre-commit] {' '.join(command)}")
+    try:
+        subprocess.run(command, cwd=cwd, check=True)
+    except subprocess.CalledProcessError as exc:
+        print(f"[pre-commit] Failed: {' '.join(command)}")
+        raise SystemExit(exc.returncode)
+
+
+def main() -> int:
+    repo_root = Path(__file__).resolve().parent.parent
+
+    # Keep __init__.py version in sync with pyproject.toml
+    run([sys.executable, "scripts/sync_version.py"], cwd=repo_root)
+
+    # Stage the possibly updated __init__.py so the commit includes it
+    run(["git", "add", "src/knowledge_base_builder/__init__.py"], cwd=repo_root)
+
+    # Run the test suite
+    run([sys.executable, "-m", "pytest"], cwd=repo_root)
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
