@@ -4,7 +4,7 @@ import os
 import shutil
 import tempfile
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
 from datetime import datetime
 
 from ..base import BaseBucket
@@ -16,6 +16,7 @@ class ZimBucket(BaseBucket):
     ZIM_MAGIC_NUMBER = 72173914
     STATE_DIR = ".kb_state"
     CHUNK_SIZE = 8192
+    FAT32_CHUNK_LIMIT = 3900 * 1024 * 1024
 
     def __init__(self, target_path: str):
         super().__init__(target_path)
@@ -36,6 +37,7 @@ class ZimBucket(BaseBucket):
                 "total_downloaded_bytes": 0,
                 "bucket_version": "0.2.0",
                 "chunks": {},
+                "splits": {},
             }
             with open(self.state_file, 'w') as f:
                 json.dump(initial_state, f, indent=2)
@@ -167,64 +169,62 @@ class ZimBucket(BaseBucket):
         }
 
     def write_and_verify_zim(self, identifier: str, response_stream, total_size: int) -> Dict[str, Any]:
-        """Streams a massive ZIM payload to disk with real-time MD5 computation."""
+        """Streams a massive ZIM payload to disk with real-time MD5 computation.
+
+        On non-FAT32 targets the ZIM is written as a single ``<identifier>.zim``
+        file. On FAT32 targets with payloads larger than 4 GB, the stream is
+        dynamically split into Kiwix-compatible slices (``.zimaa``, ``.zimab``,
+        etc.) of at most ``FAT32_CHUNK_LIMIT`` bytes while preserving one
+        continuous MD5 hash across all slices for final verification.
+        """
         target_file = self.root / f"{identifier}.zim"
         temp_file = self.root / f".{identifier}.zim.part"
-
-        hasher = hashlib.md5()
-        bytes_written = 0
-        embedded_checksum: bytes = b""
-
-        # Check file system limitations for ZIM (commonly > 4GB)
-        self._warn_filesystem_limit(target_file, total_size)
+        fat32_mode = self._detect_fat32_mode(target_file, total_size)
 
         state = self.get_state()
         chunks = state.get("chunks", {})
+        splits = state.get("splits", {})
+        hasher = hashlib.md5()
+
+        if fat32_mode:
+            return self._write_and_verify_split(
+                identifier, response_stream, total_size, state, chunks, splits, hasher
+            )
+
+        # --- single-file (non-FAT32) path ---
+        bytes_written = 0
+        progress_interval = 100 * 1024 * 1024
+        last_printed = 0
         offset = chunks.get(identifier, 0)
 
         if offset > 0 and temp_file.exists():
             bytes_written = temp_file.stat().st_size
-            # Recompute hash from existing partial file
-            with open(temp_file, "rb") as existing:
-                while True:
-                    chunk = existing.read(self.CHUNK_SIZE)
-                    if not chunk:
-                        break
-                    if bytes_written <= total_size - 16:
-                        hasher.update(chunk)
-                    else:
-                        overlap = bytes_written - (total_size - 16)
-                        valid_payload = chunk[:-overlap]
-                        hasher.update(valid_payload)
-            # If already complete, we can skip download
+            bytes_written = self._hash_file(hasher, temp_file, 0, total_size)
             if bytes_written >= total_size:
                 return self._verify_and_finalize(temp_file, target_file, hasher, total_size)
 
-        headers = {"Range": f"bytes={bytes_written}-"} if offset > 0 else {}
-        if offset > 0:
+        headers = {"Range": f"bytes={bytes_written}-"} if bytes_written > 0 else {}
+        if headers:
             response_stream = self._reopen_stream(response_stream.url, headers)
 
-        with open(temp_file, 'ab' if offset > 0 else 'wb') as f:
+        with open(temp_file, 'ab' if bytes_written > 0 else 'wb') as f:
             for chunk in response_stream.iter_content(chunk_size=self.CHUNK_SIZE):
                 if chunk:
                     f.write(chunk)
-                    bytes_written += len(chunk)
+                    bytes_written = self._update_hash(hasher, chunk, bytes_written, total_size)
 
-                    # Update chunk offset in state for resume
                     if bytes_written % (self.CHUNK_SIZE * 128) == 0:
                         chunks[identifier] = bytes_written
                         state["chunks"] = chunks
                         self.update_state(state)
 
-                    # Hash payload, excluding the final 16 bytes
-                    if bytes_written <= total_size - 16:
-                        hasher.update(chunk)
-                    else:
-                        overlap = bytes_written - (total_size - 16)
-                        valid_payload = chunk[:-overlap]
-                        hasher.update(valid_payload)
+                    if total_size and bytes_written - last_printed >= progress_interval:
+                        print(
+                            f"  {identifier}: {bytes_written / (1024 * 1024 * 1024):.2f} GB / "
+                            f"{total_size / (1024 * 1024 * 1024):.2f} GB"
+                        )
+                        last_printed = bytes_written
 
-        # Remove chunk tracking on completion
         if identifier in chunks:
             del chunks[identifier]
             state["chunks"] = chunks
@@ -232,8 +232,136 @@ class ZimBucket(BaseBucket):
 
         return self._verify_and_finalize(temp_file, target_file, hasher, total_size)
 
+    def _write_and_verify_split(
+        self,
+        identifier: str,
+        response_stream,
+        total_size: int,
+        state: Dict[str, Any],
+        chunks: Dict[str, int],
+        splits: Dict[str, Any],
+        hasher,
+    ) -> Dict[str, Any]:
+        """Split-aware streaming, resume and verification path for FAT32."""
+        slice_offsets, current_slice, active_size, bytes_written = self._get_split_progress(
+            identifier, total_size, splits
+        )
+        progress_interval = 100 * 1024 * 1024
+        last_printed = 0
+
+        # Restore cryptographic state from completed slices and active partial.
+        for i in range(len(slice_offsets)):
+            self._hash_file(
+                hasher,
+                self._slice_temp_path(identifier, i),
+                sum(slice_offsets[:i]),
+                total_size,
+            )
+
+        active_path = self._slice_temp_path(identifier, current_slice)
+        if active_size > 0:
+            self._hash_file(hasher, active_path, bytes_written - active_size, total_size)
+
+        if bytes_written >= total_size:
+            return self._verify_and_finalize_split(identifier, current_slice, hasher, total_size)
+
+        # If the active slice already hit the chunk limit but the download was
+        # interrupted before state could be advanced, rotate now.
+        if active_size >= self.FAT32_CHUNK_LIMIT and bytes_written < total_size:
+            slice_offsets.append(active_size)
+            current_slice += 1
+            active_size = 0
+            active_path = self._slice_temp_path(identifier, current_slice)
+
+        headers = {"Range": f"bytes={bytes_written}-"} if bytes_written > 0 else {}
+        if headers:
+            response_stream = self._reopen_stream(response_stream.url, headers)
+
+        current_file = open(active_path, 'ab' if active_size > 0 else 'wb')
+        slice_bytes = active_size
+        try:
+            for chunk in response_stream.iter_content(chunk_size=self.CHUNK_SIZE):
+                if not chunk:
+                    continue
+                while chunk:
+                    room = self.FAT32_CHUNK_LIMIT - slice_bytes
+                    if room <= 0:
+                        # Active slice hit the limit; rotate before writing more.
+                        current_file.close()
+                        slice_offsets.append(slice_bytes)
+                        current_slice += 1
+                        splits[identifier] = {
+                            "slice_offsets": slice_offsets,
+                            "current_slice": current_slice,
+                        }
+                        chunks[identifier] = bytes_written
+                        state["splits"] = splits
+                        state["chunks"] = chunks
+                        self.update_state(state)
+
+                        slice_bytes = 0
+                        active_path = self._slice_temp_path(identifier, current_slice)
+                        current_file = open(active_path, 'wb')
+                        room = self.FAT32_CHUNK_LIMIT
+
+                    to_write = chunk[:room]
+                    current_file.write(to_write)
+                    written = len(to_write)
+                    slice_bytes += written
+                    bytes_written = self._update_hash(hasher, to_write, bytes_written, total_size)
+                    chunk = chunk[written:]
+
+                    if total_size and bytes_written - last_printed >= progress_interval:
+                        print(
+                            f"  {identifier}: {bytes_written / (1024 * 1024 * 1024):.2f} GB / "
+                            f"{total_size / (1024 * 1024 * 1024):.2f} GB"
+                        )
+                        last_printed = bytes_written
+                        # Periodic state flush so a failure never loses >100 MB of progress.
+                        splits[identifier] = {
+                            "slice_offsets": slice_offsets,
+                            "current_slice": current_slice,
+                        }
+                        chunks[identifier] = bytes_written
+                        state["splits"] = splits
+                        state["chunks"] = chunks
+                        self.update_state(state)
+
+                    if slice_bytes >= self.FAT32_CHUNK_LIMIT and bytes_written < total_size:
+                        current_file.close()
+                        slice_offsets.append(slice_bytes)
+                        current_slice += 1
+                        splits[identifier] = {
+                            "slice_offsets": slice_offsets,
+                            "current_slice": current_slice,
+                        }
+                        chunks[identifier] = bytes_written
+                        state["splits"] = splits
+                        state["chunks"] = chunks
+                        self.update_state(state)
+
+                        slice_bytes = 0
+                        active_path = self._slice_temp_path(identifier, current_slice)
+                        current_file = open(active_path, 'wb')
+
+            current_file.close()
+        except Exception:
+            current_file.close()
+            raise
+
+        splits[identifier] = {
+            "slice_offsets": slice_offsets,
+            "current_slice": current_slice,
+        }
+        chunks[identifier] = bytes_written
+        state["splits"] = splits
+        state["chunks"] = chunks
+        self.update_state(state)
+
+        return self._verify_and_finalize_split(identifier, current_slice, hasher, total_size)
+
     def _verify_and_finalize(self, temp_file: Path, target_file: Path, hasher, total_size: int) -> Dict[str, Any]:
-        """Extract embedded checksum and atomically rename the ZIM file."""
+        """Extract embedded checksum and atomically rename a single ZIM file."""
         with open(temp_file, 'rb') as f:
             f.seek(-16, os.SEEK_END)
             embedded_checksum = f.read()
@@ -242,7 +370,6 @@ class ZimBucket(BaseBucket):
             temp_file.unlink()
             raise RuntimeError("Cryptographic validation failed: ZIM payload corrupted.")
 
-        # Validate ZIM magic number
         with open(temp_file, 'rb') as f:
             magic = int.from_bytes(f.read(4), byteorder='little')
             if magic != self.ZIM_MAGIC_NUMBER:
@@ -256,39 +383,142 @@ class ZimBucket(BaseBucket):
             "checksum": hasher.hexdigest(),
         }
 
-    def _warn_filesystem_limit(self, target_file: Path, total_size: int) -> None:
-        """Warn about filesystem limitations before downloading large ZIM files."""
-        if total_size > 4 * 1024 * 1024 * 1024:
-            # FAT32 has a 4GB file size limit
-            # Best-effort check: if the drive is likely FAT32 based on volume label
-            drive = target_file.anchor
-            if drive:
-                try:
-                    import ctypes
-                    # Windows-specific FAT32 detection
-                    fs_type = ctypes.create_string_buffer(256)
-                    ctypes.windll.kernel32.GetVolumeInformationA(
-                        drive.encode(),
-                        None,
-                        0,
-                        None,
-                        None,
-                        None,
-                        fs_type,
-                        256,
-                    )
-                    if b"FAT32" in fs_type.value:
-                        raise OSError(
-                            "FAT32 filesystem detected. ZIM files exceed 4GB limit. "
-                            "Use exFAT or NTFS for this target."
-                        )
-                except Exception:
-                    pass
+    def _verify_and_finalize_split(
+        self, identifier: str, last_slice: int, hasher, total_size: int
+    ) -> Dict[str, Any]:
+        """Validate and finalize Kiwix-compatible split ZIM slices."""
+        first_temp = self._slice_temp_path(identifier, 0)
+        with open(first_temp, 'rb') as f:
+            magic = int.from_bytes(f.read(4), byteorder='little')
+        if magic != self.ZIM_MAGIC_NUMBER:
+            self._cleanup_split_temps(identifier, last_slice)
+            raise ValueError(f"Invalid ZIM header detected. Expected {self.ZIM_MAGIC_NUMBER}, got {magic}.")
+
+        last_temp = self._slice_temp_path(identifier, last_slice)
+        with open(last_temp, 'rb') as f:
+            f.seek(-16, os.SEEK_END)
+            embedded_checksum = f.read()
+
+        if hasher.digest() != embedded_checksum:
+            self._cleanup_split_temps(identifier, last_slice)
+            raise RuntimeError("Cryptographic validation failed: ZIM payload corrupted.")
+
+        for i in range(last_slice + 1):
+            temp = self._slice_temp_path(identifier, i)
+            final = self._slice_final_path(identifier, i)
+            if temp.exists():
+                os.replace(temp, final)
+
+        # Remove transient split state for this identifier.
+        state = self.get_state()
+        if identifier in state.get("chunks", {}):
+            del state["chunks"][identifier]
+        if identifier in state.get("splits", {}):
+            del state["splits"][identifier]
+        self.update_state(state)
+
+        return {
+            "status": "verified",
+            "bytes_written": total_size,
+            "checksum": hasher.hexdigest(),
+        }
+
+    def _cleanup_split_temps(self, identifier: str, last_slice: int) -> None:
+        """Remove temporary split files after a verification failure."""
+        for i in range(last_slice + 1):
+            p = self._slice_temp_path(identifier, i)
+            if p.exists():
+                p.unlink()
+
+    def _detect_fat32_mode(self, target_file: Path, total_size: int) -> bool:
+        """Return True when the target filesystem is FAT32 and the payload > 4 GB."""
+        if total_size <= 4 * 1024 * 1024 * 1024:
+            return False
+        drive = target_file.anchor
+        if not drive:
+            return False
+        try:
+            import ctypes
+            fs_type = ctypes.create_string_buffer(256)
+            ctypes.windll.kernel32.GetVolumeInformationA(
+                drive.encode(),
+                None,
+                0,
+                None,
+                None,
+                None,
+                fs_type,
+                256,
+            )
+            return b"FAT32" in fs_type.value
+        except Exception:
+            return False
+
+    def _get_split_progress(
+        self, identifier: str, total_size: int, splits: Dict[str, Any]
+    ) -> tuple:
+        """Return (slice_offsets, current_slice, active_size, total_bytes) from state + disk."""
+        split_state = splits.get(identifier, {})
+        slice_offsets: List[int] = list(split_state.get("slice_offsets", []))
+        current_slice: int = split_state.get("current_slice", 0)
+
+        verified: List[int] = []
+        for i, off in enumerate(slice_offsets):
+            p = self._slice_temp_path(identifier, i)
+            if p.exists() and p.stat().st_size == off:
+                verified.append(off)
+            else:
+                current_slice = i
+                break
+        slice_offsets = verified
+
+        active_path = self._slice_temp_path(identifier, current_slice)
+        active_size = active_path.stat().st_size if active_path.exists() else 0
+        total_bytes = sum(slice_offsets) + active_size
+        return slice_offsets, current_slice, active_size, total_bytes
+
+    @staticmethod
+    def _slice_suffix(index: int) -> str:
+        """Alphabetical slice suffix: aa, ab, ..., az, ba, bb, ..."""
+        return f"{chr(ord('a') + index // 26)}{chr(ord('a') + index % 26)}"
+
+    def _slice_temp_path(self, identifier: str, index: int) -> Path:
+        return self.root / f".{identifier}.zim{self._slice_suffix(index)}.part"
+
+    def _slice_final_path(self, identifier: str, index: int) -> Path:
+        return self.root / f"{identifier}.zim{self._slice_suffix(index)}"
+
+    def _hash_file(self, hasher, path: Path, bytes_before: int, total_size: int) -> int:
+        """Re-hash the contents of *path*, excluding the ZIM checksum region."""
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(self.CHUNK_SIZE)
+                if not chunk:
+                    break
+                bytes_before = self._update_hash(hasher, chunk, bytes_before, total_size)
+        return bytes_before
+
+    @staticmethod
+    def _update_hash(hasher, chunk: bytes, bytes_before: int, total_size: int) -> int:
+        """Update the MD5 hasher with *chunk*, excluding the final 16 checksum bytes."""
+        checksum_start = total_size - 16
+        bytes_after = bytes_before + len(chunk)
+
+        if bytes_after <= checksum_start:
+            hasher.update(chunk)
+        elif bytes_before >= checksum_start:
+            pass
+        else:
+            valid = checksum_start - bytes_before
+            hasher.update(chunk[:valid])
+
+        return bytes_after
 
     def _reopen_stream(self, url: str, headers: Dict[str, str]):
         """Reopen an HTTP stream with Range headers for resume support."""
         import requests
-        return requests.get(url, headers=headers, stream=True, timeout=30)
+        # (connect timeout, read timeout) to tolerate slow spiky Kiwix mirrors
+        return requests.get(url, headers=headers, stream=True, timeout=(30, 300))
 
     @staticmethod
     def _format_bytes(bytes_count: int) -> str:

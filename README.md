@@ -113,7 +113,49 @@ kb-builder estimate wiki "en:wikipedia"
 kb-builder estimate wiki "fr:wiktionary"
 ```
 
-> **Warning:** Wikipedia ZIM files can exceed 100GB. The CLI will warn about filesystem limitations (e.g., FAT32's 4GB file size limit) before initiating large downloads.
+> **Note:** Wikipedia ZIM files can exceed 100GB. On FAT32 targets, large ZIMs are automatically split into Kiwix-compatible slices (`.zimaa`, `.zimab`, etc.) so the 4GB file limit is never exceeded.
+
+### 6. Bulk Download Kiwix ZIMs with Prioritization
+
+The `wiki_orchestrator` module fetches the Kiwix OPDS catalog, scores ZIMs by Vital Articles topic priority, and downloads them one at a time through a staging directory.
+
+Create a JSON config:
+
+```json
+{
+  "stage_dir": "C:\\kb_stage",
+  "final_dir": "D:\\",
+  "languages": ["en", "fr", "es"],
+  "full_flavour": "nopic",
+  "full_image": false,
+  "allow_mini": true
+}
+```
+
+Run a dry-run to preview the queue:
+
+```bash
+python -m knowledge_base_builder.wiki_orchestrator --config kiwix_config.json --dry-run
+```
+
+Run the actual download:
+
+```bash
+python -m knowledge_base_builder.wiki_orchestrator --config kiwix_config.json
+```
+
+Resume after an interruption or retry previously failed items (e.g., after reformatting `D:` to exFAT):
+
+```bash
+python -m knowledge_base_builder.wiki_orchestrator --config kiwix_config.json --retry-failed
+```
+
+The orchestrator:
+- Downloads most ZIMs to `stage_dir`, verifies them, then moves them to `final_dir` and deletes the staged copy.
+- On FAT32 `final_dir`s, large ZIMs are written directly to `final_dir` as Kiwix-compatible split slices (`.zimaa`, `.zimab`, etc.) so the 4 GB file limit is never exceeded.
+- Splits are verified with a single continuous MD5 hash across every slice and resume from the last completed slice using HTTP `Range` requests.
+- Skips any topic whose base identifier already exists in `final_dir`, even if the catalog now lists a newer dated version.
+- Persists completed/failed state in `<stage_dir>/.kiwix_processed.json`.
 
 **Note:** The pull command uses military-grade retry logic with exponential backoff by default, ensuring reliable downloads even under adverse network conditions. It also features graceful mission abort protection - press `Ctrl+C` at any time to cleanly stop the operation while preserving all downloaded items in the state file.
 
@@ -131,6 +173,7 @@ kb-builder stats /path/to/usb/drive
 | `search` | Search a backend catalog (`ia` or `wiki`) |
 | `estimate` | Estimate download size for a backend query |
 | `pull` | Synchronize items from a backend (`ia` or `wiki`) |
+| `pull-kiwix` | Download a single Kiwix ZIM by direct URL |
 | `stats` | Show bucket statistics and sync status |
 | `configure` | Configure backend credentials |
 

@@ -7,6 +7,9 @@ This document provides comprehensive API documentation for the Knowledge-Base-Bu
 - [Module Overview](#module-overview)
 - [UsbBucket Class](#usb-bucket-class)
 - [ArchiveEngine Class](#archive-engine-class)
+- [ZimBucket Class](#zimbucket-class)
+- [WikipediaEngine Class](#wikipediaengine-class)
+- [wiki_orchestrator Module](#wiki_orchestrator-module)
 - [CLI Commands](#cli-commands)
 - [State File Schema](#state-file-schema)
 - [Error Codes](#error-codes)
@@ -62,6 +65,20 @@ from knowledge_base_builder import UsbBucket, ZimBucket, ArchiveEngine, Wikipedi
 
 **Main Object**:
 - `app`: Typer application instance
+
+### Module: `knowledge_base_builder.wiki_orchestrator`
+
+**Purpose**: Prioritized, resume-friendly bulk download orchestration for Kiwix Wikipedia ZIM files.
+
+**Classes**:
+- `VitalArticlesIndex`: Topic-level Vital Article scoring for ZIM prioritization
+- `ProximityScorer`: Alternating nearest/furthest topic coverage selector
+- `KiwixCatalog`: Parser for the Kiwix OPDS catalog
+- `KiwixQueue`: Builder for the prioritized download queue
+- `ZimDownloader`: Stage -> verify -> move downloader
+
+**Functions**:
+- `run(config: dict, dry_run: bool, retry_failed: bool) -> None`
 
 ## UsbBucket Class
 
@@ -597,6 +614,104 @@ formatted = ArchiveEngine._format_bytes(1024 * 1024 * 1024)
 print(formatted)  # "1.0 GB"
 ```
 
+## ZimBucket Class
+
+Monolithic ZIM binary storage with resume, checksum validation, and ZIM magic number verification.
+
+On FAT32 targets, `write_and_verify_zim` automatically splits payloads larger than 4 GB into Kiwix-compatible slices (`.zimaa`, `.zimab`, etc.) while maintaining a single continuous MD5 hash across all slices.
+
+### Constructor
+
+```python
+ZimBucket(target_path: str)
+```
+
+**Parameters:**
+- `target_path` (str): Path to the target directory for the ZIM bucket
+
+### Methods
+
+#### write_and_verify_zim()
+
+```python
+write_and_verify_zim(identifier: str, response_stream, total_size: int) -> Dict[str, Any]
+```
+
+Stream a ZIM payload to disk, verify the MD5 checksum, and validate the ZIM magic number.
+
+**Parameters:**
+- `identifier` (str): ZIM identifier used for state/resume tracking
+- `response_stream` (requests.Response): Streaming response object
+- `total_size` (int): Expected total size in bytes
+
+**Returns:**
+- `Dict[str, Any]`: Download statistics, typically containing `bytes_written`.
+
+**Raises:**
+- `RuntimeError`: If the final checksum or magic number validation fails
+
+**Side Effects:**
+- Writes the ZIM to `<target_path>/<identifier>.zim` on non-FAT32 targets
+- On FAT32 targets with payloads > 4 GB, writes Kiwix-compatible slices `<target_path>/<identifier>.zimaa`, `<target_path>/<identifier>.zimab`, etc.
+- Uses temporary `<target_path>/.<identifier>.zim*.part` files during download
+- Updates chunk and split state in `.kb_state/sync_state.json` for resume support
+
+---
+
+## WikipediaEngine Class
+
+Wikipedia OpenZIM and Wikimedia Enterprise API integration.
+
+### Constructor
+
+```python
+WikipediaEngine(
+    verbose: bool = False,
+    username: Optional[str] = None,
+    password: Optional[str] = None,
+)
+```
+
+**Parameters:**
+- `verbose` (bool, optional): Enable verbose logging
+- `username` (Optional[str]): Wikimedia Enterprise username
+- `password` (Optional[str]): Wikimedia Enterprise password
+
+### Methods
+
+#### pull_zim_url()
+
+```python
+pull_zim_url(url: str, destdir: str) -> Dict[str, Any]
+```
+
+Download and verify a Kiwix ZIM from a direct `.zim` URL using `ZimBucket`.
+
+**Parameters:**
+- `url` (str): Direct URL to the `.zim` file
+- `destdir` (str): Destination directory path
+
+**Returns:**
+- `Dict[str, Any]`: Download statistics with keys `identifier`, `files_downloaded`, `files_skipped`, `bytes_downloaded`, `errors`
+
+**Raises:**
+- `RequestException`: If the HTTP request fails
+- `OSError`: If a non-FAT32 target filesystem cannot store the ZIM (FAT32 payloads > 4 GB are automatically split instead of raising)
+
+**Example:**
+```python
+from knowledge_base_builder.engines.wikipedia import WikipediaEngine
+
+engine = WikipediaEngine()
+stats = engine.pull_zim_url(
+    "https://download.kiwix.org/zim/wikipedia/wikipedia_en_all_nopic_2026-06.zim",
+    "/path/to/destination"
+)
+print(f"Downloaded {stats['identifier']} ({stats['bytes_downloaded']} bytes)")
+```
+
+---
+
 ## CLI Commands
 
 ### Command: init
@@ -719,6 +834,29 @@ This prevents duplicate downloads by selecting only the single best available fo
 
 **Note:** The pull command uses military-grade retry logic with exponential backoff and supports graceful mission abort protection via `Ctrl+C`. When interrupted, the command cleanly stops and preserves all downloaded items in the state file.
 
+### Command: pull-kiwix
+
+Download a single Kiwix ZIM by direct URL.
+
+**Usage:**
+```bash
+kb-builder pull-kiwix [OPTIONS] URL TARGET
+```
+
+**Arguments:**
+- `URL`: Direct `.zim` URL to download (required)
+- `TARGET`: Target directory path (required)
+
+**Options:**
+- `--verbose, -v`: Show detailed progress (default: True)
+
+**Example:**
+```bash
+kb-builder pull-kiwix https://download.kiwix.org/zim/wikipedia/wikipedia_en_medicine_nopic_2026-04.zim /path/to/usb/drive
+```
+
+**Note:** Internally uses `WikipediaEngine.pull_zim_url()` and `ZimBucket.write_and_verify_zim()`, providing resume and MD5/magic-number verification.
+
 ### Command: stats
 
 Show bucket statistics and sync status.
@@ -754,10 +892,126 @@ kb-builder configure
 # Then follow prompts to enter archive.org credentials
 ```
 
+## wiki_orchestrator Module
+
+Prioritized, resume-friendly bulk download orchestration for Kiwix Wikipedia ZIM files.
+
+### Functions
+
+#### run()
+
+```python
+run(config: dict, dry_run: bool = False, retry_failed: bool = False) -> None
+```
+
+Fetch the Kiwix OPDS catalog, build a prioritized queue, and download ZIMs one at a time through a staging directory.
+
+**Parameters:**
+- `config` (dict): Configuration dictionary with keys:
+  - `stage_dir` (str): Local staging directory, e.g. `C:\\kb_stage`
+  - `final_dir` (str): Final destination directory, e.g. `D:\\`
+  - `languages` (List[str], optional): Language codes to download. Default: `["en", "fr", "es"]`
+  - `full_flavour` (str, optional): Minimum flavour for full-language snapshots. Default: `"nopic"`
+  - `full_image` (bool, optional): If True, force `maxi` for full-language snapshots. Default: False
+  - `allow_mini` (bool, optional): Allow `mini` flavour for topic fills. Default: True
+- `dry_run` (bool, optional): If True, print the queue and totals without downloading. Default: False
+- `retry_failed` (bool, optional): If True, attempt items marked failed in `.kiwix_processed.json`. Default: False
+
+**Side Effects:**
+- Creates `stage_dir` and `final_dir` if they do not exist
+- Writes `<stage_dir>/.kiwix_processed.json` with `completed` and `failed` identifier sets
+- Downloads one ZIM at a time to `stage_dir`, moves it to `final_dir`, then deletes the staged copy
+
+**Example:**
+```python
+from knowledge_base_builder.wiki_orchestrator import run
+
+config = {
+    "stage_dir": "C:\\kb_stage",
+    "final_dir": "D:\\",
+    "languages": ["en", "fr", "es"],
+    "full_flavour": "nopic",
+    "allow_mini": True,
+}
+run(config, dry_run=False, retry_failed=False)
+```
+
+### Classes
+
+#### VitalArticlesIndex
+
+Topic-level Vital Article scorer used to rank Kiwix ZIMs.
+
+```python
+VitalArticlesIndex(
+    topic_keywords: Optional[Dict[str, List[str]]] = None,
+    category_priority: Optional[Dict[str, int]] = None,
+)
+```
+
+- `score(entry: dict) -> int`: Compute a priority score from topic keyword matches.
+- `matched_topics(entry: dict) -> List[str]`: Return the list of matched topics.
+
+#### ProximityScorer
+
+Alternates nearest and furthest topic picks for balanced coverage.
+
+- `add(entry: dict) -> None`: Register a selected entry's topics.
+- `prefer(entry: dict) -> float`: Return a proximity score for the next pick.
+
+#### KiwixCatalog
+
+Fetch and parse the Kiwix OPDS catalog.
+
+- `from_opds(url: str = KIWIX_CATALOG) -> KiwixCatalog`: Parse the OPDS feed into a catalog of entries.
+
+#### KiwixQueue
+
+Build a prioritized, resume-friendly ZIM download queue.
+
+```python
+KiwixQueue(
+    catalog: KiwixCatalog,
+    vital: VitalArticlesIndex,
+    languages: List[str] = ("en", "fr", "es"),
+    full_flavour: str = "nopic",
+    full_image: bool = False,
+    allow_mini: bool = True,
+)
+```
+
+- `build() -> Iterable[dict]`: Yield queue entries, one per Wikipedia topic, ordered by language priority, Vital Article score, and proximity/size tie-breaks.
+
+#### ZimDownloader
+
+Stage -> verify -> move downloader.
+
+```python
+ZimDownloader(engine: Optional[WikipediaEngine] = None)
+```
+
+- `download(entry: dict, stage_dir: Path, final_dir: Path) -> Dict[str, Any]`: Stage the ZIM, verify it, move it to `final_dir`, and record completion.
+
+---
+
 ## State File Schema
 
 ### Location
 `.kb_state/sync_state.json` within the bucket directory
+
+### Orchestrator State
+
+The `wiki_orchestrator` module also writes `<stage_dir>/.kiwix_processed.json`:
+
+```json
+{
+  "completed": ["wikipedia_en_medicine_nopic_2026-04"],
+  "failed": ["wikipedia_en_all_nopic_2026-06"]
+}
+```
+
+- `completed`: Identifiers whose final `.zim` or split `.zim??` files already exist
+- `failed`: Identifiers that failed during download or verification
 
 ### Schema Version
 Current version: `0.1.0`

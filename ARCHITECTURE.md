@@ -47,7 +47,7 @@ Knowledge-Base-Builder is a Python-based CLI tool that treats local storage (typ
 
 **Key Components:**
 - `app`: Main Typer application instance
-- Command handlers: `init`, `search`, `estimate`, `pull`, `stats`, `configure`
+- Command handlers: `init`, `search`, `estimate`, `pull`, `pull-kiwix`, `stats`, `configure`
 - Progress management using Rich Progress components
 - Error handling with color-coded console output
 
@@ -56,7 +56,28 @@ Knowledge-Base-Builder is a Python-based CLI tool that treats local storage (typ
 - Strategy pattern for different download modes
 - Template method for consistent command structure
 
-### 2. Engine Layer (`engines/`)
+### 2. Kiwix Orchestrator Layer (`wiki_orchestrator.py`)
+
+**Responsibilities:**
+- Fetch and parse the Kiwix OPDS catalog
+- Score and prioritize Wikipedia ZIMs by Vital Articles topic coverage
+- Build a deduplicated, resume-friendly download queue
+- Stage each ZIM locally, verify it, then move it to the final bucket; on FAT32 final drives, large ZIMs are written directly as Kiwix-compatible split slices
+- Track completed/failed downloads in `.kiwix_processed.json`
+
+**Key Components:**
+- `KiwixCatalog`: OPDS catalog parser
+- `VitalArticlesIndex`: Topic/category priority scorer
+- `ProximityScorer`: Alternating nearest/furthest topic selector
+- `KiwixQueue`: Prioritized queue builder
+- `ZimDownloader`: Stage-verify-move downloader
+- `run()`: Config-driven orchestrator entry point
+
+**State Management:**
+- `<stage_dir>/.kiwix_processed.json` stores `completed` and `failed` identifier sets
+- Filesystem type detection triggers automatic ZIM splitting on FAT32; payloads > 4 GB are written as Kiwix-compatible `.zimaa`, `.zimab`, etc. slices
+
+### 3. Engine Layer (`engines/`)
 
 **Responsibilities:**
 - Internet Archive API communication
@@ -69,6 +90,7 @@ Knowledge-Base-Builder is a Python-based CLI tool that treats local storage (typ
 **Key Components:**
 - `ArchiveEngine`: Internet Archive API interface class
 - `WikipediaEngine`: Wikipedia OpenZIM and Wikimedia Enterprise API integration
+- `pull_zim_url()`: Direct single-ZIM download from a `.zim` URL
 - `search_items()`: Lazy search result generator
 - `get_item()`: Item metadata retrieval
 - `download()`: Concurrent download manager
@@ -106,6 +128,7 @@ Knowledge-Base-Builder is a Python-based CLI tool that treats local storage (typ
 
 **State Management:**
 - JSON-based state persistence in `.kb_state/` directory
+- `.kiwix_processed.json` in the orchestrator staging directory for completed/failed ZIM tracking
 - Atomic state updates to prevent corruption
 - Version tracking for schema evolution
 - Error logging for failed operations

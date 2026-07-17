@@ -396,5 +396,26 @@ def configure(
         raise typer.BadParameter(f"Unknown source '{source}'. Use 'ia' or 'wiki'.")
 
 
+@app.command()
+def pull_kiwix(
+    url: str = typer.Argument(..., help="Direct .zim URL"),
+    target: str = typer.Argument(..., help="Target bucket path"),
+    verbose: bool = typer.Option(True, "--verbose", "-v", help="Show detailed progress"),
+):
+    """Download a single Kiwix ZIM by direct URL with resume and verification."""
+    try:
+        bucket = ZimBucket(target)
+        bucket.initialize()
+        engine = WikipediaEngine(verbose=verbose)
+        stats = engine.pull_zim_url(url, target)
+        console.print(
+            f"[bold green]Downloaded[/bold green] {stats['identifier']} "
+            f"({engine._format_bytes(stats['bytes_downloaded'])}) to {target}"
+        )
+    except Exception as e:
+        console.print(f"[bold red]Error:[/bold red] {e}")
+        raise typer.Exit(1)
+
+
 if __name__ == "__main__":
     app()

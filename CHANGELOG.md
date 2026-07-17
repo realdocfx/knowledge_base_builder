@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-07-17
+
+### Added
+
+- New `wiki_orchestrator` module for prioritized, resume-friendly Kiwix Wikipedia downloads:
+  - `KiwixCatalog`, `VitalArticlesIndex`, `ProximityScorer`, `KiwixQueue`, `ZimDownloader`, and `run()`.
+- `WikipediaEngine.pull_zim_url(url, destdir)` for direct single-ZIM downloads.
+- `kb-builder pull-kiwix` CLI command.
+- `.kiwix_processed.json` state tracking with `--dry-run` and `--retry-failed`.
+- Identifier base matching to skip newer-dated duplicates of an existing topic.
+- Dynamic ZIM splitting in `ZimBucket` for FAT32 targets: payloads > 4 GB are written as Kiwix-compatible `.zimaa`, `.zimab`, ... slices with a continuous MD5 hash and delta-aware resume.
+
+### Changed
+
+- `KiwixCatalog.from_opds` handles namespaced and unqualified OPDS extension elements.
+- Config files opened with `utf-8-sig` to support PowerShell UTF-8 BOM output.
+- `wiki_orchestrator.py` docstrings no longer contain invalid escape sequences.
+
 ## [0.2.0] - 2026-07-14
 
 ### Added
@@ -40,4 +58,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - USB bucket state tracking and resume capability.
 - Internet Archive download engine with retry logic.
 
+[0.3.0]: https://github.com/realdocfx/knowledge_base_builder/releases/tag/v0.3.0
 [0.2.0]: https://github.com/realdocfx/knowledge_base_builder/releases/tag/v0.2.0

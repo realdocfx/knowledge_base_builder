@@ -3,6 +3,7 @@ import json
 import os
 import tarfile
 import time
+from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional
 
 import requests
@@ -188,11 +189,36 @@ class WikipediaEngine(BaseEngine):
         )
         self.logger.info(f"Initiating ZIM download: {mirror_url}")
 
-        response = self.session.get(mirror_url, stream=True, timeout=30)
+        response = self.session.get(mirror_url, stream=True, timeout=(30, 300))
         response.raise_for_status()
 
         total_size = int(response.headers.get("Content-Length", 0))
         identifier = f"{language}.{project}"
+
+        result = bucket.write_and_verify_zim(identifier, response, total_size)
+        bucket.mark_item_completed(identifier, result["bytes_written"])
+
+        return {
+            "identifier": identifier,
+            "files_downloaded": 1,
+            "files_skipped": 0,
+            "bytes_downloaded": result["bytes_written"],
+            "errors": [],
+        }
+
+    def pull_zim_url(self, url: str, destdir: str) -> Dict[str, Any]:
+        """Download and verify a Kiwix ZIM from a direct URL."""
+        from ..buckets.zim import ZimBucket
+
+        bucket = ZimBucket(destdir)
+        bucket.initialize()
+        self.logger.info(f"Initiating ZIM download from URL: {url}")
+
+        response = self.session.get(url, stream=True, timeout=(30, 300))
+        response.raise_for_status()
+
+        total_size = int(response.headers.get("Content-Length", 0))
+        identifier = Path(url).stem
 
         result = bucket.write_and_verify_zim(identifier, response, total_size)
         bucket.mark_item_completed(identifier, result["bytes_written"])
