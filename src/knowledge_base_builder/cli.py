@@ -12,6 +12,7 @@ from rich.console import Group
 
 from .buckets import UsbBucket, ZimBucket
 from .engines import ArchiveEngine, WikipediaEngine
+from .presentation import serve_bucket
 
 # Progress description template constant
 PROGRESS_DESC = "[progress.description]{task.description}"
@@ -415,6 +416,49 @@ def pull_kiwix(
     except Exception as e:
         console.print(f"[bold red]Error:[/bold red] {e}")
         raise typer.Exit(1)
+
+
+@app.command()
+def serve(
+    path: str = typer.Argument(..., help="Path to the ZIM bucket"),
+    port: int = typer.Option(8080, "--port", "-p", help="Port to serve the archive on"),
+    no_browser: bool = typer.Option(False, "--no-browser", help="Do not open the default web browser"),
+):
+    """Launch a local web server to browse downloaded ZIM archives."""
+    try:
+        bucket = ZimBucket(path)
+        bucket.initialize()
+        console.print(f"[cyan]Initializing tactical readout on port {port}...[/cyan]")
+        serve_bucket(str(bucket.root), port, open_browser=not no_browser)
+    except Exception as e:
+        console.print(f"[bold red]Serve Error:[/bold red] {e}")
+        raise typer.Exit(1)
+
+
+@app.command()
+def portal(
+    path: str = typer.Argument(..., help="Path to the bucket/drive to expose"),
+    host: str = typer.Option("127.0.0.1", "--host", "-h", help="Bind address"),
+    port: int = typer.Option(8080, "--port", "-p", help="Port to serve the portal on"),
+    no_browser: bool = typer.Option(False, "--no-browser", help="Do not open the dashboard in a web browser"),
+):
+    """Launch the FastAPI C2 Knowledge Portal for the local bucket."""
+    try:
+        import uvicorn
+        from .web import app as portal_app
+    except ImportError as exc:
+        console.print(
+            "[bold red]Missing web dependencies.[/bold red] Run: pip install -e .[web]"
+        )
+        raise typer.Exit(1) from exc
+
+    portal_app.state.bucket_root = str(Path(path).resolve())
+    url = f"http://{host}:{port}"
+    console.print(f"[cyan]Starting C2 Knowledge Portal at {url} ...[/cyan]")
+    if not no_browser:
+        import webbrowser
+        webbrowser.open(url)
+    uvicorn.run(portal_app, host=host, port=port, log_level="info")
 
 
 if __name__ == "__main__":

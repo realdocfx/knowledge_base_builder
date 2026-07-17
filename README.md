@@ -159,7 +159,28 @@ The orchestrator:
 
 **Note:** The pull command uses military-grade retry logic with exponential backoff by default, ensuring reliable downloads even under adverse network conditions. It also features graceful mission abort protection - press `Ctrl+C` at any time to cleanly stop the operation while preserving all downloaded items in the state file.
 
-### 5. Check Bucket Status
+### 5. Serve Downloaded ZIMs
+
+Launch a read-only ZIM browser (uses `kiwix-serve` if installed, otherwise falls back to a pure-Python `libzim` server):
+
+```bash
+kb-builder serve D:\
+```
+
+### 6. Launch the C2 Knowledge Portal
+
+Start the FastAPI dashboard to view bucket telemetry, search both backends, trigger downloads, browse Archive.org files, and read Wikipedia ZIMs from a single interface:
+
+```bash
+# Install the web extra first if you haven't already
+pip install -e .[web]
+
+kb-builder portal D:\
+```
+
+Then open `http://127.0.0.1:8080` in your browser. The dashboard iframe proxies the local ZIM reader; Archive.org files are served statically from `/files/`.
+
+### 7. Check Bucket Status
 
 ```bash
 kb-builder stats /path/to/usb/drive
@@ -174,6 +195,8 @@ kb-builder stats /path/to/usb/drive
 | `estimate` | Estimate download size for a backend query |
 | `pull` | Synchronize items from a backend (`ia` or `wiki`) |
 | `pull-kiwix` | Download a single Kiwix ZIM by direct URL |
+| `serve` | Browse downloaded ZIMs in a local web server |
+| `portal` | Launch the FastAPI C2 Knowledge Portal dashboard |
 | `stats` | Show bucket statistics and sync status |
 | `configure` | Configure backend credentials |
 

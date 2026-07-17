@@ -47,7 +47,7 @@ Knowledge-Base-Builder is a Python-based CLI tool that treats local storage (typ
 
 **Key Components:**
 - `app`: Main Typer application instance
-- Command handlers: `init`, `search`, `estimate`, `pull`, `pull-kiwix`, `stats`, `configure`
+- Command handlers: `init`, `search`, `estimate`, `pull`, `pull-kiwix`, `serve`, `portal`, `stats`, `configure`
 - Progress management using Rich Progress components
 - Error handling with color-coded console output
 
@@ -137,6 +137,23 @@ Knowledge-Base-Builder is a Python-based CLI tool that treats local storage (typ
 - Repository pattern for state management
 - Singleton pattern for bucket instances
 - Template method for state operations
+
+### 4. Presentation Layer (`presentation.py`, `web.py`)
+
+**Responsibilities:**
+- Serve downloaded ZIM archives as a local, read-only web service
+- Provide a FastAPI dashboard (C2 Knowledge Portal) for telemetry, search, and downloads
+- Proxy the ZIM reader through `/wiki/` and serve Archive.org payloads statically under `/files/`
+- Prefer `kiwix-serve` when installed, fall back to a pure-Python `libzim` server
+
+**Key Components:**
+- `serve_bucket()`: Standalone ZIM server launched by `kb-builder serve`
+- `LibzimServer`: Threaded, non-blocking `http.server` using `libzim` reader
+- `web.py` FastAPI app: Dashboard, API endpoints, static file serving, and `/wiki/` reverse proxy
+
+**State Management:**
+- Reads `.kb_state/sync_state.json` via `UsbBucket.get_state()`
+- Discovers finalized `.zim` and split `.zim??` archives on the bucket root
 
 ## Data Flow
 

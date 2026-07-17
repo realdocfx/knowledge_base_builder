@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-07-17
+
+### Added
+
+- FastAPI C2 Knowledge Portal (`kb-builder portal`) with:
+  - Dashboard showing `UsbBucket` stats and `.kb_state` sync state.
+  - `/api/search`, `/api/estimate`, and `/api/download` endpoints for IA and Wikipedia backends.
+  - Static file serving for Archive.org payloads at `/files/`.
+  - ZIM reader reverse proxy at `/wiki/` with `kiwix-serve` preferred and a pure-Python `libzim` fallback.
+- `presentation.py` standalone `kb-builder serve` command for direct `libzim`/kiwix-serve ZIM browsing.
+- Optional `web` extra (`fastapi`, `uvicorn`, `httpx`, `aiofiles`) for portal deployments.
+
+### Fixed
+
+- ZIM proxy streaming now uses `httpx` streaming requests so the full response body is forwarded without buffering or `StreamConsumed` errors.
+- `libzim` fallback server uses `ThreadingMixIn` and caches open `Archive` objects for concurrent, low-latency reads.
+
 ## [0.3.0] - 2026-07-17
 
 ### Added
@@ -58,5 +75,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - USB bucket state tracking and resume capability.
 - Internet Archive download engine with retry logic.
 
+[0.4.0]: https://github.com/realdocfx/knowledge_base_builder/releases/tag/v0.4.0
 [0.3.0]: https://github.com/realdocfx/knowledge_base_builder/releases/tag/v0.3.0
 [0.2.0]: https://github.com/realdocfx/knowledge_base_builder/releases/tag/v0.2.0

@@ -857,6 +857,54 @@ kb-builder pull-kiwix https://download.kiwix.org/zim/wikipedia/wikipedia_en_medi
 
 **Note:** Internally uses `WikipediaEngine.pull_zim_url()` and `ZimBucket.write_and_verify_zim()`, providing resume and MD5/magic-number verification.
 
+### Command: serve
+
+Launch a local, read-only web server to browse downloaded ZIM archives.
+
+**Usage:**
+```bash
+kb-builder serve [OPTIONS] PATH
+```
+
+**Arguments:**
+- `PATH`: Path to the ZIM bucket (required)
+
+**Options:**
+- `--port, -p`: Port to serve on (default: 8080)
+- `--no-browser`: Do not open the default web browser
+
+**Example:**
+```bash
+kb-builder serve D:\
+```
+
+**Note:** Prefers the native `kiwix-serve` binary when available; otherwise falls back to a pure-Python `libzim` HTTP server that understands `.zim` and split `.zim??` archives.
+
+### Command: portal
+
+Launch the FastAPI C2 Knowledge Portal dashboard for the bucket.
+
+**Usage:**
+```bash
+kb-builder portal [OPTIONS] PATH
+```
+
+**Arguments:**
+- `PATH`: Path to the bucket/drive to expose (required)
+
+**Options:**
+- `--host, -h`: Bind address (default: 127.0.0.1)
+- `--port, -p`: Port to serve the portal on (default: 8080)
+- `--no-browser`: Do not open the default web browser
+
+**Example:**
+```bash
+pip install -e .[web]
+kb-builder portal D:\
+```
+
+**Note:** Requires the `web` extra (`fastapi`, `uvicorn`, `httpx`, `aiofiles`). The portal exposes `/api/stats`, `/api/state`, `/api/archives`, `/api/search`, `/api/estimate`, `/api/download`, serves Archive.org files under `/files/`, and proxies the ZIM reader under `/wiki/`.
+
 ### Command: stats
 
 Show bucket statistics and sync status.
