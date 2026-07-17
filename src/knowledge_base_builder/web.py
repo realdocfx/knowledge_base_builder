@@ -2,8 +2,7 @@
 
 A lightweight, read-only web dashboard that exposes bucket telemetry, drives
 search/estimate/download workflows, serves Archive.org payloads as static files,
-and proxies a localized ZIM reader (kiwix-serve when available, libzim fallback
-when not).
+and embeds the native ``kiwix-serve`` ZIM reader directly.
 
 Install the web extra: ``pip install -e .[web]``.
 """
@@ -19,26 +18,24 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-import httpx
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 from .buckets.usb import UsbBucket
 from .engines import ArchiveEngine, WikipediaEngine
-from .presentation import discover_archives, LibzimServer
+from .presentation import discover_archives
 
 
 app = FastAPI(
     title="Knowledge-Base-Builder C2 Portal",
     description="Tactical dashboard for local knowledge-base logistics.",
-    version="0.4.1",
+    version="0.4.2",
 )
 
 # In-memory job store. Survives only as long as the server process.
 JOBS: Dict[str, Dict[str, Any]] = {}
 BUCKET: Optional[UsbBucket] = None
 KIWIX_PROCESS: Optional[subprocess.Popen] = None
-LIBZIM_SERVER: Optional[Any] = None
 
 
 def _find_free_port(start: int = 18080) -> int:
@@ -53,33 +50,34 @@ def _find_free_port(start: int = 18080) -> int:
     raise RuntimeError("No free port found for internal Kiwix server")
 
 
-def _start_kiwix_or_fallback(root: Path) -> Optional[str]:
-    """Launch ``kiwix-serve`` if present; otherwise start the libzim fallback."""
-    global KIWIX_PROCESS, LIBZIM_SERVER
+def _start_kiwix_server(root: Path) -> Optional[str]:
+    """Launch ``kiwix-serve`` on an internal port and return its URL.
+
+    Raises:
+        RuntimeError: If the ``kiwix-serve`` binary is missing or no archives are found.
+    """
+    global KIWIX_PROCESS
     archives = discover_archives(root)
     if not archives:
         return None
 
     binary = shutil.which("kiwix-serve")
-    port = _find_free_port()
-    if binary:
-        cmd = [binary, "--port", str(port), "--address", "127.0.0.1"]
-        cmd.extend(str(path) for _, path in archives)
-        try:
-            KIWIX_PROCESS = subprocess.Popen(
-                cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            # Wait briefly for the binary to bind.
-            time.sleep(0.7)
-            return f"http://127.0.0.1:{port}"
-        except OSError:
-            KIWIX_PROCESS = None
+    if not binary:
+        raise RuntimeError(
+            "kiwix-serve binary not found. Install it from https://kiwix.org/en/applications/ "
+            "or via your package manager, then ensure it is on PATH."
+        )
 
-    # Fallback to pure-Python libzim server.
-    LIBZIM_SERVER = LibzimServer(root, port, archives)
-    LIBZIM_SERVER.start()
+    port = _find_free_port()
+    cmd = [binary, "--port", str(port), "--address", "127.0.0.1"]
+    cmd.extend(str(path) for _, path in archives)
+    KIWIX_PROCESS = subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    # Wait briefly for the binary to bind.
+    time.sleep(0.7)
     return f"http://127.0.0.1:{port}"
 
 
@@ -95,7 +93,11 @@ async def lifespan(_app: FastAPI):
     BUCKET = UsbBucket(str(root))
     BUCKET.initialize()
 
-    kiwix_url = _start_kiwix_or_fallback(root)
+    try:
+        kiwix_url = _start_kiwix_server(root)
+    except RuntimeError as exc:
+        # Portal can still function for stats/search/files without the ZIM reader.
+        kiwix_url = None
     _app.state.kiwix_url = kiwix_url
     _app.state.bucket_root = root
 
@@ -107,8 +109,6 @@ async def lifespan(_app: FastAPI):
             KIWIX_PROCESS.wait(timeout=5)
         except Exception:
             pass
-    if LIBZIM_SERVER is not None:
-        LIBZIM_SERVER.stop()
 
 
 app.router.lifespan_context = lifespan
@@ -116,7 +116,14 @@ app.router.lifespan_context = lifespan
 
 @app.get("/", response_class=HTMLResponse)
 async def dashboard() -> str:
-    return DASHBOARD_HTML
+    kiwix_url = getattr(app.state, "kiwix_url", None)
+    if kiwix_url:
+        return DASHBOARD_HTML.replace("{{KIWIX_URL}}", kiwix_url)
+    placeholder = "about:blank#kiwix-serve-not-installed"
+    return DASHBOARD_HTML.replace("{{KIWIX_URL}}", placeholder).replace(
+        f'<iframe id="wiki-frame" src="{placeholder}" title="ZIM Reader"></iframe>',
+        '<p class="error">ZIM reader unavailable. Install kiwix-serve and restart the portal.</p>'
+    )
 
 
 @app.get("/api/stats")
@@ -237,65 +244,6 @@ async def static_files(path: str) -> Any:
     return FileResponse(target)
 
 
-@app.api_route("/wiki/{path:path}", methods=["GET", "POST"])
-async def wiki_proxy(request: Request, path: str) -> Any:
-    kiwix_url = getattr(app.state, "kiwix_url", None)
-    if not kiwix_url:
-        # No finalized archives yet; render a friendly status page showing
-        # any in-progress downloads so operators understand why the reader
-        # is not yet available.
-        if BUCKET is None:
-            raise HTTPException(status_code=503, detail="Bucket not initialized")
-        partials = []
-        for pattern in ("*.zim*.part", "*.zim.part"):
-            for p in sorted(BUCKET.root.glob(pattern)):
-                if p.is_file():
-                    partials.append(f"<li>{p.name} ({_format_bytes(p.stat().st_size)})</li>")
-        partials_html = (
-            f"<ul>{''.join(partials)}</ul>" if partials else "<p>No active downloads detected.</p>"
-        )
-        html = (
-            "<html><body><h1>ZIM reader not ready</h1>"
-            "<p>There are no finalized ZIM archives in this bucket yet. "
-            "Once a ZIM download completes, this page will display the Kiwix reader.</p>"
-            "<h2>In-progress downloads</h2>" + partials_html +
-            "</body></html>"
-        )
-        return HTMLResponse(html)
-
-    client: httpx.AsyncClient = getattr(app.state, "proxy_client", None)
-    if client is None:
-        client = httpx.AsyncClient(base_url=kiwix_url, follow_redirects=False, timeout=60.0)
-        app.state.proxy_client = client
-
-    url = "/" + path + ("?" + request.query_params if request.query_params else "")
-    headers = {
-        k: v
-        for k, v in request.headers.items()
-        if k.lower() not in ("host", "content-length")
-    }
-    body = await request.body()
-
-    # Use a streaming request so large ZIM resources are not buffered in memory.
-    upstream_req = client.build_request(
-        method=request.method, url=url, headers=headers, content=body
-    )
-    upstream = await client.send(upstream_req, stream=True)
-
-    async def stream_response():
-        try:
-            async for chunk in upstream.aiter_raw():
-                yield chunk
-        finally:
-            await upstream.aclose()
-
-    return StreamingResponse(
-        stream_response(),
-        status_code=upstream.status_code,
-        headers=dict(upstream.headers),
-    )
-
-
 DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -326,8 +274,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
 <div class="card" style="margin-top: 1rem;">
   <h2>Reader</h2>
-  <p><a id="wiki-link" href="/wiki/" target="_blank">Open local ZIM reader in new tab</a></p>
-  <iframe id="wiki-frame" src="/wiki/" title="ZIM Reader"></iframe>
+  <p><a id="wiki-link" href="{{KIWIX_URL}}" target="_blank">Open local ZIM reader in new tab</a></p>
+  <iframe id="wiki-frame" src="{{KIWIX_URL}}" title="ZIM Reader"></iframe>
 </div>
 
 <div class="card" style="margin-top: 1rem;">

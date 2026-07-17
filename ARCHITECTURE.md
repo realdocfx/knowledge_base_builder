@@ -143,13 +143,13 @@ Knowledge-Base-Builder is a Python-based CLI tool that treats local storage (typ
 **Responsibilities:**
 - Serve downloaded ZIM archives as a local, read-only web service
 - Provide a FastAPI dashboard (C2 Knowledge Portal) for telemetry, search, and downloads
-- Proxy the ZIM reader through `/wiki/` and serve Archive.org payloads statically under `/files/`
-- Prefer `kiwix-serve` when installed, fall back to a pure-Python `libzim` server
+- Embed the native `kiwix-serve` ZIM reader directly in the dashboard iframe
+- Serve Archive.org payloads statically under `/files/`
+- Require `kiwix-serve` on PATH; no broken pure-Python fallback is used
 
 **Key Components:**
-- `serve_bucket()`: Standalone ZIM server launched by `kb-builder serve`
-- `LibzimServer`: Threaded, non-blocking `http.server` using `libzim` reader
-- `web.py` FastAPI app: Dashboard, API endpoints, static file serving, and `/wiki/` reverse proxy
+- `serve_bucket()`: Standalone ZIM server launched by `kb-builder serve` (requires `kiwix-serve`)
+- `web.py` FastAPI app: Dashboard, API endpoints, static file serving, and direct `kiwix-serve` iframe embedding
 
 **State Management:**
 - Reads `.kb_state/sync_state.json` via `UsbBucket.get_state()`

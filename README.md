@@ -161,7 +161,7 @@ The orchestrator:
 
 ### 5. Serve Downloaded ZIMs
 
-Launch a read-only ZIM browser (uses `kiwix-serve` if installed, otherwise falls back to a pure-Python `libzim` server):
+Launch the native `kiwix-serve` ZIM browser (install kiwix-serve first; no pure-Python fallback is provided because only the C++ server supports the ZIM's ServiceWorker and search APIs):
 
 ```bash
 kb-builder serve D:\
@@ -178,7 +178,7 @@ pip install -e .[web]
 kb-builder portal D:\
 ```
 
-Then open `http://127.0.0.1:8080` in your browser. The dashboard iframe proxies the local ZIM reader; Archive.org files are served statically from `/files/`.
+Then open `http://127.0.0.1:8080` in your browser. The dashboard embeds the native `kiwix-serve` ZIM reader directly; Archive.org files are served statically from `/files/`.
 
 ### 7. Check Bucket Status
 

@@ -205,9 +205,9 @@ class KiwixQueue:
         catalog: KiwixCatalog,
         vital: VitalArticlesIndex,
         languages: List[str] = ("en", "fr", "es"),
-        full_flavour: str = "nopic",
+        full_flavour: str = "maxi",
         full_image: bool = False,
-        allow_mini: bool = True,
+        allow_mini: bool = False,
     ):
         self.catalog = catalog
         self.vital = vital
@@ -403,9 +403,9 @@ def run(config: dict, dry_run: bool = False, retry_failed: bool = False) -> None
             catalog,
             vital,
             languages=config.get("languages", ["en", "fr", "es"]),
-            full_flavour=config.get("full_flavour", "nopic"),
+            full_flavour=config.get("full_flavour", "maxi"),
             full_image=config.get("full_image", False),
-            allow_mini=config.get("allow_mini", True),
+            allow_mini=config.get("allow_mini", False),
         ).build()
     )
 

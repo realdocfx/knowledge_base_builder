@@ -878,7 +878,7 @@ kb-builder serve [OPTIONS] PATH
 kb-builder serve D:\
 ```
 
-**Note:** Prefers the native `kiwix-serve` binary when available; otherwise falls back to a pure-Python `libzim` HTTP server that understands `.zim` and split `.zim??` archives.
+**Note:** Requires the native `kiwix-serve` binary on PATH; the bundled `libzim` reader cannot expose the ServiceWorker/REST APIs the ZIM's Wikipedia JavaScript needs.
 
 ### Command: portal
 
@@ -903,7 +903,7 @@ pip install -e .[web]
 kb-builder portal D:\
 ```
 
-**Note:** Requires the `web` extra (`fastapi`, `uvicorn`, `httpx`, `aiofiles`). The portal exposes `/api/stats`, `/api/state`, `/api/archives`, `/api/search`, `/api/estimate`, `/api/download`, serves Archive.org files under `/files/`, and proxies the ZIM reader under `/wiki/`.
+**Note:** Requires the `web` extra (`fastapi`, `uvicorn[standard]`). The portal exposes `/api/stats`, `/api/state`, `/api/archives`, `/api/search`, `/api/estimate`, `/api/download`, serves Archive.org files under `/files/`, and embeds the native `kiwix-serve` ZIM reader directly in an iframe.
 
 ### Command: stats
 
