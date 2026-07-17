@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] - 2026-07-17
+
+### Fixed
+
+- Removed `HEAD` from the `/wiki/` reverse proxy route in `web.py` because the built-in `libzim` fallback server does not implement `do_HEAD`; this prevents `501 Not Implemented` responses from pre-fetching clients.
+
 ## [0.4.0] - 2026-07-17
 
 ### Added
@@ -75,6 +81,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - USB bucket state tracking and resume capability.
 - Internet Archive download engine with retry logic.
 
+[0.4.1]: https://github.com/realdocfx/knowledge_base_builder/releases/tag/v0.4.1
 [0.4.0]: https://github.com/realdocfx/knowledge_base_builder/releases/tag/v0.4.0
 [0.3.0]: https://github.com/realdocfx/knowledge_base_builder/releases/tag/v0.3.0
 [0.2.0]: https://github.com/realdocfx/knowledge_base_builder/releases/tag/v0.2.0

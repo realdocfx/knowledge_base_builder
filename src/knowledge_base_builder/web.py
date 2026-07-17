@@ -31,7 +31,7 @@ from .presentation import discover_archives, LibzimServer
 app = FastAPI(
     title="Knowledge-Base-Builder C2 Portal",
     description="Tactical dashboard for local knowledge-base logistics.",
-    version="0.4.0",
+    version="0.4.1",
 )
 
 # In-memory job store. Survives only as long as the server process.
@@ -237,7 +237,7 @@ async def static_files(path: str) -> Any:
     return FileResponse(target)
 
 
-@app.api_route("/wiki/{path:path}", methods=["GET", "POST", "HEAD"])
+@app.api_route("/wiki/{path:path}", methods=["GET", "POST"])
 async def wiki_proxy(request: Request, path: str) -> Any:
     kiwix_url = getattr(app.state, "kiwix_url", None)
     if not kiwix_url:
