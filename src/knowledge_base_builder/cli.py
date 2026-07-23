@@ -49,20 +49,9 @@ console = Console()
 
 def _open_browser(url: str) -> None:
     """Open *url* in Chrome when available, otherwise the system default browser."""
-    candidates = [
-        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-    ]
-    for exe in candidates:
-        if Path(exe).exists():
-            subprocess.Popen(
-                [exe, url],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
-            )
-            return
-    webbrowser.open(url)
+    from .os_utils import open_browser
+
+    open_browser(url)
 
 
 def _wait_and_open_browser(host: str, port: int, url: str) -> None:
@@ -554,6 +543,13 @@ def _extract_zip(zip_path: Path, dest: Path) -> None:
         z.extractall(dest)
 
 
+def _extract_tarball(tarball_path: Path, dest: Path) -> None:
+    """Extract a tar.gz archive into *dest*."""
+    import tarfile
+    with tarfile.open(tarball_path, "r:gz") as tf:
+        tf.extractall(dest)
+
+
 def _patch_embedded_pth(python_dir: Path) -> None:
     """Patch the embeddable python*._pth to enable site-packages and import site."""
     pth_files = list(python_dir.glob("python*._pth"))
@@ -579,36 +575,61 @@ def _patch_embedded_pth(python_dir: Path) -> None:
     pth.write_text("".join(out), encoding="utf-8")
 
 
-def _provision_python_runtime(root: Path, python_version: str) -> Path:
+def _provision_python_runtime(root: Path, python_version: str, target_os: str) -> Path:
     """Download and prepare an embeddable Python runtime under *.kb_env/python*."""
+    from .os_utils import get_executable_extension
+
     env_dir = root / ".kb_env"
     python_dir = env_dir / "python"
     python_dir.mkdir(parents=True, exist_ok=True)
 
-    if (python_dir / "python.exe").exists():
+    exe_ext = get_executable_extension()
+    python_exe = python_dir / f"python{exe_ext}"
+
+    if python_exe.exists():
         console.print("[yellow]Embedded Python already present; skipping download.[/yellow]")
         _patch_embedded_pth(python_dir)
         return python_dir
 
-    zip_name = f"python-{python_version}-embed-amd64.zip"
-    url = f"https://www.python.org/ftp/python/{python_version}/{zip_name}"
+    # Platform-specific Python runtime URLs
+    if target_os == "windows":
+        zip_name = f"python-{python_version}-embed-amd64.zip"
+        url = f"https://www.python.org/ftp/python/{python_version}/{zip_name}"
+    elif target_os == "linux":
+        # Use python-build-standalone for Linux
+        zip_name = f"python-{python_version}-x86_64-unknown-linux-gnu-install_only.tar.gz"
+        url = f"https://github.com/indygreg/python-build-standalone/releases/download/{python_version}/{zip_name}"
+    elif target_os == "darwin":
+        # Use python-build-standalone for macOS
+        zip_name = f"python-{python_version}-x86_64-apple-darwin-install_only.tar.gz"
+        url = f"https://github.com/indygreg/python-build-standalone/releases/download/{python_version}/{zip_name}"
+    else:
+        raise ValueError(f"Unsupported target OS: {target_os}")
+
     zip_path = env_dir / zip_name
 
     if not zip_path.exists():
-        console.print(f"[cyan]Downloading embedded Python {python_version}...[/cyan]")
+        console.print(f"[cyan]Downloading embedded Python {python_version} for {target_os}...[/cyan]")
         _download_file(url, zip_path, f"Python {python_version}")
     else:
         console.print(f"[yellow]Using cached {zip_name}[/yellow]")
 
     console.print("[cyan]Extracting embedded Python...[/cyan]")
-    _extract_zip(zip_path, python_dir)
+    if target_os == "windows":
+        _extract_zip(zip_path, python_dir)
+    else:
+        _extract_tarball(zip_path, python_dir)
+
     _patch_embedded_pth(python_dir)
     return python_dir
 
 
-def _bootstrap_pip(python_dir: Path) -> None:
+def _bootstrap_pip(python_dir: Path, target_os: str) -> None:
     """Install pip, setuptools, and wheel into the embeddable Python runtime."""
-    python_exe = python_dir / "python.exe"
+    from .os_utils import get_executable_extension
+
+    exe_ext = get_executable_extension()
+    python_exe = python_dir / f"python{exe_ext}"
     get_pip = python_dir / "get-pip.py"
     if not get_pip.exists():
         console.print("[cyan]Downloading get-pip.py...[/cyan]")
@@ -694,14 +715,17 @@ def _install_xapian_wheel(python_dir: Path, python_version: str) -> None:
             console.print(f"[dim]{result.stderr.strip()}[/dim]")
 
 
-def _install_portable_packages(python_dir: Path, package_spec: str, python_version: str) -> None:
+def _install_portable_packages(python_dir: Path, package_spec: str, python_version: str, target_os: str) -> None:
     """Install KBB and web dependencies into the drive runtime.
 
-    ``xapian-bindings`` is provisioned from a pre-compiled Windows wheel matching
+    ``xapian-bindings`` is provisioned from a pre-compiled wheel matching the target OS.
     the embedded Python ABI when available, with a best-effort PyPI source-build
     fallback. A failure must not abort the rest of the portable environment.
     """
-    python_exe = python_dir / "python.exe"
+    from .os_utils import get_executable_extension
+
+    exe_ext = get_executable_extension()
+    python_exe = python_dir / f"python{exe_ext}"
 
     # Strip extras from the spec so we control the web dependencies ourselves.
     # e.g. "path/to/wheel.whl[web]" -> "path/to/wheel.whl"
@@ -731,28 +755,48 @@ def _install_portable_packages(python_dir: Path, package_spec: str, python_versi
     _install_xapian_wheel(python_dir, python_version)
 
 
-def _provision_kiwix_runtime(root: Path, kiwix_version: str) -> Path:
-    """Download and extract kiwix-serve.exe and libraries under *.kb_env/kiwix*."""
+def _provision_kiwix_runtime(root: Path, kiwix_version: str, target_os: str) -> Path:
+    """Download and extract kiwix-serve and libraries under *.kb_env/kiwix*."""
+    from .os_utils import get_executable_extension
+
     env_dir = root / ".kb_env"
     kiwix_dir = env_dir / "kiwix"
     kiwix_dir.mkdir(parents=True, exist_ok=True)
 
-    if (kiwix_dir / "kiwix-serve.exe").exists():
+    exe_ext = get_executable_extension()
+    kiwix_serve = kiwix_dir / f"kiwix-serve{exe_ext}"
+
+    if kiwix_serve.exists():
         console.print("[yellow]kiwix-serve already present; skipping download.[/yellow]")
         return kiwix_dir
 
-    zip_name = f"kiwix-tools_win-x86_64-{kiwix_version}.zip"
-    url = f"https://download.kiwix.org/release/kiwix-tools/{zip_name}"
-    zip_path = env_dir / zip_name
-
-    if not zip_path.exists():
-        console.print(f"[cyan]Downloading kiwix-tools {kiwix_version}...[/cyan]")
-        _download_file(url, zip_path, f"kiwix-tools {kiwix_version}")
+    # Platform-specific Kiwix runtime URLs
+    if target_os == "windows":
+        archive_name = f"kiwix-tools_win-x86_64-{kiwix_version}.zip"
+        url = f"https://download.kiwix.org/release/kiwix-tools/{archive_name}"
+        archive_path = env_dir / archive_name
+        extract_func = _extract_zip
+    elif target_os == "linux":
+        archive_name = f"kiwix-tools_linux-x86_64-{kiwix_version}.tar.gz"
+        url = f"https://download.kiwix.org/release/kiwix-tools/{archive_name}"
+        archive_path = env_dir / archive_name
+        extract_func = _extract_tarball
+    elif target_os == "darwin":
+        archive_name = f"kiwix-tools_darwin-x86_64-{kiwix_version}.tar.gz"
+        url = f"https://download.kiwix.org/release/kiwix-tools/{archive_name}"
+        archive_path = env_dir / archive_name
+        extract_func = _extract_tarball
     else:
-        console.print(f"[yellow]Using cached {zip_name}[/yellow]")
+        raise ValueError(f"Unsupported target OS: {target_os}")
+
+    if not archive_path.exists():
+        console.print(f"[cyan]Downloading kiwix-tools {kiwix_version} for {target_os}...[/cyan]")
+        _download_file(url, archive_path, f"kiwix-tools {kiwix_version}")
+    else:
+        console.print(f"[yellow]Using cached {archive_name}[/yellow]")
 
     console.print("[cyan]Extracting kiwix-serve...[/cyan]")
-    _extract_zip(zip_path, kiwix_dir)
+    extract_func(archive_path, kiwix_dir)
 
     # The archive usually drops files into a subdirectory; flatten if needed.
     subdirs = [d for d in kiwix_dir.iterdir() if d.is_dir()]
@@ -763,14 +807,23 @@ def _provision_kiwix_runtime(root: Path, kiwix_version: str) -> Path:
                 shutil.move(str(item), str(target))
         shutil.rmtree(subdirs[0])
 
-    serve = kiwix_dir / "kiwix-serve.exe"
-    if not serve.exists():
-        raise RuntimeError(f"kiwix-serve.exe not found after extraction in {kiwix_dir}")
+    kiwix_serve = kiwix_dir / f"kiwix-serve{exe_ext}"
+    if not kiwix_serve.exists():
+        raise RuntimeError(f"kiwix-serve{exe_ext} not found after extraction in {kiwix_dir}")
     return kiwix_dir
 
 
-def _write_portable_launcher(root: Path) -> None:
-    """Generate C2_Portal.bat at the drive root for zero-install launching."""
+def _write_portable_launchers(root: Path, target_os: str) -> None:
+    """Generate platform-specific launchers at the drive root for zero-install launching."""
+    from .os_utils import get_executable_extension, get_script_extension
+
+    # Always generate both launchers for cross-drive compatibility
+    _write_windows_launcher(root)
+    _write_posix_launcher(root)
+
+
+def _write_windows_launcher(root: Path) -> None:
+    """Generate C2_Portal.bat at the drive root for Windows zero-install launching."""
     bat_path = root / "C2_Portal.bat"
     bat_content = r'''@echo off
 :: C2_Portal.bat - Autonomous Edge Launcher
@@ -793,6 +846,33 @@ pause
     os.system(f'attrib -h "{bat_path}" >nul 2>&1')
 
 
+def _write_posix_launcher(root: Path) -> None:
+    """Generate C2_Portal.sh at the drive root for POSIX zero-install launching."""
+    sh_path = root / "C2_Portal.sh"
+    sh_content = r'''#!/bin/bash
+# C2_Portal.sh - Autonomous Edge Launcher
+
+# 1. Force the working directory to the USB drive root
+cd "$(dirname "$0")"
+
+# 2. Prepend the isolated kiwix-serve to the local session PATH
+export PATH="$(pwd)/.kb_env/kiwix:$PATH"
+
+# 3. Launch the portal using the embedded Python environment
+echo "[KBB] Initializing Autonomous Runtime..."
+".kb_env/python/python" -m knowledge_base_builder.cli portal "$(pwd)/."
+
+# Keep terminal open on error
+if [ $? -ne 0 ]; then
+    echo "Press Enter to exit..."
+    read
+fi
+'''
+    sh_path.write_text(sh_content, encoding="utf-8")
+    # Make the script executable
+    os.chmod(sh_path, 0o755)
+
+
 @app.command()
 def portable(
     path: str = typer.Argument(..., help="Root path of the portable tactical drive"),
@@ -807,36 +887,55 @@ def portable(
         "--package",
         help="KBB package to install (PyPI spec or local wheel path)",
     ),
+    target_os: str = typer.Option(
+        None,
+        "--target-os",
+        help="Target OS for provisioning (windows, linux, darwin). Defaults to current platform.",
+    ),
 ):
     """Provision a self-contained, zero-install runtime on a portable drive.
 
     Creates .kb_env/python (embedded Python), .kb_env/kiwix (kiwix-serve), and
-    C2_Portal.bat at the drive root.
+    platform-specific launchers at the drive root.
     """
+    from .os_utils import get_platform_name, get_executable_extension, get_script_extension
+
     root = Path(path).resolve()
     root.mkdir(parents=True, exist_ok=True)
 
+    # Determine target platform
+    if target_os is None:
+        target_os = get_platform_name()
+    else:
+        target_os = target_os.lower()
+        if target_os not in ("windows", "linux", "darwin"):
+            console.print(f"[bold red]Invalid target OS: {target_os}. Must be windows, linux, or darwin.[/bold red]")
+            raise typer.Exit(1)
+
     console.print(Panel(
         f"Provisioning autonomous runtime on {root}\n"
+        f"Target OS: {target_os}\n"
         f"Python: {python_version} | Kiwix: {kiwix_version}",
         title="Portable C2 Builder",
         border_style="cyan",
     ))
 
     try:
-        python_dir = _provision_python_runtime(root, python_version)
-        _bootstrap_pip(python_dir)
-        _install_portable_packages(python_dir, package_spec, python_version)
-        _provision_kiwix_runtime(root, kiwix_version)
-        _write_portable_launcher(root)
+        python_dir = _provision_python_runtime(root, python_version, target_os)
+        _bootstrap_pip(python_dir, target_os)
+        _install_portable_packages(python_dir, package_spec, python_version, target_os)
+        _provision_kiwix_runtime(root, kiwix_version, target_os)
+        _write_portable_launchers(root, target_os)
     except Exception as e:
         console.print(f"[bold red]Provisioning failed:[/bold red] {e}")
         raise typer.Exit(1)
 
+    launcher_ext = get_script_extension()
+    launcher_name = f"C2_Portal{launcher_ext}"
     console.print(Panel(
         f"[bold green]Autonomous C2 runtime ready.[/bold green]\n\n"
-        f"Insert this drive into any Windows host and run:\n"
-        f"  {root}\\C2_Portal.bat",
+        f"Insert this drive into any {target_os} host and run:\n"
+        f"  {root}\\{launcher_name}",
         title="Done",
         border_style="green",
     ))

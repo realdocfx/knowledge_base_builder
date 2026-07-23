@@ -517,25 +517,10 @@ class ZimBucket(BaseBucket):
     def _detect_fat32_mode(self, target_file: Path, total_size: int) -> bool:
         """Return True when the target filesystem is FAT32 and the payload exceeds
         the per-file chunk limit."""
-        drive = target_file.anchor
-        if not drive:
-            return False
-        try:
-            import ctypes
-            fs_type = ctypes.create_string_buffer(256)
-            ctypes.windll.kernel32.GetVolumeInformationA(
-                drive.encode(),
-                None,
-                0,
-                None,
-                None,
-                None,
-                fs_type,
-                256,
-            )
-            if b"FAT32" not in fs_type.value:
-                return False
-        except Exception:
+        from .os_utils import get_fs_type
+
+        fs_type = get_fs_type(target_file)
+        if not fs_type or "FAT32" not in fs_type:
             return False
 
         # Any payload larger than the chunk limit must be split; files right at
