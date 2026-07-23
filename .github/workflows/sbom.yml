@@ -3,45 +3,34 @@ name: Generate SBOM
 on:
   push:
     branches: [ main ]
-  pull_request:
-    branches: [ main ]
-  workflow_dispatch:
+  release:
+    types: [published]
 
 jobs:
-  generate-sbom:
+  build-sbom:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
+      - name: Checkout Code
         uses: actions/checkout@v4
-      
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
-      
-      - name: Install dependencies
+          python-version: "3.11"
+          cache: 'pip'
+
+      - name: Install Build Dependencies
         run: |
-          python -m pip install pip-tools cyclonedx-bom
-      
-      - name: Generate requirements.txt with hashes
-        run: |
-          pip-compile --generate-hashes requirements.in
-      
+          python -m pip install --upgrade pip
+          pip install pip-tools cyclonedx-bom
+
       - name: Generate CycloneDX SBOM
         run: |
           python scripts/generate_sbom.py
-      
-      - name: Upload SBOM artifact
+
+      - name: Upload SBOM Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: sbom
+          name: sbom.json
           path: sbom.json
-          
-      - name: Commit SBOM
-        if: github.event_name == 'push'
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add sbom.json requirements.txt
-          git diff --staged --quiet || git commit -m "Update SBOM and requirements.txt"
-          git push
+          retention-days: 90

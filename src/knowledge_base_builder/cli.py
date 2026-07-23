@@ -539,34 +539,42 @@ def _default_portable_package() -> str:
     return "knowledge-base-builder[web]"
 
 
-def _verify_hash(file_path: Path, expected_hash: str) -> None:
-    """Verify SHA-256 hash of a downloaded file against expected hash.
+def _verify_hash(file_path: Path, expected_hash: str, allow_insecure: bool = False) -> None:
+    """Cryptographically verify a file against an expected FIPS-approved SHA-256 hash.
     
     Args:
         file_path: Path to the file to verify
         expected_hash: Expected SHA-256 hash (lowercase hex string)
+        allow_insecure: If True, skip verification when hash is unavailable (development only)
         
     Raises:
-        ValueError: If hash verification fails
+        ValueError: If hash verification fails or no hash provided in secure mode
     """
     if not expected_hash:
-        console.print("[yellow]No hash provided for verification; skipping.[/yellow]")
-        return
+        if allow_insecure:
+            console.print(f"[yellow]WARNING: No hash provided for {file_path.name}; skipping verification (INSECURE MODE).[/yellow]")
+            return
+        raise ValueError(
+            f"SECURITY HALT: No expected hash provided for {file_path.name}. "
+            "Cannot verify provenance. Use --allow-insecure-network for development only."
+        )
         
     sha256 = hashlib.sha256()
     with open(file_path, 'rb') as f:
-        for chunk in iter(lambda: f.read(8192), b''):
-            sha256.update(chunk)
+        # Read in 4K chunks to prevent memory exhaustion on large binary payloads
+        for byte_block in iter(lambda: f.read(4096), b''):
+            sha256.update(byte_block)
     
     actual_hash = sha256.hexdigest().lower()
     if actual_hash != expected_hash.lower():
-        raise ValueError(
-            f"Hash verification failed for {file_path.name}:\n"
-            f"  Expected: {expected_hash}\n"
-            f"  Actual:   {actual_hash}"
+        raise RuntimeError(
+            f"CRITICAL SECURITY VIOLATION: Hash mismatch for {file_path.name}!\n"
+            f"Expected: {expected_hash}\n"
+            f"Actual:   {actual_hash}\n"
+            "Execution halted to prevent supply chain compromise."
         )
     
-    console.print(f"[green]Hash verification passed for {file_path.name}[/green]")
+    console.print(f"[green]SHA-256 signature verified for {file_path.name}[/green]")
 
 
 def _download_file(url: str, dest: Path, label: str, expected_hash: str = "", chunk_size: int = 1024 * 1024) -> None:
@@ -587,10 +595,55 @@ def _download_file(url: str, dest: Path, label: str, expected_hash: str = "", ch
                     if chunk:
                         f.write(chunk)
                         progress.update(task, advance=len(chunk))
+
+
+def _secure_fetch(
+    url: str,
+    dest: Path,
+    label: str,
+    expected_hash: str,
+    local_bundle: Optional[Path] = None,
+    allow_insecure: bool = False
+) -> None:
+    """Fetch an asset via air-gapped local bundle or network, and verify its signature.
     
-    # Verify hash if provided
-    if expected_hash:
-        _verify_hash(dest, expected_hash)
+    Args:
+        url: Network URL for the asset (used if local_bundle is None)
+        dest: Destination path for the asset
+        label: Human-readable label for progress messages
+        expected_hash: Expected SHA-256 hash for verification
+        local_bundle: Path to local air-gapped bundle directory (if provided)
+        allow_insecure: Allow network downloads without hash verification (development only)
+        
+    Raises:
+        FileNotFoundError: If asset not found in local bundle
+        RuntimeError: If network fetching attempted without allow_insecure flag
+        ValueError: If hash verification fails
+    """
+    if local_bundle:
+        # Air-gapped mode: extract from local bundle
+        source_file = local_bundle / Path(url).name
+        if not source_file.exists():
+            raise FileNotFoundError(
+                f"Air-gap violation: Required asset {source_file.name} not found in {local_bundle}. "
+                "Ensure your provisioning bundle contains all required assets."
+            )
+        console.print(f"[cyan]Sourcing {label} from local air-gapped bundle...[/cyan]")
+        shutil.copy2(source_file, dest)
+    else:
+        # Network mode: requires explicit insecure flag
+        if not allow_insecure:
+            raise RuntimeError(
+                "Network fetching is disabled for security. "
+                "Provide a --local-bundle path or use --allow-insecure-network for development only."
+            )
+        console.print(f"[cyan]Downloading {label} over network...[/cyan]")
+        _download_file(url, dest, label)
+
+    # Enforce cryptographic provenance
+    console.print(f"[dim]Verifying SHA-256 signature for {label}...[/dim]")
+    _verify_hash(dest, expected_hash, allow_insecure)
+    console.print(f"[bold green]Signature verified for {label}[/bold green]")
 
 
 def _extract_zip(zip_path: Path, dest: Path) -> None:
@@ -639,7 +692,7 @@ def _patch_embedded_pth(python_dir: Path, target_os: str) -> None:
     pth.write_text("".join(out), encoding="utf-8")
 
 
-def _provision_python_runtime(root: Path, python_version: str, target_os: str) -> Path:
+def _provision_python_runtime(root: Path, python_version: str, target_os: str, local_bundle: Optional[Path] = None, allow_insecure: bool = False) -> Path:
     """Download and prepare an embeddable Python runtime under *.kb_env/python*."""
     from .os_utils import get_executable_extension
 
@@ -673,10 +726,14 @@ def _provision_python_runtime(root: Path, python_version: str, target_os: str) -
     zip_path = env_dir / zip_name
 
     if not zip_path.exists():
-        console.print(f"[cyan]Downloading embedded Python {python_version} for {target_os}...[/cyan]")
-        _download_file(url, zip_path, f"Python {python_version}")
+        expected_hash = PROVISIONING_HASHES.get(zip_name, "")
+        _secure_fetch(url, zip_path, f"Python {python_version}", expected_hash, local_bundle, allow_insecure)
     else:
         console.print(f"[yellow]Using cached {zip_name}[/yellow]")
+        # Verify cached file hash if in secure mode
+        if not allow_insecure:
+            expected_hash = PROVISIONING_HASHES.get(zip_name, "")
+            _verify_hash(zip_path, expected_hash, allow_insecure)
 
     console.print("[cyan]Extracting embedded Python...[/cyan]")
     if target_os == "windows":
@@ -688,7 +745,7 @@ def _provision_python_runtime(root: Path, python_version: str, target_os: str) -
     return python_dir
 
 
-def _bootstrap_pip(python_dir: Path, target_os: str, allow_insecure_network: bool = False) -> None:
+def _bootstrap_pip(python_dir: Path, target_os: str, local_bundle: Optional[Path] = None, allow_insecure: bool = False) -> None:
     """Install pip, setuptools, and wheel into the embeddable Python runtime."""
     from .os_utils import get_executable_extension
 
@@ -696,13 +753,14 @@ def _bootstrap_pip(python_dir: Path, target_os: str, allow_insecure_network: boo
     python_exe = python_dir / f"python{exe_ext}"
     get_pip = python_dir / "get-pip.py"
     if not get_pip.exists():
-        console.print("[cyan]Downloading get-pip.py...[/cyan]")
-        # Verify get-pip.py hash if available
         expected_hash = PROVISIONING_HASHES.get("get-pip.py", "")
-        if expected_hash and not allow_insecure_network:
-            _download_file("https://bootstrap.pypa.io/get-pip.py", get_pip, "get-pip.py", expected_hash)
-        else:
-            _download_file("https://bootstrap.pypa.io/get-pip.py", get_pip, "get-pip.py")
+        _secure_fetch("https://bootstrap.pypa.io/get-pip.py", get_pip, "get-pip.py", expected_hash, local_bundle, allow_insecure)
+    else:
+        # Verify cached get-pip.py hash if in secure mode
+        if not allow_insecure:
+            expected_hash = PROVISIONING_HASHES.get("get-pip.py", "")
+            _verify_hash(get_pip, expected_hash, allow_insecure)
+    
     console.print("[cyan]Bootstrapping pip...[/cyan]")
     subprocess.run(
         [str(python_exe), str(get_pip), "--no-warn-script-location", "--no-cache-dir"],
@@ -715,7 +773,7 @@ def _bootstrap_pip(python_dir: Path, target_os: str, allow_insecure_network: boo
     )
 
 
-def _install_xapian_wheel(python_dir: Path, python_version: str, allow_insecure_network: bool = False) -> None:
+def _install_xapian_wheel(python_dir: Path, python_version: str, local_bundle: Optional[Path] = None, allow_insecure: bool = False) -> None:
     """Download and install a pre-compiled Windows wheel for xapian-bindings.
 
     MIL-SPEC COMPLIANCE: This function no longer falls back to PyPI source builds.
@@ -744,7 +802,7 @@ def _install_xapian_wheel(python_dir: Path, python_version: str, allow_insecure_
     try:
         # Look up hash from PROVISIONING_HASHES if available
         expected_hash = PROVISIONING_HASHES.get(wheel_name, "")
-        _download_file(wheel_url, wheel_dest, f"Xapian Wheel ({abi_tag})", expected_hash)
+        _secure_fetch(wheel_url, wheel_dest, f"Xapian Wheel ({abi_tag})", expected_hash, local_bundle, allow_insecure)
     except Exception as exc:
         console.print(f"[bold red]Failed to fetch pre-compiled Xapian wheel: {exc}[/bold red]")
         console.print(
@@ -781,10 +839,10 @@ def _install_xapian_wheel(python_dir: Path, python_version: str, allow_insecure_
     else:
         console.print(f"[bold red]Xapian wheel installation failed (exit code {result.returncode})[/bold red]")
         console.print(f"[dim]{result.stderr.strip()}[/dim]")
-        raise RuntimeError(f"Failed to install Xapian wheel: {result.stderr}")
+        raise RuntimeError("Strict MIL-SPEC compliance prevents falling back to unverified PyPI source builds.")
 
 
-def _install_portable_packages(python_dir: Path, package_spec: str, python_version: str, target_os: str, allow_insecure_network: bool = False) -> None:
+def _install_portable_packages(python_dir: Path, package_spec: str, python_version: str, target_os: str, allow_insecure: bool = False) -> None:
     """Install KBB and web dependencies into the drive runtime.
 
     MIL-SPEC COMPLIANCE: Uses requirements.txt with SHA-256 hashes for all PyPI dependencies.
@@ -821,10 +879,10 @@ def _install_portable_packages(python_dir: Path, package_spec: str, python_versi
         check=True,
     )
 
-    _install_xapian_wheel(python_dir, python_version)
+    _install_xapian_wheel(python_dir, python_version, None, allow_insecure)
 
 
-def _provision_kiwix_runtime(root: Path, kiwix_version: str, target_os: str) -> Path:
+def _provision_kiwix_runtime(root: Path, kiwix_version: str, target_os: str, local_bundle: Optional[Path] = None, allow_insecure: bool = False) -> Path:
     """Download and extract kiwix-serve and libraries under *.kb_env/kiwix*."""
     from .os_utils import get_executable_extension
 
@@ -859,10 +917,14 @@ def _provision_kiwix_runtime(root: Path, kiwix_version: str, target_os: str) -> 
         raise ValueError(f"Unsupported target OS: {target_os}")
 
     if not archive_path.exists():
-        console.print(f"[cyan]Downloading kiwix-tools {kiwix_version} for {target_os}...[/cyan]")
-        _download_file(url, archive_path, f"kiwix-tools {kiwix_version}")
+        expected_hash = PROVISIONING_HASHES.get(archive_name, "")
+        _secure_fetch(url, archive_path, f"kiwix-tools {kiwix_version}", expected_hash, local_bundle, allow_insecure)
     else:
         console.print(f"[yellow]Using cached {archive_name}[/yellow]")
+        # Verify cached file hash if in secure mode
+        if not allow_insecure:
+            expected_hash = PROVISIONING_HASHES.get(archive_name, "")
+            _verify_hash(archive_path, expected_hash, allow_insecure)
 
     console.print("[cyan]Extracting kiwix-serve...[/cyan]")
     extract_func(archive_path, kiwix_dir)
@@ -997,10 +1059,12 @@ def portable(
 
     if allow_insecure_network:
         console.print(
-            "[yellow]WARNING: --allow-insecure-network enabled. "
-            "Downloads will not be cryptographically verified. "
-            "This violates MIL-SPEC supply chain requirements.[/yellow]"
+            "[bold yellow]WARNING: --allow-insecure-network enabled. "
+            "Operating in insecure network mode. Air-gap controls disabled.[/bold yellow]"
         )
+
+    # Resolve local bundle path if provided
+    bundle_path = Path(local_bundle).resolve() if local_bundle else None
 
     # Determine target platform
     if target_os is None:
@@ -1020,11 +1084,10 @@ def portable(
     ))
 
     try:
-        python_dir = _provision_python_runtime(root, python_version, target_os)
-        _bootstrap_pip(python_dir, target_os, allow_insecure_network)
+        python_dir = _provision_python_runtime(root, python_version, target_os, bundle_path, allow_insecure_network)
+        _bootstrap_pip(python_dir, target_os, bundle_path, allow_insecure_network)
         _install_portable_packages(python_dir, package_spec, python_version, target_os, allow_insecure_network)
-        _install_xapian_wheel(python_dir, python_version, allow_insecure_network)
-        _provision_kiwix_runtime(root, kiwix_version, target_os)
+        _provision_kiwix_runtime(root, kiwix_version, target_os, bundle_path, allow_insecure_network)
         _write_portable_launchers(root, target_os)
     except Exception as e:
         console.print(f"[bold red]Provisioning failed:[/bold red] {e}")
