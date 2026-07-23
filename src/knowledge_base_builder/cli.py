@@ -1,8 +1,19 @@
-import typer
-from typing import Any, Optional, List
-from datetime import datetime
+import os
+import shutil
+import socket
+import stat
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import webbrowser
+import zipfile
 from pathlib import Path
+from typing import Any, List, Optional
 
+import requests
+import typer
 from rich.console import Console
 from rich.table import Table
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, DownloadColumn, TimeRemainingColumn
@@ -10,6 +21,7 @@ from rich.panel import Panel
 from rich.live import Live
 from rich.console import Group
 
+from . import __version__ as _kbb_version
 from .buckets import UsbBucket, ZimBucket
 from .engines import ArchiveEngine, WikipediaEngine
 from .presentation import serve_bucket
@@ -28,7 +40,42 @@ app = typer.Typer(
     help="Knowledge-Base-Builder: Mathematically perfect knowledge base local manager.",
     no_args_is_help=True
 )
+
+# Pre-compiled Xapian wheel configuration for the portable runtime.
+XAPIAN_WHEEL_VERSION = "1.4.22"
+XAPIAN_WHEEL_REPO = "realdocfx/knowledge_base_builder"
 console = Console()
+
+
+def _open_browser(url: str) -> None:
+    """Open *url* in Chrome when available, otherwise the system default browser."""
+    candidates = [
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    ]
+    for exe in candidates:
+        if Path(exe).exists():
+            subprocess.Popen(
+                [exe, url],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            return
+    webbrowser.open(url)
+
+
+def _wait_and_open_browser(host: str, port: int, url: str) -> None:
+    """Poll the portal socket and open the browser once it accepts connections."""
+    for _ in range(120):
+        try:
+            with socket.create_connection((host, port), timeout=1):
+                time.sleep(2)
+                _open_browser(url)
+                return
+        except OSError:
+            time.sleep(1)
+    _open_browser(url)
 
 
 def get_engine(source: str, verbose: bool = False, **kwargs):
@@ -453,12 +500,346 @@ def portal(
         raise typer.Exit(1) from exc
 
     portal_app.state.bucket_root = str(Path(path).resolve())
-    url = f"http://{host}:{port}"
+    display_host = "127.0.0.1" if host in ("0.0.0.0", "::") else host
+    url = f"http://{display_host}:{port}"
     console.print(f"[cyan]Starting C2 Knowledge Portal at {url} ...[/cyan]")
     if not no_browser:
-        import webbrowser
-        webbrowser.open(url)
+        threading.Thread(
+            target=_wait_and_open_browser,
+            args=(display_host, port, url),
+            daemon=True,
+        ).start()
     uvicorn.run(portal_app, host=host, port=port, log_level="info")
+
+
+def _default_portable_package() -> str:
+    """Return a built wheel path if available, otherwise fall back to PyPI."""
+    # cli.py lives in src/knowledge_base_builder, so the repo root is two parents up.
+    repo_root = Path(__file__).resolve().parents[2]
+    dist_dir = repo_root / "dist"
+    if dist_dir.exists():
+        wheels = sorted(
+            dist_dir.glob("knowledge_base_builder-*.whl"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        if wheels:
+            return f"{wheels[0]}[web]"
+    return "knowledge-base-builder[web]"
+
+
+def _download_file(url: str, dest: Path, label: str, chunk_size: int = 1024 * 1024) -> None:
+    """Download *url* to *dest* with a Rich progress bar."""
+    with requests.get(url, stream=True, timeout=60) as r:
+        r.raise_for_status()
+        total = int(r.headers.get("content-length", 0))
+        with Progress(
+            TextColumn(PROGRESS_DESC),
+            BarColumn(),
+            DownloadColumn(),
+            TimeRemainingColumn(),
+            console=console,
+        ) as progress:
+            task = progress.add_task(f"[cyan]{label}", total=total)
+            with open(dest, "wb") as f:
+                for chunk in r.iter_content(chunk_size=chunk_size):
+                    if chunk:
+                        f.write(chunk)
+                        progress.update(task, advance=len(chunk))
+
+
+def _extract_zip(zip_path: Path, dest: Path) -> None:
+    """Extract a ZIP archive into *dest*."""
+    with zipfile.ZipFile(zip_path, "r") as z:
+        z.extractall(dest)
+
+
+def _patch_embedded_pth(python_dir: Path) -> None:
+    """Patch the embeddable python*._pth to enable site-packages and import site."""
+    pth_files = list(python_dir.glob("python*._pth"))
+    if not pth_files:
+        raise RuntimeError(f"No python*._pth file found in {python_dir}")
+    pth = pth_files[0]
+    lines = pth.read_text(encoding="utf-8").splitlines(keepends=True)
+    out = []
+    import_site = False
+    site_pkg_line = "Lib\\site-packages\n"
+    for line in lines:
+        stripped = line.strip()
+        if stripped.lower() == "import site":
+            out.append("import site\n")
+            import_site = True
+            continue
+        out.append(line)
+    if not import_site:
+        out.append("import site\n")
+    # Add site-packages path relative to python.exe location if missing.
+    if site_pkg_line not in out:
+        out.append(site_pkg_line)
+    pth.write_text("".join(out), encoding="utf-8")
+
+
+def _provision_python_runtime(root: Path, python_version: str) -> Path:
+    """Download and prepare an embeddable Python runtime under *.kb_env/python*."""
+    env_dir = root / ".kb_env"
+    python_dir = env_dir / "python"
+    python_dir.mkdir(parents=True, exist_ok=True)
+
+    if (python_dir / "python.exe").exists():
+        console.print("[yellow]Embedded Python already present; skipping download.[/yellow]")
+        _patch_embedded_pth(python_dir)
+        return python_dir
+
+    zip_name = f"python-{python_version}-embed-amd64.zip"
+    url = f"https://www.python.org/ftp/python/{python_version}/{zip_name}"
+    zip_path = env_dir / zip_name
+
+    if not zip_path.exists():
+        console.print(f"[cyan]Downloading embedded Python {python_version}...[/cyan]")
+        _download_file(url, zip_path, f"Python {python_version}")
+    else:
+        console.print(f"[yellow]Using cached {zip_name}[/yellow]")
+
+    console.print("[cyan]Extracting embedded Python...[/cyan]")
+    _extract_zip(zip_path, python_dir)
+    _patch_embedded_pth(python_dir)
+    return python_dir
+
+
+def _bootstrap_pip(python_dir: Path) -> None:
+    """Install pip, setuptools, and wheel into the embeddable Python runtime."""
+    python_exe = python_dir / "python.exe"
+    get_pip = python_dir / "get-pip.py"
+    if not get_pip.exists():
+        console.print("[cyan]Downloading get-pip.py...[/cyan]")
+        _download_file("https://bootstrap.pypa.io/get-pip.py", get_pip, "get-pip.py")
+    console.print("[cyan]Bootstrapping pip...[/cyan]")
+    subprocess.run(
+        [str(python_exe), str(get_pip), "--no-warn-script-location", "--no-cache-dir"],
+        check=True,
+    )
+    # Ensure build tooling is present so any source-only dependencies can be built if needed.
+    subprocess.run(
+        [str(python_exe), "-m", "pip", "install", "--no-cache-dir", "setuptools", "wheel"],
+        check=True,
+    )
+
+
+def _install_xapian_wheel(python_dir: Path, python_version: str) -> None:
+    """Download and install a pre-compiled Windows wheel for xapian-bindings.
+
+    The ABI tag is derived from the embedded Python version (e.g. ``3.11.4`` ->
+    ``cp311``). A missing or incompatible wheel silently falls back to the
+    source build available on PyPI, which itself is allowed to fail without
+    aborting provisioning.
+    """
+    python_exe = python_dir / "python.exe"
+    v = python_version.split(".")[:2]
+    abi_tag = f"cp{v[0]}{v[1]}"
+    wheel_name = (
+        f"xapian_bindings-{XAPIAN_WHEEL_VERSION}-{abi_tag}-{abi_tag}-win_amd64.whl"
+    )
+
+    wheel_url = os.environ.get("KBB_XAPIAN_WHEEL_URL")
+    if not wheel_url:
+        wheel_url = (
+            f"https://github.com/{XAPIAN_WHEEL_REPO}/"
+            f"releases/download/v{_kbb_version}/{wheel_name}"
+        )
+
+    wheel_dest = python_dir.parent / wheel_name
+
+    console.print("[cyan]Attempting to provision pre-compiled Xapian bindings...[/cyan]")
+    try:
+        _download_file(wheel_url, wheel_dest, f"Xapian Wheel ({abi_tag})")
+    except Exception as exc:
+        console.print(f"[yellow]Could not fetch pre-compiled Xapian wheel ({exc}); falling back.[/yellow]")
+    else:
+        result = subprocess.run(
+            [
+                str(python_exe),
+                "-m",
+                "pip",
+                "install",
+                "--no-cache-dir",
+                "--force-reinstall",
+                str(wheel_dest),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            console.print(
+                "[bold green]Native Xapian search engine installed successfully.[/bold green]"
+            )
+            return
+        console.print(
+            "[yellow]Pre-compiled Xapian wheel failed to install; falling back to source build.[/yellow]"
+        )
+
+    console.print("[cyan]Attempting optional Xapian bindings build from PyPI...[/cyan]")
+    result = subprocess.run(
+        [str(python_exe), "-m", "pip", "install", "--no-cache-dir", "xapian-bindings>=1.4.0"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode == 0:
+        console.print("[bold green]Native Xapian search engine installed successfully.[/bold green]")
+    else:
+        console.print(
+            "[yellow]xapian-bindings could not be installed; "
+            "the FTS overlay will be disabled at runtime.[/yellow]"
+        )
+        if result.stderr:
+            console.print(f"[dim]{result.stderr.strip()}[/dim]")
+
+
+def _install_portable_packages(python_dir: Path, package_spec: str, python_version: str) -> None:
+    """Install KBB and web dependencies into the drive runtime.
+
+    ``xapian-bindings`` is provisioned from a pre-compiled Windows wheel matching
+    the embedded Python ABI when available, with a best-effort PyPI source-build
+    fallback. A failure must not abort the rest of the portable environment.
+    """
+    python_exe = python_dir / "python.exe"
+
+    # Strip extras from the spec so we control the web dependencies ourselves.
+    # e.g. "path/to/wheel.whl[web]" -> "path/to/wheel.whl"
+    base_spec = package_spec.split("[")[0] if "[" in package_spec else package_spec
+
+    console.print(f"[cyan]Installing {base_spec} into portable runtime...[/cyan]")
+    subprocess.run(
+        [str(python_exe), "-m", "pip", "install", "--no-cache-dir", "--force-reinstall", base_spec],
+        check=True,
+    )
+
+    console.print("[cyan]Installing web runtime dependencies...[/cyan]")
+    subprocess.run(
+        [
+            str(python_exe),
+            "-m",
+            "pip",
+            "install",
+            "--no-cache-dir",
+            "fastapi>=0.100.0",
+            "uvicorn[standard]>=0.23.0",
+            "httpx>=0.24.0",
+        ],
+        check=True,
+    )
+
+    _install_xapian_wheel(python_dir, python_version)
+
+
+def _provision_kiwix_runtime(root: Path, kiwix_version: str) -> Path:
+    """Download and extract kiwix-serve.exe and libraries under *.kb_env/kiwix*."""
+    env_dir = root / ".kb_env"
+    kiwix_dir = env_dir / "kiwix"
+    kiwix_dir.mkdir(parents=True, exist_ok=True)
+
+    if (kiwix_dir / "kiwix-serve.exe").exists():
+        console.print("[yellow]kiwix-serve already present; skipping download.[/yellow]")
+        return kiwix_dir
+
+    zip_name = f"kiwix-tools_win-x86_64-{kiwix_version}.zip"
+    url = f"https://download.kiwix.org/release/kiwix-tools/{zip_name}"
+    zip_path = env_dir / zip_name
+
+    if not zip_path.exists():
+        console.print(f"[cyan]Downloading kiwix-tools {kiwix_version}...[/cyan]")
+        _download_file(url, zip_path, f"kiwix-tools {kiwix_version}")
+    else:
+        console.print(f"[yellow]Using cached {zip_name}[/yellow]")
+
+    console.print("[cyan]Extracting kiwix-serve...[/cyan]")
+    _extract_zip(zip_path, kiwix_dir)
+
+    # The archive usually drops files into a subdirectory; flatten if needed.
+    subdirs = [d for d in kiwix_dir.iterdir() if d.is_dir()]
+    if len(subdirs) == 1:
+        for item in subdirs[0].iterdir():
+            target = kiwix_dir / item.name
+            if not target.exists():
+                shutil.move(str(item), str(target))
+        shutil.rmtree(subdirs[0])
+
+    serve = kiwix_dir / "kiwix-serve.exe"
+    if not serve.exists():
+        raise RuntimeError(f"kiwix-serve.exe not found after extraction in {kiwix_dir}")
+    return kiwix_dir
+
+
+def _write_portable_launcher(root: Path) -> None:
+    """Generate C2_Portal.bat at the drive root for zero-install launching."""
+    bat_path = root / "C2_Portal.bat"
+    bat_content = r'''@echo off
+:: C2_Portal.bat - Autonomous Edge Launcher
+title Knowledge Base C2 Portal
+
+:: 1. Force the working directory to the USB drive root
+cd /d "%~dp0"
+
+:: 2. Prepend the isolated kiwix-serve to the local session PATH
+set PATH=%~dp0.kb_env\kiwix;%PATH%
+
+:: 3. Launch the portal using the embedded Python environment
+echo [KBB] Initializing Autonomous Runtime...
+".kb_env\python\python.exe" -m knowledge_base_builder.cli portal "%~dp0."
+
+pause
+'''
+    bat_path.write_text(bat_content, encoding="utf-8")
+    # Make the batch file easily visible by removing the hidden attribute if set.
+    os.system(f'attrib -h "{bat_path}" >nul 2>&1')
+
+
+@app.command()
+def portable(
+    path: str = typer.Argument(..., help="Root path of the portable tactical drive"),
+    python_version: str = typer.Option(
+        f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+        "--python-version",
+        help="Embedded Python version to download",
+    ),
+    kiwix_version: str = typer.Option("3.8.1", "--kiwix-version", help="Kiwix tools version to download"),
+    package_spec: str = typer.Option(
+        _default_portable_package(),
+        "--package",
+        help="KBB package to install (PyPI spec or local wheel path)",
+    ),
+):
+    """Provision a self-contained, zero-install runtime on a portable drive.
+
+    Creates .kb_env/python (embedded Python), .kb_env/kiwix (kiwix-serve), and
+    C2_Portal.bat at the drive root.
+    """
+    root = Path(path).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+
+    console.print(Panel(
+        f"Provisioning autonomous runtime on {root}\n"
+        f"Python: {python_version} | Kiwix: {kiwix_version}",
+        title="Portable C2 Builder",
+        border_style="cyan",
+    ))
+
+    try:
+        python_dir = _provision_python_runtime(root, python_version)
+        _bootstrap_pip(python_dir)
+        _install_portable_packages(python_dir, package_spec, python_version)
+        _provision_kiwix_runtime(root, kiwix_version)
+        _write_portable_launcher(root)
+    except Exception as e:
+        console.print(f"[bold red]Provisioning failed:[/bold red] {e}")
+        raise typer.Exit(1)
+
+    console.print(Panel(
+        f"[bold green]Autonomous C2 runtime ready.[/bold green]\n\n"
+        f"Insert this drive into any Windows host and run:\n"
+        f"  {root}\\C2_Portal.bat",
+        title="Done",
+        border_style="green",
+    ))
 
 
 if __name__ == "__main__":

@@ -1,5 +1,6 @@
 import hashlib
 import json
+import logging
 import os
 import shutil
 import tempfile
@@ -8,6 +9,9 @@ from typing import Any, Dict, List, Optional
 from datetime import datetime
 
 from ..base import BaseBucket
+from ..presentation import _physical_zim_path
+
+logger = logging.getLogger(__name__)
 
 
 class ZimBucket(BaseBucket):
@@ -168,6 +172,88 @@ class ZimBucket(BaseBucket):
             **disk_info
         }
 
+    def extract_fulltext_index(self, identifier: str) -> bool:
+        """Extract the embedded Xapian full-text index from a finalized ZIM.
+
+        The extracted single-file glass database is written to
+        ``<state_dir>/wiki_fts/<identifier>/xapian`` alongside a small
+        ``metadata.json`` sidecar used by the search endpoint.
+
+        Extraction is idempotent and non-fatal: a missing or broken index is
+        logged but does not abort the download.
+        """
+        try:
+            from libzim.reader import Archive
+        except Exception as exc:  # pragma: no cover - libzim is a core dependency
+            logger.warning("libzim not available; cannot extract FTS index: %s", exc)
+            return False
+
+        logical_path = self.root / f"{identifier}.zim"
+        physical_path = _physical_zim_path(logical_path, self.root)
+        if not physical_path.exists():
+            logger.warning("Cannot extract FTS index; ZIM not found at %s", physical_path)
+            return False
+
+        fts_dir = self.state_dir / "wiki_fts" / identifier
+        fts_file = fts_dir / "xapian"
+        meta_file = fts_dir / "metadata.json"
+        if fts_file.exists() and meta_file.exists():
+            logger.info("FTS index already extracted for %s", identifier)
+            return True
+
+        fts_dir.mkdir(parents=True, exist_ok=True)
+
+        index_paths = [
+            "X/fulltext/xapian",
+            "fulltext/xapian",
+            "Z/fulltextIndex/xapian",
+        ]
+
+        try:
+            archive = Archive(str(physical_path))
+            try:
+                entry = None
+                for path in index_paths:
+                    try:
+                        entry = archive.get_entry_by_path(path)
+                        break
+                    except KeyError:
+                        continue
+
+                if entry is None:
+                    logger.warning("No Xapian fulltext index found in %s", identifier)
+                    return False
+
+                item = entry.get_item()
+                if not getattr(item, "size", 0):
+                    logger.warning("Empty Xapian fulltext index entry in %s", identifier)
+                    return False
+
+                # Write the libzim memoryview directly to disk to avoid a
+                # second multi-GB contiguous allocation.
+                with open(fts_file, "wb") as f:
+                    f.write(item.content)
+
+                new_namespace = False
+                try:
+                    new_namespace = bool(archive.has_new_namespace_scheme)
+                except Exception:
+                    pass
+
+                metadata = {
+                    "book_name": identifier,
+                    "new_namespace": new_namespace,
+                }
+                meta_file.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+
+                logger.info("Extracted FTS index for %s (%d bytes)", identifier, item.size)
+                return True
+            finally:
+                archive.close()
+        except Exception as exc:
+            logger.warning("Failed to extract FTS index for %s: %s", identifier, exc)
+            return False
+
     def write_and_verify_zim(self, identifier: str, response_stream, total_size: int) -> Dict[str, Any]:
         """Streams a massive ZIM payload to disk with real-time MD5 computation.
 
@@ -184,11 +270,9 @@ class ZimBucket(BaseBucket):
         state = self.get_state()
         chunks = state.get("chunks", {})
         splits = state.get("splits", {})
-        hasher = hashlib.md5()
-
         if fat32_mode:
             return self._write_and_verify_split(
-                identifier, response_stream, total_size, state, chunks, splits, hasher
+                identifier, response_stream, total_size, state, chunks, splits
             )
 
         # --- single-file (non-FAT32) path ---
@@ -199,8 +283,9 @@ class ZimBucket(BaseBucket):
 
         if offset > 0 and temp_file.exists():
             bytes_written = temp_file.stat().st_size
-            bytes_written = self._hash_file(hasher, temp_file, 0, total_size)
             if bytes_written >= total_size:
+                hasher = hashlib.md5()
+                self._hash_file(hasher, temp_file, 0, total_size)
                 return self._verify_and_finalize(temp_file, target_file, hasher, total_size)
 
         headers = {"Range": f"bytes={bytes_written}-"} if bytes_written > 0 else {}
@@ -211,7 +296,7 @@ class ZimBucket(BaseBucket):
             for chunk in response_stream.iter_content(chunk_size=self.CHUNK_SIZE):
                 if chunk:
                     f.write(chunk)
-                    bytes_written = self._update_hash(hasher, chunk, bytes_written, total_size)
+                    bytes_written += len(chunk)
 
                     if bytes_written % (self.CHUNK_SIZE * 128) == 0:
                         chunks[identifier] = bytes_written
@@ -221,7 +306,8 @@ class ZimBucket(BaseBucket):
                     if total_size and bytes_written - last_printed >= progress_interval:
                         print(
                             f"  {identifier}: {bytes_written / (1024 * 1024 * 1024):.2f} GB / "
-                            f"{total_size / (1024 * 1024 * 1024):.2f} GB"
+                            f"{total_size / (1024 * 1024 * 1024):.2f} GB",
+                            flush=True,
                         )
                         last_printed = bytes_written
 
@@ -230,6 +316,8 @@ class ZimBucket(BaseBucket):
             state["chunks"] = chunks
             self.update_state(state)
 
+        hasher = hashlib.md5()
+        self._hash_file(hasher, temp_file, 0, total_size)
         return self._verify_and_finalize(temp_file, target_file, hasher, total_size)
 
     def _write_and_verify_split(
@@ -240,7 +328,6 @@ class ZimBucket(BaseBucket):
         state: Dict[str, Any],
         chunks: Dict[str, int],
         splits: Dict[str, Any],
-        hasher,
     ) -> Dict[str, Any]:
         """Split-aware streaming, resume and verification path for FAT32."""
         slice_offsets, current_slice, active_size, bytes_written = self._get_split_progress(
@@ -249,20 +336,11 @@ class ZimBucket(BaseBucket):
         progress_interval = 100 * 1024 * 1024
         last_printed = 0
 
-        # Restore cryptographic state from completed slices and active partial.
-        for i in range(len(slice_offsets)):
-            self._hash_file(
-                hasher,
-                self._slice_temp_path(identifier, i),
-                sum(slice_offsets[:i]),
-                total_size,
-            )
-
         active_path = self._slice_temp_path(identifier, current_slice)
-        if active_size > 0:
-            self._hash_file(hasher, active_path, bytes_written - active_size, total_size)
 
         if bytes_written >= total_size:
+            hasher = hashlib.md5()
+            self._hash_split_files(hasher, identifier, current_slice, total_size)
             return self._verify_and_finalize_split(identifier, current_slice, hasher, total_size)
 
         # If the active slice already hit the chunk limit but the download was
@@ -308,13 +386,14 @@ class ZimBucket(BaseBucket):
                     current_file.write(to_write)
                     written = len(to_write)
                     slice_bytes += written
-                    bytes_written = self._update_hash(hasher, to_write, bytes_written, total_size)
+                    bytes_written += written
                     chunk = chunk[written:]
 
                     if total_size and bytes_written - last_printed >= progress_interval:
                         print(
                             f"  {identifier}: {bytes_written / (1024 * 1024 * 1024):.2f} GB / "
-                            f"{total_size / (1024 * 1024 * 1024):.2f} GB"
+                            f"{total_size / (1024 * 1024 * 1024):.2f} GB",
+                            flush=True,
                         )
                         last_printed = bytes_written
                         # Periodic state flush so a failure never loses >100 MB of progress.
@@ -358,6 +437,8 @@ class ZimBucket(BaseBucket):
         state["chunks"] = chunks
         self.update_state(state)
 
+        hasher = hashlib.md5()
+        self._hash_split_files(hasher, identifier, current_slice, total_size)
         return self._verify_and_finalize_split(identifier, current_slice, hasher, total_size)
 
     def _verify_and_finalize(self, temp_file: Path, target_file: Path, hasher, total_size: int) -> Dict[str, Any]:
@@ -377,6 +458,7 @@ class ZimBucket(BaseBucket):
                 raise ValueError(f"Invalid ZIM header detected. Expected {self.ZIM_MAGIC_NUMBER}, got {magic}.")
 
         os.replace(temp_file, target_file)
+        self.extract_fulltext_index(target_file.stem)
         return {
             "status": "verified",
             "bytes_written": total_size,
@@ -417,6 +499,8 @@ class ZimBucket(BaseBucket):
             del state["splits"][identifier]
         self.update_state(state)
 
+        self.extract_fulltext_index(identifier)
+
         return {
             "status": "verified",
             "bytes_written": total_size,
@@ -431,9 +515,8 @@ class ZimBucket(BaseBucket):
                 p.unlink()
 
     def _detect_fat32_mode(self, target_file: Path, total_size: int) -> bool:
-        """Return True when the target filesystem is FAT32 and the payload > 4 GB."""
-        if total_size <= 4 * 1024 * 1024 * 1024:
-            return False
+        """Return True when the target filesystem is FAT32 and the payload exceeds
+        the per-file chunk limit."""
         drive = target_file.anchor
         if not drive:
             return False
@@ -450,9 +533,14 @@ class ZimBucket(BaseBucket):
                 fs_type,
                 256,
             )
-            return b"FAT32" in fs_type.value
+            if b"FAT32" not in fs_type.value:
+                return False
         except Exception:
             return False
+
+        # Any payload larger than the chunk limit must be split; files right at
+        # 4 GiB are invalid on FAT32, so using the chunk limit is the safe guard.
+        return total_size > self.FAT32_CHUNK_LIMIT
 
     def _get_split_progress(
         self, identifier: str, total_size: int, splits: Dict[str, Any]
@@ -498,6 +586,16 @@ class ZimBucket(BaseBucket):
                 bytes_before = self._update_hash(hasher, chunk, bytes_before, total_size)
         return bytes_before
 
+    def _hash_split_files(
+        self, hasher, identifier: str, last_slice: int, total_size: int
+    ) -> int:
+        """Hash all temporary split slices in order, skipping the final 16 checksum bytes."""
+        bytes_before = 0
+        for i in range(last_slice + 1):
+            path = self._slice_temp_path(identifier, i)
+            bytes_before = self._hash_file(hasher, path, bytes_before, total_size)
+        return bytes_before
+
     @staticmethod
     def _update_hash(hasher, chunk: bytes, bytes_before: int, total_size: int) -> int:
         """Update the MD5 hasher with *chunk*, excluding the final 16 checksum bytes."""
@@ -517,8 +615,9 @@ class ZimBucket(BaseBucket):
     def _reopen_stream(self, url: str, headers: Dict[str, str]):
         """Reopen an HTTP stream with Range headers for resume support."""
         import requests
-        # (connect timeout, read timeout) to tolerate slow spiky Kiwix mirrors
-        return requests.get(url, headers=headers, stream=True, timeout=(30, 300))
+        # Shorter read timeout so a stalled mirror trips quickly and the caller
+        # can retry/resume instead of hanging forever.
+        return requests.get(url, headers=headers, stream=True, timeout=(30, 60))
 
     @staticmethod
     def _format_bytes(bytes_count: int) -> str:

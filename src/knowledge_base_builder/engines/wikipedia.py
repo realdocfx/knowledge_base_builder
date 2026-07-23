@@ -212,24 +212,37 @@ class WikipediaEngine(BaseEngine):
 
         bucket = ZimBucket(destdir)
         bucket.initialize()
-        self.logger.info(f"Initiating ZIM download from URL: {url}")
-
-        response = self.session.get(url, stream=True, timeout=(30, 300))
-        response.raise_for_status()
-
-        total_size = int(response.headers.get("Content-Length", 0))
         identifier = Path(url).stem
 
-        result = bucket.write_and_verify_zim(identifier, response, total_size)
-        bucket.mark_item_completed(identifier, result["bytes_written"])
+        max_retries = 10
+        delay = 5
+        for attempt in range(1, max_retries + 1):
+            try:
+                self.logger.info(
+                    f"Initiating ZIM download from URL: {url} (attempt {attempt}/{max_retries})"
+                )
+                response = self.session.get(url, stream=True, timeout=(30, 60))
+                response.raise_for_status()
 
-        return {
-            "identifier": identifier,
-            "files_downloaded": 1,
-            "files_skipped": 0,
-            "bytes_downloaded": result["bytes_written"],
-            "errors": [],
-        }
+                total_size = int(response.headers.get("Content-Length", 0))
+                result = bucket.write_and_verify_zim(identifier, response, total_size)
+                bucket.mark_item_completed(identifier, result["bytes_written"])
+
+                return {
+                    "identifier": identifier,
+                    "files_downloaded": 1,
+                    "files_skipped": 0,
+                    "bytes_downloaded": result["bytes_written"],
+                    "errors": [],
+                }
+            except (RequestException, ProtocolError) as e:
+                self.logger.warning(
+                    f"ZIM download attempt {attempt} failed: {e}"
+                )
+                if attempt == max_retries:
+                    raise
+                time.sleep(delay)
+                delay = min(delay * 2, 300)
 
     def pull_enterprise_snapshot(
         self,

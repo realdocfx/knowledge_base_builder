@@ -5,7 +5,7 @@ on:
     types: [published]
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   pypi-publish:
@@ -37,3 +37,20 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           password: ${{ secrets.PYPI_API_TOKEN }}
+
+  attach-xapian-wheels:
+    name: Attach Xapian wheels to release
+    runs-on: ubuntu-latest
+    needs: pypi-publish
+    steps:
+      - name: Download all wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-*
+          path: wheels
+
+      - name: Attach wheels to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: wheels/**/*
+          fail_on_unmatched_files: false

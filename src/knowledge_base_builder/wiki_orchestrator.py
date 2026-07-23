@@ -348,6 +348,14 @@ class ZimDownloader:
             if src.exists():
                 src.unlink()
 
+        # If the staging bucket extracted an FTS index, migrate it to the final
+        # bucket so the portal can search the finalized ZIM.
+        stage_fts_dir = stage_dir / ".kb_state" / "wiki_fts" / identifier
+        final_fts_dir = final_dir / ".kb_state" / "wiki_fts" / identifier
+        if stage_fts_dir.exists():
+            final_fts_dir.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(stage_fts_dir), str(final_fts_dir))
+
         final_bucket = ZimBucket(str(final_dir))
         final_bucket.initialize()
         final_bucket.mark_item_completed(identifier, stats["bytes_downloaded"])

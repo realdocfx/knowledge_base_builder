@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "knowledge-base-builder"
-version = "0.4.2"
+version = "0.4.3"
 description = "Mathematically perfect knowledge base local manager"
 readme = "README.md"
 requires-python = ">=3.8"
@@ -52,6 +52,8 @@ dependencies = [
 web = [
     "fastapi>=0.100.0",
     "uvicorn[standard]>=0.23.0",
+    "httpx>=0.24.0",
+    "xapian-bindings>=1.4.0",
 ]
 dev = [
     "pytest>=7.0.0",

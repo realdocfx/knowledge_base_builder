@@ -1,0 +1,79 @@
+name: Build Xapian Windows Wheels
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  build-wheels:
+    runs-on: windows-2022
+    strategy:
+      matrix:
+        python-version: ["3.8", "3.9", "3.10", "3.11", "3.12", "3.13"]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            autotools
+            gcc
+            g++
+            make
+            libtool
+            python
+
+      - name: Install vcpkg
+        run: |
+          git clone https://github.com/Microsoft/vcpkg.git C:/vcpkg
+          C:/vcpkg/bootstrap-vcpkg.bat
+          C:/vcpkg/vcpkg install xapian:x64-windows-release
+
+      - name: Download Xapian bindings source
+        run: |
+          Invoke-WebRequest -Uri "https://oligarchy.co.uk/xapian/1.4.22/xapian-bindings-1.4.22.tar.xz" -OutFile xapian-bindings.tar.xz
+          tar -xf xapian-bindings.tar.xz
+
+      - name: Build Xapian bindings
+        shell: msys2 {0}
+        run: |
+          cd xapian-bindings-1.4.22
+          ./configure \
+            --with-python3 \
+            --without-csharp --without-java --without-lua \
+            --without-perl --without-php --without-ruby --without-tcl \
+            XAPIAN_CONFIG="C:/vcpkg/installed/x64-windows-release/tools/xapian/xapian-config" \
+            PYTHON3="python" \
+            PYTHON3_LIB="$PWD/stage"
+          make -j2
+          make install DESTDIR="$PWD/stage"
+
+      - name: Collect wheel artifacts
+        run: |
+          $python_version = "${{ matrix.python-version }}"
+          $v = $python_version.Split('.')
+          $abi_tag = "cp{0}{1}" -f $v[0], $v[1]
+          $wheel_name = "xapian_bindings-1.4.22-{0}-{0}-win_amd64.whl" -f $abi_tag
+          mkdir wheel
+          Copy-Item xapian-bindings-1.4.22/stage/xapian -Recurse -Destination wheel
+          Copy-Item C:/vcpkg/installed/x64-windows-release/bin/xapian.dll wheel/xapian
+          python -m pip install delvewheel
+          delvewheel repair wheel/xapian --wheel-dir wheel
+          Rename-Item wheel/xapian_bindings-1.4.22-cp*-cp*-win_amd64.whl $wheel_name
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.python-version }}
+          path: wheel/*.whl

@@ -33,6 +33,21 @@ def _logical_zim_path(path: Path) -> Path:
     return path
 
 
+def _physical_zim_path(logical: Path, root: Path) -> Path:
+    """Return a concrete path that kiwix-serve can open.
+
+    For split archives the logical ``.zim`` file does not exist; the first
+    slice ``.zimaa`` is returned. libzim 9.2+ auto-resolves the logical name,
+    but pointing directly at the first slice keeps the launch deterministic.
+    """
+    if logical.exists():
+        return logical
+    first_slice = root / f"{logical.stem}.zimaa"
+    if first_slice.exists():
+        return first_slice
+    return logical
+
+
 def discover_archives(root: Path) -> List[Tuple[str, Path]]:
     """Return a list of (display name, logical path) for local ZIM archives.
 
@@ -67,28 +82,43 @@ def discover_archives(root: Path) -> List[Tuple[str, Path]]:
     return archives
 
 
+def _find_kiwix_binary(root: Path) -> str:
+    """Locate a kiwix-serve binary, preferring a portable runtime on *root*."""
+    candidates = [
+        root / ".kb_env" / "kiwix" / "kiwix-serve.exe",
+        root / ".kb_env" / "kiwix" / "kiwix-serve",
+    ]
+    for cand in candidates:
+        if cand.exists():
+            return str(cand)
+    system = shutil.which("kiwix-serve")
+    if system:
+        return system
+    raise RuntimeError(
+        "kiwix-serve binary not found. Install it from https://kiwix.org/en/applications/ "
+        "or run: kb-builder portable <drive>"
+    )
+
+
 def launch_kiwix_server(root: Path, port: int, archives: List[Tuple[str, Path]]) -> subprocess.Popen:
     """Launch ``kiwix-serve`` against the discovered archives.
 
     Raises:
-        RuntimeError: If the ``kiwix-serve`` binary is not on ``PATH``.
+        RuntimeError: If the ``kiwix-serve`` binary cannot be found.
         OSError: If the binary cannot be executed.
     """
-    binary = shutil.which("kiwix-serve")
-    if not binary:
-        raise RuntimeError(
-            "kiwix-serve binary not found. Install it from https://kiwix.org/en/applications/ "
-            "or via your package manager, then ensure it is on PATH."
-        )
+    binary = _find_kiwix_binary(root)
 
     cmd = [binary, "--port", str(port)]
-    # kiwix-serve accepts the logical .zim path for split archives.
-    cmd.extend(str(path) for _, path in archives)
+    # kiwix-serve accepts the logical .zim path for split archives, but
+    # passing the first physical slice (.zimaa) is robust across libzim versions.
+    for _, logical in archives:
+        physical = _physical_zim_path(logical, root)
+        cmd.append(str(physical))
     return subprocess.Popen(
         cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
         cwd=str(root),
     )
 

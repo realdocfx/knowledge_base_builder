@@ -8,6 +8,7 @@ from urllib3.exceptions import ProtocolError
 from requests.exceptions import RequestException
 from rich.logging import RichHandler
 
+from ..archive_index import ArchiveIndex
 from ..base import BaseEngine
 
 # Format mapping for macros that expand to multiple IA format strings
@@ -233,7 +234,7 @@ class ArchiveEngine(BaseEngine):
                         if target_path.exists():
                             existing_bytes += target_path.stat().st_size
 
-                total_required_bytes = sum(f.get('size', 0) for f in target_files)
+                total_required_bytes = sum(int(f.get('size', 0) or 0) for f in target_files)
                 delta_bytes = max(0, total_required_bytes - existing_bytes)
 
                 _, _, free = shutil.disk_usage(destdir)
@@ -271,10 +272,19 @@ class ArchiveEngine(BaseEngine):
                         self.logger.debug(f"[{identifier}] Skipped (Already exists/Verified): {file_name}")
                     else:
                         download_stats['files_downloaded'] += 1
-                        download_stats['bytes_downloaded'] += file_info.get('size', 0)
+                        download_stats['bytes_downloaded'] += int(file_info.get('size', 0) or 0)
                         self.logger.info(f"[{identifier}] Successfully wrote and verified: {file_name}")
 
                 self.logger.info(f"[{identifier}] Payload secured. Total bytes: {self._format_bytes(download_stats['bytes_downloaded'])}")
+
+                # --- LOCAL FTS5 INDEX PERSISTENCE ---
+                try:
+                    index = ArchiveIndex(Path(destdir))
+                    index.index_item(identifier, item.metadata, target_files, Path(destdir))
+                    self.logger.info(f"[{identifier}] Indexed {len(target_files)} file(s) in local FTS5.")
+                except Exception as index_err:
+                    self.logger.warning(f"[{identifier}] FTS5 index error (non-fatal): {index_err}")
+
                 return download_stats
 
             except (ConnectionError, TimeoutError, RequestException, ProtocolError) as net_err:

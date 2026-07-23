@@ -883,6 +883,43 @@ python -m build
 python -m twine upload dist/*
 ```
 
+### Pre-Compiled Xapian Wheels
+
+The `kb-builder portable` command on Windows requires pre-compiled `xapian-bindings` wheels to avoid needing a C++ compiler. These wheels are built and attached to GitHub releases by the `build-xapian-wheels.yml` workflow.
+
+#### Wheel Naming Convention
+
+Wheels follow the pattern:
+
+```
+xapian_bindings-{xapian_version}-{abi_tag}-{abi_tag}-win_amd64.whl
+```
+
+- **xapian_bindings**: Package name (underscores per PEP 427)
+- **xapian_version**: Xapian version (e.g., `1.4.22`)
+- **abi_tag**: Python ABI tag (e.g., `cp311` for Python 3.11)
+- **win_amd64**: Platform tag
+
+Example: `xapian_bindings-1.4.22-cp311-cp311-win_amd64.whl`
+
+#### CI/CD Workflow
+
+The `.github/workflows/build-xapian-wheels.yml` workflow:
+- Triggers on release publication or manual dispatch
+- Builds wheels for Python 3.8–3.13 on `windows-2022`
+- Uses MSYS2/MinGW-w64 and vcpkg to build `xapian-core` and `xapian-bindings`
+- Bundles `xapian.dll` into the wheel using `delvewheel`
+- Uploads artifacts which are then attached to the release by `publish.yml`
+
+#### Environment Override
+
+For local testing, set the `KBB_XAPIAN_WHEEL_URL` environment variable to override the default GitHub Release URL:
+
+```powershell
+$env:KBB_XAPIAN_WHEEL_URL = "https://example.com/custom.whl"
+kb-builder portable D:
+```
+
 ### Post-Release
 
 1. Announce release in relevant channels
