@@ -8,16 +8,22 @@ Install the web extra: ``pip install -e .[web]``.
 """
 
 import asyncio
+import html
 import json
 import logging
+import mimetypes
 import os
+import posixpath
 import re
 import shutil
 import socket
 import subprocess
 import time
+import urllib.parse
 import urllib.request
 import uuid
+import xml.etree.ElementTree as ET
+import zipfile
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
@@ -352,7 +358,7 @@ async def dashboard() -> str:
     placeholder = "about:blank#kiwix-serve-not-installed"
     return DASHBOARD_HTML.replace("{{KIWIX_URL}}", placeholder).replace("{{WIKI_ENTRY_URL}}", placeholder).replace(
         f'<iframe id="wiki-frame" src="{placeholder}" title="ZIM Reader"></iframe>',
-        '<div class="card error"><h2 style="color: #ef4444;">ZIM Engine Offline</h2><p>The native kiwix-serve C++ binary is required to process ServiceWorkers and REST APIs for 1:1 Wikipedia functionality. Run <code>kb-builder portable &lt;drive&gt;</code> to inject the autonomous runtime.</p></div>'
+        '<div class="card panel-inset"><h2 class="danger-text">ZIM Engine Offline</h2><p class="mono">The native kiwix-serve C++ binary is required to process ServiceWorkers and REST APIs for 1:1 Wikipedia functionality. Run <code>kb-builder portable &lt;drive&gt;</code> to inject the autonomous runtime.</p></div>'
     )
 
 
@@ -616,7 +622,16 @@ async def wiki_proxy(request: Request, path: str) -> Response:
                 text = text.replace("</body>", FTS_OVERLAY + "\n</body>", 1)
             else:
                 text = text + FTS_OVERLAY
-            
+            # Make the Stealth-Night phosphor optic follow the operator into the
+            # fullscreen / standalone wiki. The injected head script self-filters
+            # ONLY when top-level (window.top===window.self); inside the dashboard
+            # iframe the parent #wiki-frame already carries the filter, so nested
+            # frames skip it to avoid a double invert.
+            if "</head>" in text:
+                text = text.replace("</head>", WIKI_STEALTH_INJECT + "</head>", 1)
+            else:
+                text = WIKI_STEALTH_INJECT + text
+
             # The body was decoded (httpx transparently decompresses on aread) and
             # rewritten, so drop BOTH content-length and content-encoding. Leaving
             # content-encoding=gzip makes the browser try to gunzip already-plain
@@ -672,13 +687,7 @@ async def static_files(path: str) -> Any:
     if not target.exists():
         raise HTTPException(status_code=404, detail="File not found")
     if target.is_dir():
-        # Simple directory listing.
-        entries = []
-        for item in sorted(target.iterdir()):
-            suffix = "/" if item.is_dir() else ""
-            entries.append(f'<li><a href="{item.name}{suffix}">{item.name}{suffix}</a></li>')
-        html = f"<html><body><h1>Index of /{path}</h1><ul>{''.join(entries)}</ul></body></html>"
-        return HTMLResponse(html)
+        return HTMLResponse(_render_library_listing(path, target, root))
     return FileResponse(target)
 
 
@@ -816,92 +825,355 @@ FTS_OVERLAY = """
 
 
 DASHBOARD_HTML = """<!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-view-mode="standard">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Tactical C2 Knowledge Portal</title>
+<title>KBB // Tactical C2 Knowledge Portal</title>
+<script>
+  /* Pre-paint: apply the saved optics BEFORE first paint so Stealth Night never
+     flashes a bright frame (critical for night light-discipline). */
+  (function(){try{var m=localStorage.getItem('kbb-view-mode');
+    if(m==='stealth-night'||m==='standard'){document.documentElement.setAttribute('data-view-mode',m);}
+    var b=localStorage.getItem('kbb-stealth-bright');
+    if(b){document.documentElement.style.setProperty('--stealth-bright',(b/100).toFixed(2));}
+  }catch(e){}})();
+</script>
 <style>
-  body { font-family: system-ui, sans-serif; margin: 0; padding: 1rem 2rem; background: #0f172a; color: #e2e8f0; }
-  h1 { color: #38bdf8; font-size: 1.8rem; margin-bottom: 0.5rem; }
-  h2 { color: #94a3b8; border-bottom: 1px solid #334155; padding-bottom: 0.3rem; margin-top: 0; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; margin-bottom: 1rem; }
-  .card { background: #1e293b; border-radius: 0.5rem; padding: 1rem; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.5); }
-  .metric { font-size: 1.3rem; font-weight: bold; color: #38bdf8; margin-top: 0.3rem; }
-  .mono { font-family: monospace; font-size: 0.85rem; color: #cbd5e1; }
-  .section-header { margin-top: 2rem; padding-top: 1rem; border-top: 2px solid #2563eb; color: #f8fafc; text-transform: uppercase; letter-spacing: 0.05em; }
-  input, select, button { padding: 0.5rem; border-radius: 0.3rem; border: 1px solid #475569; background: #0f172a; color: #f8fafc; font-size: 0.95rem; }
-  button { background: #2563eb; border: none; cursor: pointer; font-weight: bold; transition: background 0.2s; }
-  button:hover { background: #1d4ed8; }
-  .reader-container { display: flex; flex-direction: column; height: 75vh; }
-  iframe { flex-grow: 1; width: 100%; border: none; border-radius: 0.5rem; background: white; }
-  table { width: 100%; border-collapse: collapse; margin-top: 1rem; }
-  th, td { text-align: left; padding: 0.5rem; border-bottom: 1px solid #334155; }
+  /* ======================================================================
+     KBB design tokens — Netscape / NCSA-Mosaic Win95 identity: #c0c0c0
+     chrome, outset/inset bevels, Times body, Courier mono, classic links,
+     phosphor accents. (Standard optic.)
+     ====================================================================== */
+  :root{
+    color-scheme: light only;
+    --silver:#c0c0c0; --panel:#d0d0d0; --field:#e0e0e0; --canvas:#ffffff;
+    --ink:#000000; --ink-soft:#404040; --mono-ink:#000080;
+    --hi:#ffffff; --mid:#808080; --lo:#404040;
+    --link:#0000ee; --visited:#551a8b; --active:#ff0000;
+    --ok:#006000; --danger:#a00000; --warn:#905000; --info:#004080; --phosphor:#00d000;
+    --font-body:"Times New Roman",Times,Georgia,serif;
+    --font-mono:"Courier New",Courier,monospace;
+    --bevel-out:var(--hi) var(--lo) var(--lo) var(--hi);
+    --bevel-in:var(--lo) var(--hi) var(--hi) var(--lo);
+    --bevel-panel-out:var(--hi) var(--mid) var(--mid) var(--hi);
+    --bevel-panel-in:var(--mid) var(--hi) var(--hi) var(--mid);
+    --gap:14px; --radius:0; --content:1180px;
+    /* tactical extensions (tokenised so both optics theme cleanly) */
+    --row-alt:#d8d8d8; --th-bg:#a0a0a0;
+    --btn-primary:#b8c0d8; --btn-danger:#b08080;
+    --stealth-bright:.72;
+    --iframe-filter:none; --iframe-bg:#ffffff;
+  }
+  /* ======================================================================
+     Stealth Night Green overrides (tactical-tokens). Absolute-black surfaces,
+     monochrome phosphor ink, low-signature bevels: zero light-bleed so the
+     display does not give away operator position within visual range.
+     ====================================================================== */
+  [data-view-mode="stealth-night"]{
+    color-scheme: dark only;
+    --silver:#020802; --panel:#041204; --field:#000500; --canvas:#000000;
+    --ink:#00d000; --ink-soft:#008800; --mono-ink:#00ff00;
+    --hi:#003300; --mid:#002200; --lo:#001100;
+    --link:#00ff66; --visited:#00bb44; --active:#ffffff;
+    --ok:#00ff00; --danger:#ff3333; --warn:#ffcc00; --info:#00ccff; --phosphor:#00ff00;
+    --row-alt:#041a04; --th-bg:#052605;
+    --btn-primary:#032a12; --btn-danger:#2a0505;
+    /* darken + green-tint the bright wiki iframe to suppress night glare.
+       NB: --iframe-bg stays #ffffff (inherited from :root) on purpose — the
+       invert() turns white PRE-invert into true black POST-invert. Setting it
+       to #000000 here would invert to WHITE and bleed light. */
+    --iframe-filter: invert(1) sepia(1) hue-rotate(75deg) saturate(3.2) brightness(var(--stealth-bright,.72)) contrast(1.05);
+  }
+
+  /* ---- Base (adapted from mosaic.css) ---------------------------------- */
+  *{box-sizing:border-box;}
+  body{
+    background:var(--silver);
+    background-image:linear-gradient(0deg, rgba(255,255,255,.04), rgba(0,0,0,.04));
+    color:var(--ink); font-family:var(--font-body); font-size:15px; line-height:1.45;
+    margin:0; padding:0;
+  }
+  a{color:var(--link); text-decoration:underline;}
+  a:visited{color:var(--visited);} a:active{color:var(--active);}
+  h1{font-size:1.7rem;font-weight:bold;margin:.2em 0 .5em;border-bottom:2px solid var(--mid);padding-bottom:4px;}
+  h2{font-size:1.15rem;font-weight:bold;margin:1em 0 .4em;border-bottom:1px solid var(--mid);padding-bottom:2px;}
+  h2:first-child,h3:first-child{margin-top:0;}
+  .muted{color:var(--ink-soft);}
+  .mono{font-family:var(--font-mono);font-size:.85rem;}
+  .ok-text{color:var(--ok);font-weight:bold;}
+  .danger-text{color:var(--danger);font-weight:bold;}
+  code{font-family:var(--font-mono);color:var(--mono-ink);word-break:break-all;}
+  hr{border:none;height:2px;background:var(--mid);box-shadow:0 1px 0 var(--hi);margin:14px 0;}
+
+  /* ---- Fixed tactical header ------------------------------------------- */
+  .topbar{
+    position:sticky; top:0; z-index:50;
+    display:flex; justify-content:space-between; align-items:center;
+    padding:6px 14px; gap:12px; flex-wrap:wrap;
+    background:var(--silver); border-bottom:2px solid var(--mid);
+    box-shadow:inset 0 1px 0 var(--hi), 0 2px 4px rgba(0,0,0,.25);
+  }
+  .brand{font-weight:bold;letter-spacing:.5px;color:var(--ink);text-decoration:none;font-size:1.05rem;display:inline-flex;align-items:center;gap:8px;}
+  .brand:visited{color:var(--ink);}
+  .brand span{color:var(--ink-soft);font-weight:normal;}
+  .brand-logo{height:26px;width:26px;display:block;color:var(--phosphor);}
+  .topbar nav{display:flex;align-items:center;gap:2px;flex-wrap:wrap;}
+  .topbar nav a{margin-left:10px;text-decoration:none;color:var(--ink);font-size:.9rem;}
+  .topbar nav a:visited{color:var(--ink);}
+  .topbar nav a:hover{text-decoration:underline;}
+  .lang-btn{
+    margin-left:14px;font-weight:bold;text-decoration:none;color:var(--ink);
+    background:var(--silver);border:2px solid;border-color:var(--bevel-out);
+    padding:2px 10px;font-size:.8rem;font-family:var(--font-mono);cursor:pointer;
+  }
+  .lang-btn:active{border-color:var(--bevel-in);}
+
+  /* ---- App shell (robust flexbox; stacks on narrow) -------------------- */
+  .wrap{max-width:var(--content);margin:14px auto;padding:0 16px 40px;}
+  .layout{display:flex;gap:18px;align-items:flex-start;}
+  .sidemenu{width:220px;flex:0 0 220px;position:sticky;top:56px;max-height:calc(100vh - 68px);overflow:auto;}
+  .content{flex:1 1 auto;min-width:0;}
+  @media (max-width:860px){
+    .layout{flex-direction:column;}
+    .sidemenu{width:auto;flex:none;position:static;max-height:none;}
+  }
+
+  /* ---- Panels ---------------------------------------------------------- */
+  .card{background:var(--panel);border:2px solid;border-color:var(--bevel-panel-out);padding:12px 16px;margin:14px 0;}
+  .card.panel-inset{border-color:var(--bevel-panel-in);}
+  .section-header{margin:18px 0 0;padding:6px 10px;background:var(--panel);border:2px solid;border-color:var(--bevel-out);font-weight:bold;text-transform:uppercase;letter-spacing:.06em;color:var(--ink);font-size:.9rem;}
+
+  /* ---- Side navigation ------------------------------------------------- */
+  .menu-h{font-weight:bold;font-size:.75rem;text-transform:uppercase;letter-spacing:.4px;color:var(--ink-soft);margin:12px 0 4px;border-bottom:1px solid var(--mid);padding-bottom:2px;}
+  .menu-h:first-child{margin-top:0;}
+  .sidemenu ul{list-style:none;margin:0 0 6px;padding:0;}
+  .sidemenu li{margin:2px 0;}
+  .sidemenu li a{display:block;padding:3px 6px;text-decoration:none;font-size:.9rem;color:var(--link);}
+  .sidemenu li a:hover{background:var(--field);text-decoration:underline;}
+  .sidemenu .btn{display:block;width:100%;text-align:left;margin:3px 0;}
+
+  /* ---- Form controls --------------------------------------------------- */
+  label{display:block;margin:.5em 0;color:var(--ink);font-size:.9rem;}
+  input,select,textarea{padding:4px 6px;background:var(--hi);color:var(--ink);border:2px solid;border-color:var(--bevel-in);border-radius:var(--radius);font-family:var(--font-mono);font-size:13px;max-width:100%;}
+  input[type=range]{padding:0;}
+  .row{display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap;margin:8px 0;}
+
+  /* ---- Buttons: raised; inset when pressed ----------------------------- */
+  .btn,.content button{display:inline-block;cursor:pointer;background:var(--silver);color:var(--ink);border:2px solid;border-color:var(--bevel-out);border-radius:var(--radius);padding:4px 14px;margin:4px 6px 4px 0;font-family:var(--font-body);font-weight:bold;font-size:.95rem;text-decoration:none;}
+  .btn:visited{color:var(--ink);}
+  .btn:active,.content button:active{border-color:var(--bevel-in);}
+  .btn.small{padding:1px 8px;font-size:.8rem;margin:3px 0;}
+  .btn.primary{background:var(--btn-primary);}
+  .btn.danger{background:var(--btn-danger);color:var(--danger);}
+
+  /* ---- Metric tiles ---------------------------------------------------- */
+  .metric-strip{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin:14px 0;}
+  .metric{background:var(--field);border:2px solid;border-color:var(--bevel-in);padding:10px 12px;}
+  .metric .metric-k{font-size:.72rem;color:var(--ink-soft);text-transform:uppercase;letter-spacing:.4px;}
+  .metric .metric-n{font-family:var(--font-mono);font-size:1.35rem;font-weight:bold;color:var(--mono-ink);line-height:1.15;word-break:break-all;}
+
+  /* ---- Wiki reader ----------------------------------------------------- */
+  .reader-container{display:flex;flex-direction:column;height:72vh;min-height:420px;}
+  .reader-bar{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:6px;flex-wrap:wrap;}
+  iframe#wiki-frame{flex-grow:1;width:100%;border:2px solid;border-color:var(--bevel-in);background:var(--iframe-bg);filter:var(--iframe-filter);}
+
+  /* ---- Tables ---------------------------------------------------------- */
+  table{width:100%;border-collapse:collapse;font-size:.85rem;margin-top:10px;background:var(--field);}
+  th,td{text-align:left;padding:4px 8px;border:1px solid var(--mid);vertical-align:top;}
+  th{background:var(--th-bg);color:var(--ink);font-weight:bold;}
+  tr:nth-child(even) td{background:var(--row-alt);}
+
+  /* ---- Misc ------------------------------------------------------------ */
+  pre{white-space:pre-wrap;word-break:break-word;font-family:var(--font-mono);font-size:.85rem;background:var(--field);border:2px solid;border-color:var(--bevel-in);padding:8px;margin:8px 0;overflow:auto;max-height:360px;}
+  .foot{color:var(--ink-soft);text-align:center;padding:16px;font-size:.8rem;border-top:2px solid var(--mid);box-shadow:inset 0 1px 0 var(--hi);}
+
+  /* ---- Stealth-only phosphor glow (low-glare, headings only) ----------- */
+  [data-view-mode="stealth-night"] body{background-image:linear-gradient(0deg,rgba(0,255,0,.012),rgba(0,0,0,.06));}
+  [data-view-mode="stealth-night"] h1,[data-view-mode="stealth-night"] .brand{text-shadow:0 0 4px rgba(0,255,0,.35);}
+  [data-view-mode="stealth-night"] .metric .metric-n{text-shadow:0 0 5px rgba(0,255,0,.4);}
+
+  /* ---- Optic-scoped controls (e.g. brightness only exists in stealth) --- */
+  .stealth-only{display:none;}
+  [data-view-mode="stealth-night"] .stealth-only{display:block;}
 </style>
 </head>
 <body>
 
-<h1>Command & Control (C2) Knowledge Portal</h1>
+<header class="topbar">
+  <a class="brand" href="/" title="Knowledge Base Builder">
+    <svg class="brand-logo" viewBox="0 0 32 32" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+      <rect x="3" y="3" width="26" height="26"/><circle cx="16" cy="16" r="7"/>
+      <line x1="16" y1="1" x2="16" y2="9"/><line x1="16" y1="23" x2="16" y2="31"/>
+      <line x1="1" y1="16" x2="9" y2="16"/><line x1="23" y1="16" x2="31" y2="16"/>
+      <circle cx="16" cy="16" r="1.6" fill="currentColor" stroke="none"/>
+    </svg>
+    KBB <span>// C2 KNOWLEDGE PORTAL</span>
+  </a>
+  <nav>
+    <a href="#overview">Status</a>
+    <a href="#wiki">Wiki</a>
+    <a href="#files">Files</a>
+    <a href="#remote">Acquire</a>
+    <a href="#settings">Settings</a>
+    <button class="lang-btn" id="modeToggle" type="button" onclick="toggleStealthMode()" title="Toggle Stealth Night Green (Alt+N)">[MODE: STANDARD]</button>
+  </nav>
+</header>
 
-<div class="grid" id="stats">
-    <div class="card"><div class="mono">Initializing Telemetry...</div></div>
+<div class="wrap">
+ <div class="layout">
+
+  <aside class="sidemenu">
+    <div class="card panel-inset">
+      <div class="menu-h">Navigation</div>
+      <ul>
+        <li><a href="#overview">System Status</a></li>
+        <li><a href="#wiki">Wiki Reader</a></li>
+        <li><a href="#files">Local Files</a></li>
+        <li><a href="#search">Local Search</a></li>
+        <li><a href="#remote">Remote Acquisition</a></li>
+      </ul>
+      <div class="menu-h">Actions</div>
+      <button class="btn small" type="button" onclick="loadStats()">Refresh Telemetry</button>
+      <button class="btn small" type="button" onclick="window.open('/files/','_blank')">Open File System</button>
+      <button class="btn small" type="button" onclick="window.open('{{WIKI_ENTRY_URL}}','_blank')">Fullscreen Wiki</button>
+      <button class="btn small" type="button" onclick="window.open('/docs','_blank')">API Console</button>
+      <div class="menu-h" id="settings">Settings</div>
+      <button class="btn small primary" type="button" onclick="toggleStealthMode()">Toggle View Mode</button>
+      <div class="stealth-only">
+        <label class="mono" style="font-size:.72rem;margin-top:8px;">Stealth brightness
+          <input id="stealthBright" type="range" min="30" max="120" value="72" oninput="setStealthBrightness(this.value)" title="Night-vision glare / light-bleed control" style="width:100%;">
+        </label>
+      </div>
+      <div class="mono muted" style="margin-top:6px;font-size:.72rem;">Optics: <span id="statusModeLabel">Standard Mosaic</span></div>
+      <div class="mono muted" style="margin-top:4px;font-size:.7rem;">Alt+N toggles stealth.</div>
+    </div>
+  </aside>
+
+  <main class="content">
+    <h1 id="overview">Command &amp; Control Knowledge Portal</h1>
+
+    <div id="stats" class="metric-strip">
+      <div class="metric"><div class="metric-k">Telemetry</div><div class="metric-n">Initializing&hellip;</div></div>
+    </div>
+
+    <div class="section-header" id="wiki">I. Local Intelligence Database</div>
+    <div class="card reader-container">
+      <div class="reader-bar">
+        <span class="mono ok-text" id="engineStatus">Status: ZIM Engine Active | Mode: 1:1 Interactivity</span>
+        <a href="{{WIKI_ENTRY_URL}}" target="_blank" rel="noopener">[ Expand to Fullscreen ]</a>
+      </div>
+      <iframe id="wiki-frame" src="{{WIKI_ENTRY_URL}}" title="ZIM Reader"></iframe>
+    </div>
+
+    <div class="card" id="files">
+      <h2>Local File Index (Archive.org)</h2>
+      <p class="mono muted">Browse downloaded raw PDFs, media, and manuals secured by the ArchiveEngine.</p>
+      <button class="btn" type="button" onclick="window.open('/files/', '_blank')">Open Local File System</button>
+    </div>
+
+    <div class="card" id="search">
+      <h2>Search Local Archive (FTS5)</h2>
+      <p class="mono muted">Deterministic offline full-text search across already-secured Archive.org payloads.</p>
+      <div class="row">
+        <input id="local-query" type="text" placeholder="e.g., 'manual OR guide'" style="flex:1; min-width:180px;">
+        <input id="local-limit" type="number" value="25" style="width:80px;" title="Result Limit">
+        <button class="btn primary" type="button" onclick="searchLocal()">Search Local</button>
+      </div>
+      <div id="local-results"></div>
+    </div>
+
+    <div class="section-header" id="remote">II. Remote Target Acquisition</div>
+    <div class="card">
+      <h2>Query Builder &amp; Downloader</h2>
+      <p class="mono muted">Search external nodes (Internet Archive / Kiwix OPDS) to pull new datasets into the local drive.</p>
+      <div class="row">
+        <select id="source" style="flex:0 0 auto;">
+          <option value="ia">Internet Archive</option>
+          <option value="wiki">Wikipedia (ZIM)</option>
+        </select>
+        <input id="query" type="text" placeholder="Query (e.g., 'tactical medicine')" style="flex:1; min-width:180px;">
+        <input id="limit" type="number" value="25" style="width:80px;" title="Result Limit">
+        <button class="btn primary" type="button" onclick="search()">Search</button>
+        <button class="btn" type="button" onclick="estimate()">Estimate Size</button>
+      </div>
+      <div id="results"></div>
+    </div>
+  </main>
+
+ </div>
 </div>
 
-<div class="section-header">I. Local Intelligence Database</div>
-<div class="card reader-container">
-  <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem;">
-      <span class="mono" style="color: #22c55e;">Status: ZIM Engine Active | Mode: 1:1 Interactivity</span>
-      <a href="{{WIKI_ENTRY_URL}}" target="_blank" style="color: #38bdf8; text-decoration: none;">[ Expand to Fullscreen ]</a>
-  </div>
-  <iframe id="wiki-frame" src="{{WIKI_ENTRY_URL}}" title="ZIM Reader"></iframe>
-</div>
-
-<div class="card" style="margin-top: 1rem;">
-  <h2>Local File Index (Archive.org)</h2>
-  <p class="mono">Browse downloaded raw PDFs, media, and manuals secured by the ArchiveEngine.</p>
-  <button onclick="window.open('/files/', '_blank')">Open Local File System</button>
-</div>
-
-<div class="card" style="margin-top: 1rem;">
-  <h2>Search Local Archive (FTS5)</h2>
-  <p class="mono">Deterministic offline full-text search across already-secured Archive.org payloads.</p>
-  <div style="display: flex; gap: 0.5rem; margin-bottom: 0.5rem;">
-    <input id="local-query" type="text" placeholder="e.g., 'manual OR guide'" style="flex-grow: 1;">
-    <input id="local-limit" type="number" value="25" style="width: 80px;" title="Result Limit">
-    <button onclick="searchLocal()">Search Local</button>
-  </div>
-  <div id="local-results"></div>
-</div>
-
-<div class="section-header">II. Remote Target Acquisition</div>
-<div class="card">
-  <h2>Query Builder & Downloader</h2>
-  <p class="mono" style="color: #94a3b8;">Search external nodes (Internet Archive / Kiwix OPDS) to pull new datasets into the local drive.</p>
-  <div style="display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 1rem;">
-      <select id="source">
-        <option value="ia">Internet Archive</option>
-        <option value="wiki">Wikipedia (ZIM)</option>
-      </select>
-      <input id="query" type="text" placeholder="Query (e.g., 'tactical medicine')" style="flex-grow: 1;">
-      <input id="limit" type="number" value="25" style="width: 80px;" title="Result Limit">
-      <button onclick="search()">Search</button>
-      <button onclick="estimate()" style="background: #475569;">Estimate Size</button>
-  </div>
-  <div id="results"></div>
-</div>
+<footer class="foot">KBB // C2 Knowledge Portal &middot; Netscape-Mosaic &amp; Stealth-Night dual-optics &middot; offline-autonomous, OS-independent</footer>
 
 <script>
-async function api(path) { return await (await fetch(path)).json(); }
+async function api(path) { const r = await fetch(path); return await r.json(); }
+
+/* ---- Optics: Standard Mosaic <-> Stealth Night Green ------------------- */
+function applyMode(mode) {
+  if (mode !== 'stealth-night') mode = 'standard';
+  document.documentElement.setAttribute('data-view-mode', mode);
+  var btn = document.getElementById('modeToggle');
+  var label = document.getElementById('statusModeLabel');
+  if (btn) btn.textContent = (mode === 'stealth-night') ? '[MODE: STEALTH NIGHT]' : '[MODE: STANDARD]';
+  if (label) label.textContent = (mode === 'stealth-night') ? 'Stealth Night Green (Active)' : 'Standard Mosaic';
+  try { localStorage.setItem('kbb-view-mode', mode); } catch (e) {}
+}
+function toggleStealthMode() {
+  var cur = document.documentElement.getAttribute('data-view-mode');
+  applyMode(cur === 'stealth-night' ? 'standard' : 'stealth-night');
+}
+function setStealthBrightness(v) {
+  document.documentElement.style.setProperty('--stealth-bright', (v / 100).toFixed(2));
+  try { localStorage.setItem('kbb-stealth-bright', v); } catch (e) {}
+}
+(function initMode() {
+  var mode = 'standard';
+  try { mode = localStorage.getItem('kbb-view-mode') || 'standard'; } catch (e) {}
+  applyMode(mode);
+  try {
+    var b = localStorage.getItem('kbb-stealth-bright');
+    if (b) { var s = document.getElementById('stealthBright'); if (s) s.value = b; setStealthBrightness(b); }
+  } catch (e) {}
+  document.addEventListener('keydown', function (e) {
+    if (e.altKey && (e.key === 'n' || e.key === 'N')) { e.preventDefault(); toggleStealthMode(); }
+  });
+  // Live cross-tab sync: if the operator flips optics in a /read, /files or
+  // fullscreen-wiki tab, the dashboard follows without a reload.
+  window.addEventListener('storage', function (e) {
+    if (e.key === 'kbb-view-mode') {
+      applyMode(localStorage.getItem('kbb-view-mode') || 'standard');
+    } else if (e.key === 'kbb-stealth-bright') {
+      var b = localStorage.getItem('kbb-stealth-bright');
+      if (b) {
+        var s = document.getElementById('stealthBright');
+        if (s) s.value = b;
+        document.documentElement.style.setProperty('--stealth-bright', (b / 100).toFixed(2));
+      }
+    }
+  });
+})();
+
 async function loadStats() {
-  const stats = await api('/api/stats');
-  const archives = await api('/api/archives');
-  const html = `
-    <div class="card"><div style="color: #94a3b8;">Drive Target</div><div class="metric mono">${stats.bucket_path}</div></div>
-    <div class="card"><div style="color: #94a3b8;">Drive Capacity</div><div class="metric">${stats.used_formatted} / ${stats.total_formatted}</div></div>
-    <div class="card"><div style="color: #94a3b8;">Items Secured</div><div class="metric">${stats.completed_items}</div></div>
-    <div class="card"><div style="color: #94a3b8;">ZIM Archives</div><div class="metric">${archives.length}</div></div>
-  `;
-  document.getElementById('stats').innerHTML = html;
+  try {
+    const stats = await api('/api/stats');
+    const archives = await api('/api/archives');
+    const tiles = [
+      ['Drive Target', stats.bucket_path],
+      ['Drive Capacity', (stats.used_formatted || '?') + ' / ' + (stats.total_formatted || '?')],
+      ['Items Secured', stats.completed_items],
+      ['ZIM Archives', archives.length]
+    ];
+    let html = '';
+    for (const t of tiles) {
+      const v = (t[1] === undefined || t[1] === null) ? '—' : t[1];
+      html += '<div class="metric"><div class="metric-k">' + t[0] + '</div><div class="metric-n">' + v + '</div></div>';
+    }
+    document.getElementById('stats').innerHTML = html;
+  } catch (e) {
+    document.getElementById('stats').innerHTML =
+      '<div class="metric"><div class="metric-k">Telemetry</div><div class="metric-n danger-text">LINK DOWN</div></div>';
+  }
 }
 
 async function search() {
@@ -928,7 +1200,7 @@ async function estimate() {
   const query = encodeURIComponent(document.getElementById('query').value);
   const limit = document.getElementById('limit').value;
   const est = await api(`/api/estimate?source=${source}&query=${query}&limit=${limit}`);
-  document.getElementById('results').innerHTML = `<pre class="mono" style="background: #0f172a; padding: 1rem; border-radius: 0.3rem;">${JSON.stringify(est, null, 2)}</pre>`;
+  document.getElementById('results').innerHTML = `<pre>${JSON.stringify(est, null, 2)}</pre>`;
 }
 
 async function searchLocal() {
@@ -966,3 +1238,565 @@ setInterval(loadStats, 10000);
 </body>
 </html>
 """
+
+
+# ==========================================================================
+# Shared dual-optic chrome + media reader (stealth-follows-everywhere).
+#
+# Every secondary surface (/files listing, /read viewer, EPUB reader) is
+# wrapped by _themed_page so it carries the same dual-optic tokens as the
+# dashboard and re-reads the operator's saved optic from localStorage BEFORE
+# first paint (no bright flash in Stealth Night). Un-themeable embedded media
+# (PDF / EPUB / image inside an <iframe>/<img>) is filtered via .doc-frame /
+# .doc-media so the phosphor optic follows the operator into the document.
+# ==========================================================================
+
+BRAND_SVG = (
+    '<svg class="brand-logo" viewBox="0 0 32 32" fill="none" stroke="currentColor" '
+    'stroke-width="2" aria-hidden="true"><rect x="3" y="3" width="26" height="26"/>'
+    '<circle cx="16" cy="16" r="7"/><line x1="16" y1="1" x2="16" y2="9"/>'
+    '<line x1="16" y1="23" x2="16" y2="31"/><line x1="1" y1="16" x2="9" y2="16"/>'
+    '<line x1="23" y1="16" x2="31" y2="16"/>'
+    '<circle cx="16" cy="16" r="1.6" fill="currentColor" stroke="none"/></svg>'
+)
+
+
+PREPAINT_SCRIPT = """<script>
+  /* Pre-paint: apply saved optics BEFORE first paint (night light-discipline). */
+  (function(){try{var m=localStorage.getItem('kbb-view-mode');
+    if(m==='stealth-night'||m==='standard'){document.documentElement.setAttribute('data-view-mode',m);}
+    var b=localStorage.getItem('kbb-stealth-bright');
+    if(b){document.documentElement.style.setProperty('--stealth-bright',(b/100).toFixed(2));}
+  }catch(e){}})();
+</script>
+"""
+
+
+MODE_SCRIPT = """<script>
+function applyMode(mode){
+  if(mode!=='stealth-night')mode='standard';
+  document.documentElement.setAttribute('data-view-mode',mode);
+  var btn=document.getElementById('modeToggle');
+  if(btn)btn.textContent=(mode==='stealth-night')?'[MODE: STEALTH NIGHT]':'[MODE: STANDARD]';
+  try{localStorage.setItem('kbb-view-mode',mode);}catch(e){}
+}
+function toggleStealthMode(){
+  var cur=document.documentElement.getAttribute('data-view-mode');
+  applyMode(cur==='stealth-night'?'standard':'stealth-night');
+}
+function applyBright(v){if(v)document.documentElement.style.setProperty('--stealth-bright',(v/100).toFixed(2));}
+(function(){
+  var mode='standard';
+  try{mode=localStorage.getItem('kbb-view-mode')||'standard';}catch(e){}
+  applyMode(mode);
+  try{applyBright(localStorage.getItem('kbb-stealth-bright'));}catch(e){}
+  document.addEventListener('keydown',function(e){
+    if(e.altKey&&(e.key==='n'||e.key==='N')){e.preventDefault();toggleStealthMode();}
+  });
+  window.addEventListener('storage',function(e){
+    if(e.key==='kbb-view-mode')applyMode(localStorage.getItem('kbb-view-mode')||'standard');
+    if(e.key==='kbb-stealth-bright')applyBright(localStorage.getItem('kbb-stealth-bright'));
+  });
+})();
+</script>
+"""
+
+
+# Injected into every proxied kiwix HTML page so Stealth Night follows the
+# operator into the fullscreen / standalone wiki. Self-filters ONLY at top
+# level; nested frames inherit an ancestor's filter and must not double-invert.
+WIKI_STEALTH_INJECT = """
+<style id="kbb-stealth-style">
+html.kbb-stealth{filter:invert(1) sepia(1) hue-rotate(75deg) saturate(3.2) brightness(var(--kbb-bright,.72)) contrast(1.05);background:#ffffff !important;}
+</style>
+<script>
+(function(){
+  'use strict';
+  if(window.top!==window.self)return;
+  function apply(){
+    try{
+      var el=document.documentElement;
+      var b=localStorage.getItem('kbb-stealth-bright');
+      if(b)el.style.setProperty('--kbb-bright',(b/100).toFixed(2));
+      if(localStorage.getItem('kbb-view-mode')==='stealth-night')el.classList.add('kbb-stealth');
+      else el.classList.remove('kbb-stealth');
+    }catch(e){}
+  }
+  apply();
+  window.addEventListener('storage',function(e){
+    if(e.key==='kbb-view-mode'||e.key==='kbb-stealth-bright')apply();
+  });
+})();
+</script>
+"""
+
+
+# Standalone stylesheet served at /portal.css for the secondary themed pages
+# (kept external so /files and /read stay lean; the dashboard inlines its own
+# copy for the strict no-flash guarantee). Pure CSS — no <style> wrapper.
+PORTAL_CSS = """:root{
+  color-scheme: light only;
+  --silver:#c0c0c0; --panel:#d0d0d0; --field:#e0e0e0; --canvas:#ffffff;
+  --ink:#000000; --ink-soft:#404040; --mono-ink:#000080;
+  --hi:#ffffff; --mid:#808080; --lo:#404040;
+  --link:#0000ee; --visited:#551a8b; --active:#ff0000;
+  --ok:#006000; --danger:#a00000; --warn:#905000; --info:#004080; --phosphor:#00d000;
+  --font-body:"Times New Roman",Times,Georgia,serif;
+  --font-mono:"Courier New",Courier,monospace;
+  --bevel-out:var(--hi) var(--lo) var(--lo) var(--hi);
+  --bevel-in:var(--lo) var(--hi) var(--hi) var(--lo);
+  --bevel-panel-out:var(--hi) var(--mid) var(--mid) var(--hi);
+  --bevel-panel-in:var(--mid) var(--hi) var(--hi) var(--mid);
+  --gap:14px; --radius:0; --content:1180px;
+  --row-alt:#d8d8d8; --th-bg:#a0a0a0;
+  --btn-primary:#b8c0d8; --btn-danger:#b08080;
+  --stealth-bright:.72;
+  --iframe-filter:none; --iframe-bg:#ffffff;
+}
+[data-view-mode="stealth-night"]{
+  color-scheme: dark only;
+  --silver:#020802; --panel:#041204; --field:#000500; --canvas:#000000;
+  --ink:#00d000; --ink-soft:#008800; --mono-ink:#00ff00;
+  --hi:#003300; --mid:#002200; --lo:#001100;
+  --link:#00ff66; --visited:#00bb44; --active:#ffffff;
+  --ok:#00ff00; --danger:#ff3333; --warn:#ffcc00; --info:#00ccff; --phosphor:#00ff00;
+  --row-alt:#041a04; --th-bg:#052605;
+  --btn-primary:#032a12; --btn-danger:#2a0505;
+  /* --iframe-bg stays #ffffff so invert() yields true black (no light-bleed). */
+  --iframe-filter: invert(1) sepia(1) hue-rotate(75deg) saturate(3.2) brightness(var(--stealth-bright,.72)) contrast(1.05);
+}
+*{box-sizing:border-box;}
+body{background:var(--silver);background-image:linear-gradient(0deg,rgba(255,255,255,.04),rgba(0,0,0,.04));color:var(--ink);font-family:var(--font-body);font-size:15px;line-height:1.45;margin:0;padding:0;}
+a{color:var(--link);text-decoration:underline;}
+a:visited{color:var(--visited);} a:active{color:var(--active);}
+h1{font-size:1.7rem;font-weight:bold;margin:.2em 0 .5em;border-bottom:2px solid var(--mid);padding-bottom:4px;}
+h2{font-size:1.15rem;font-weight:bold;margin:1em 0 .4em;border-bottom:1px solid var(--mid);padding-bottom:2px;}
+h2:first-child{margin-top:0;}
+.muted{color:var(--ink-soft);}
+.mono{font-family:var(--font-mono);font-size:.85rem;}
+.ok-text{color:var(--ok);font-weight:bold;}
+.danger-text{color:var(--danger);font-weight:bold;}
+code{font-family:var(--font-mono);color:var(--mono-ink);word-break:break-all;}
+.topbar{position:sticky;top:0;z-index:50;display:flex;justify-content:space-between;align-items:center;padding:6px 14px;gap:12px;flex-wrap:wrap;background:var(--silver);border-bottom:2px solid var(--mid);box-shadow:inset 0 1px 0 var(--hi),0 2px 4px rgba(0,0,0,.25);}
+.brand{font-weight:bold;letter-spacing:.5px;color:var(--ink);text-decoration:none;font-size:1.05rem;display:inline-flex;align-items:center;gap:8px;}
+.brand:visited{color:var(--ink);}
+.brand span{color:var(--ink-soft);font-weight:normal;}
+.brand-logo{height:26px;width:26px;display:block;color:var(--phosphor);}
+.topbar nav{display:flex;align-items:center;gap:2px;flex-wrap:wrap;}
+.topbar nav a{margin-left:10px;text-decoration:none;color:var(--ink);font-size:.9rem;}
+.topbar nav a:visited{color:var(--ink);}
+.topbar nav a:hover{text-decoration:underline;}
+.lang-btn{margin-left:14px;font-weight:bold;text-decoration:none;color:var(--ink);background:var(--silver);border:2px solid;border-color:var(--bevel-out);padding:2px 10px;font-size:.8rem;font-family:var(--font-mono);cursor:pointer;}
+.lang-btn:active{border-color:var(--bevel-in);}
+.wrap{max-width:var(--content);margin:14px auto;padding:0 16px 40px;}
+.card{background:var(--panel);border:2px solid;border-color:var(--bevel-panel-out);padding:12px 16px;margin:14px 0;}
+.card.panel-inset{border-color:var(--bevel-panel-in);}
+label{display:block;margin:.5em 0;color:var(--ink);font-size:.9rem;}
+input,select,textarea{padding:4px 6px;background:var(--hi);color:var(--ink);border:2px solid;border-color:var(--bevel-in);border-radius:var(--radius);font-family:var(--font-mono);font-size:13px;max-width:100%;}
+.btn,button.btn{display:inline-block;cursor:pointer;background:var(--silver);color:var(--ink);border:2px solid;border-color:var(--bevel-out);border-radius:var(--radius);padding:4px 14px;margin:4px 6px 4px 0;font-family:var(--font-body);font-weight:bold;font-size:.95rem;text-decoration:none;}
+.btn:visited{color:var(--ink);}
+.btn:active{border-color:var(--bevel-in);}
+.btn.primary{background:var(--btn-primary);}
+table{width:100%;border-collapse:collapse;font-size:.85rem;margin-top:10px;background:var(--field);}
+th,td{text-align:left;padding:4px 8px;border:1px solid var(--mid);vertical-align:top;}
+th{background:var(--th-bg);color:var(--ink);font-weight:bold;}
+tr:nth-child(even) td{background:var(--row-alt);}
+pre{white-space:pre-wrap;word-break:break-word;font-family:var(--font-mono);font-size:.85rem;background:var(--field);color:var(--ink);border:2px solid;border-color:var(--bevel-in);padding:8px;margin:8px 0;overflow:auto;}
+.foot{color:var(--ink-soft);text-align:center;padding:16px;font-size:.8rem;border-top:2px solid var(--mid);box-shadow:inset 0 1px 0 var(--hi);}
+.doc-frame{width:100%;height:calc(100vh - 172px);min-height:460px;border:2px solid;border-color:var(--bevel-in);background:var(--iframe-bg);filter:var(--iframe-filter);}
+.doc-media{display:block;max-width:100%;height:auto;margin:0 auto;background:var(--iframe-bg);filter:var(--iframe-filter);}
+.doc-text{max-height:none;}
+.doc-toolbar{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin:6px 0 8px;}
+.doc-nav{display:flex;gap:6px;align-items:center;flex-wrap:wrap;}
+.doc-nav select{max-width:56vw;}
+.breadcrumb{margin:0 0 10px;font-family:var(--font-mono);font-size:.85rem;color:var(--ink-soft);}
+.breadcrumb a{color:var(--link);}
+.filelist{list-style:none;margin:0;padding:0;}
+.filelist li{margin:0;border-bottom:1px solid var(--mid);}
+.filelist li a{display:flex;justify-content:space-between;gap:12px;padding:6px 8px;text-decoration:none;color:var(--link);}
+.filelist li a:hover{background:var(--field);}
+.filelist .fname{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.filelist .fmeta{color:var(--ink-soft);font-family:var(--font-mono);font-size:.78rem;white-space:nowrap;}
+.stealth-only{display:none;}
+[data-view-mode="stealth-night"] .stealth-only{display:block;}
+[data-view-mode="stealth-night"] body{background-image:linear-gradient(0deg,rgba(0,255,0,.012),rgba(0,0,0,.06));}
+[data-view-mode="stealth-night"] h1,[data-view-mode="stealth-night"] .brand{text-shadow:0 0 4px rgba(0,255,0,.35);}
+"""
+
+
+_IMAGE_EXT = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg", ".avif", ".ico"}
+_TEXT_EXT = {
+    ".txt", ".md", ".markdown", ".rst", ".log", ".csv", ".tsv", ".json",
+    ".xml", ".yaml", ".yml", ".ini", ".cfg", ".conf", ".py", ".sh", ".nfo",
+}
+_HTML_EXT = {".html", ".htm", ".xhtml"}
+_VIEWABLE_EXT = {".pdf", ".epub"} | _IMAGE_EXT | _TEXT_EXT | _HTML_EXT
+
+
+def _type_label(ext: str) -> str:
+    ext = ext.lower()
+    if ext == ".pdf":
+        return "PDF"
+    if ext == ".epub":
+        return "EPUB"
+    if ext in _IMAGE_EXT:
+        return "image"
+    if ext in _HTML_EXT:
+        return "HTML"
+    if ext in _TEXT_EXT:
+        return "text"
+    return "file"
+
+
+def _human_size(num_bytes: int) -> str:
+    size = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024 or unit == "TB":
+            return f"{int(size)} B" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TB"
+
+
+def _breadcrumb(rel: str) -> str:
+    crumbs = ['<a href="/files/">Library</a>']
+    acc = ""
+    for part in [p for p in rel.split("/") if p]:
+        acc = (acc + "/" + part) if acc else part
+        crumbs.append(
+            '<a href="/files/' + urllib.parse.quote(acc, safe="/") + '/">' + html.escape(part) + "</a>"
+        )
+    return " / ".join(crumbs)
+
+
+def _parent_nav(rel: str) -> Tuple[str, str]:
+    """Return (href, label) for the topbar 'back' link of a /read page."""
+    parts = [p for p in rel.split("/") if p]
+    parent = "/".join(parts[:-1])
+    if parent:
+        label = parts[-2] if len(parts) >= 2 else "Library"
+        return "/files/" + urllib.parse.quote(parent, safe="/") + "/", label
+    return "/files/", "Library"
+
+
+def _themed_page(title: str, body_html: str, back_href: str = "/", back_label: str = "Portal") -> str:
+    """Wrap body_html in the dual-optic KBB chrome (pre-paint + /portal.css)."""
+    return (
+        '<!DOCTYPE html>\n<html lang="en" data-view-mode="standard">\n<head>\n'
+        '<meta charset="utf-8">\n'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
+        "<title>" + html.escape(title) + " // KBB</title>\n"
+        + PREPAINT_SCRIPT
+        + '<link rel="stylesheet" href="/portal.css">\n'
+        "</head>\n<body>\n"
+        '<header class="topbar">\n'
+        '  <a class="brand" href="/" title="Knowledge Base Builder">'
+        + BRAND_SVG
+        + ' KBB <span>// C2 KNOWLEDGE PORTAL</span></a>\n'
+        "  <nav>\n"
+        '    <a href="' + html.escape(back_href) + '">&larr; ' + html.escape(back_label) + "</a>\n"
+        '    <button class="lang-btn" id="modeToggle" type="button" onclick="toggleStealthMode()" '
+        'title="Toggle Stealth Night Green (Alt+N)">[MODE: STANDARD]</button>\n'
+        "  </nav>\n</header>\n"
+        '<div class="wrap">\n' + body_html + "\n</div>\n"
+        '<footer class="foot">KBB // C2 Knowledge Portal &middot; dual-optics &middot; offline-autonomous</footer>\n'
+        + MODE_SCRIPT
+        + "\n</body>\n</html>"
+    )
+
+
+def _render_library_listing(path: str, target: Path, root: Path) -> str:
+    """Render a themed directory listing that links viewables to /read."""
+    rel = path.strip("/")
+    try:
+        items = sorted(target.iterdir(), key=lambda p: (p.is_file(), p.name.lower()))
+    except OSError:
+        items = []
+    rows: List[str] = []
+    for item in items:
+        name = item.name
+        item_rel = (rel + "/" + name) if rel else name
+        if item.is_dir():
+            href = "/files/" + urllib.parse.quote(item_rel, safe="/") + "/"
+            rows.append(
+                '<li><a href="' + href + '"><span class="fname">[DIR] '
+                + html.escape(name) + '/</span><span class="fmeta">directory</span></a></li>'
+            )
+            continue
+        ext = item.suffix.lower()
+        try:
+            size = _human_size(item.stat().st_size)
+        except OSError:
+            size = "?"
+        if ext in _VIEWABLE_EXT:
+            href = "/read?path=" + urllib.parse.quote(item_rel, safe="")
+        else:
+            href = "/files/" + urllib.parse.quote(item_rel, safe="/")
+        rows.append(
+            '<li><a href="' + href + '"><span class="fname">' + html.escape(name)
+            + '</span><span class="fmeta">' + size + " &middot; " + _type_label(ext)
+            + "</span></a></li>"
+        )
+    listing = "".join(rows) or '<li class="mono muted" style="padding:6px 8px;">(empty)</li>'
+    heading = "/" + html.escape(rel) if rel else "/ (Library root)"
+    body = (
+        "<h1>Local File Index</h1>\n"
+        '<div class="breadcrumb">' + _breadcrumb(rel) + "</div>\n"
+        '<div class="card">\n  <h2>Index of ' + heading + "</h2>\n"
+        '  <ul class="filelist">' + listing + "</ul>\n</div>"
+    )
+    return _themed_page("Index of /" + rel if rel else "Library", body, "/", "Portal")
+
+
+def _epub_opf_path(zf: zipfile.ZipFile) -> Optional[str]:
+    """Locate the OPF package document inside an EPUB zip."""
+    try:
+        container = zf.read("META-INF/container.xml").decode("utf-8", "replace")
+        m = re.search(r'full-path="([^"]+)"', container)
+        if m:
+            return m.group(1)
+    except (KeyError, OSError):
+        pass
+    for n in zf.namelist():
+        if n.lower().endswith(".opf"):
+            return n
+    return None
+
+
+def _epub_spine(epub_path: Path) -> Tuple[str, List[Tuple[str, str]]]:
+    """Return (book_title, [(chapter_title, internal_href), ...]) in reading order."""
+    title = epub_path.stem
+    chapters: List[Tuple[str, str]] = []
+    try:
+        with zipfile.ZipFile(epub_path, "r") as zf:
+            opf_path = _epub_opf_path(zf)
+            if not opf_path:
+                return title, chapters
+            opf_dir = posixpath.dirname(opf_path)
+            pkg = ET.fromstring(zf.read(opf_path))
+
+            t = pkg.find(".//{*}metadata/{*}title")
+            if t is not None and t.text and t.text.strip():
+                title = t.text.strip()
+
+            manifest: Dict[str, str] = {}
+            media: Dict[str, str] = {}
+            for item in pkg.findall(".//{*}manifest/{*}item"):
+                iid = item.get("id")
+                href = item.get("href")
+                if not iid or not href:
+                    continue
+                full = posixpath.normpath(posixpath.join(opf_dir, href)) if opf_dir else href
+                manifest[iid] = full
+                media[iid] = item.get("media-type", "")
+
+            spine_el = pkg.find(".//{*}spine")
+            spine_hrefs: List[str] = []
+            if spine_el is not None:
+                for ref in spine_el.findall("{*}itemref"):
+                    idref = ref.get("idref")
+                    if idref and idref in manifest:
+                        spine_hrefs.append(manifest[idref])
+
+            # Chapter titles from the NCX table of contents, if present.
+            titles: Dict[str, str] = {}
+            ncx_path = None
+            if spine_el is not None and spine_el.get("toc") in manifest:
+                ncx_path = manifest[spine_el.get("toc")]
+            if not ncx_path:
+                for iid, mt in media.items():
+                    if mt == "application/x-dtbncx+xml":
+                        ncx_path = manifest[iid]
+                        break
+            if ncx_path:
+                try:
+                    ncx = ET.fromstring(zf.read(ncx_path))
+                    ncx_dir = posixpath.dirname(ncx_path)
+                    for nav_point in ncx.findall(".//{*}navPoint"):
+                        label = nav_point.find(".//{*}navLabel/{*}text")
+                        content = nav_point.find("{*}content")
+                        if label is None or content is None or not label.text:
+                            continue
+                        src = (content.get("src") or "").split("#")[0]
+                        if not src:
+                            continue
+                        full = posixpath.normpath(posixpath.join(ncx_dir, src)) if ncx_dir else src
+                        titles.setdefault(full, label.text.strip())
+                except (ET.ParseError, KeyError, OSError):
+                    pass
+
+            for i, href in enumerate(spine_hrefs):
+                chapters.append((titles.get(href) or ("Section %d" % (i + 1)), href))
+    except (zipfile.BadZipFile, ET.ParseError, KeyError, OSError):
+        return title, chapters
+    return title, chapters
+
+
+@app.get("/portal.css")
+async def portal_css() -> Response:
+    """Standalone dual-optic stylesheet for the secondary themed pages."""
+    return Response(PORTAL_CSS, media_type="text/css")
+
+
+@app.get(
+    "/read",
+    response_class=HTMLResponse,
+    responses={
+        200: {"description": "Themed inline document viewer"},
+        403: {"description": "Path escapes the bucket root"},
+        404: {"description": "File not found"},
+        503: {"description": "Bucket not initialized"},
+    },
+)
+async def read_document(
+    path: str = Query(..., description="Bucket-relative path to the file"),
+    i: int = Query(0, ge=0, description="EPUB spine index"),
+) -> Any:
+    """Inline media reader (PDF / EPUB / image / text / HTML) inside KBB chrome.
+
+    Un-themeable media is embedded so the Stealth-Night phosphor optic follows
+    the operator via the .doc-frame / .doc-media CSS filter.
+    """
+    if BUCKET is None:
+        raise HTTPException(status_code=503, detail="Bucket not initialized")
+    root = BUCKET.root.resolve()
+    target = (root / path).resolve()
+    try:
+        target.relative_to(root)
+    except ValueError:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    if not target.exists() or not target.is_file():
+        raise HTTPException(status_code=404, detail="File not found")
+
+    rel = target.relative_to(root).as_posix()
+    ext = target.suffix.lower()
+    name = target.name
+    esc_name = html.escape(name)
+    file_url = "/files/" + urllib.parse.quote(rel, safe="/")
+    back_href, back_label = _parent_nav(rel)
+
+    def toolbar(extra: str = "") -> str:
+        return (
+            '<div class="doc-toolbar"><div class="doc-nav">' + extra + "</div>"
+            '<a class="btn" href="' + file_url + '" download>Download raw</a></div>'
+        )
+
+    if ext == ".pdf":
+        body = (
+            "<h1>" + esc_name + "</h1>" + toolbar()
+            + '<iframe class="doc-frame" src="' + file_url + '#view=FitH" title="' + esc_name + '"></iframe>'
+        )
+        return HTMLResponse(_themed_page(name, body, back_href, back_label))
+
+    if ext in _IMAGE_EXT:
+        body = (
+            "<h1>" + esc_name + "</h1>" + toolbar()
+            + '<div class="card panel-inset"><img class="doc-media" src="' + file_url
+            + '" alt="' + esc_name + '"></div>'
+        )
+        return HTMLResponse(_themed_page(name, body, back_href, back_label))
+
+    if ext in _HTML_EXT:
+        body = (
+            "<h1>" + esc_name + "</h1>" + toolbar()
+            + '<iframe class="doc-frame" src="' + file_url + '" title="' + esc_name + '"></iframe>'
+        )
+        return HTMLResponse(_themed_page(name, body, back_href, back_label))
+
+    if ext in _TEXT_EXT:
+        try:
+            raw = target.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        if len(raw) > 2_000_000:
+            raw = raw[:2_000_000] + "\n\n[... truncated ...]"
+        body = (
+            "<h1>" + esc_name + "</h1>" + toolbar()
+            + '<pre class="doc-text">' + html.escape(raw) + "</pre>"
+        )
+        return HTMLResponse(_themed_page(name, body, back_href, back_label))
+
+    if ext == ".epub":
+        book_title, chapters = _epub_spine(target)
+        if not chapters:
+            body = (
+                "<h1>" + html.escape(book_title) + "</h1>" + toolbar()
+                + '<div class="card"><p class="mono">This EPUB could not be parsed for inline reading. '
+                'Use <a href="' + file_url + '" download>Download raw</a> to open it in a dedicated reader.</p></div>'
+            )
+            return HTMLResponse(_themed_page(book_title, body, back_href, back_label))
+        idx = i if i < len(chapters) else 0
+        cur_title, cur_href = chapters[idx]
+        chapter_src = (
+            "/epubres/" + urllib.parse.quote(rel, safe="/") + "/" + urllib.parse.quote(cur_href, safe="/")
+        )
+        base = "/read?path=" + urllib.parse.quote(rel, safe="") + "&i="
+        opts = []
+        for n, (ctitle, _href) in enumerate(chapters):
+            sel = " selected" if n == idx else ""
+            opts.append(
+                '<option value="' + str(n) + '"' + sel + ">"
+                + html.escape("%02d. %s" % (n + 1, ctitle)) + "</option>"
+            )
+        nav = (
+            "<select onchange=\"location.href='" + base + "'+this.value\">" + "".join(opts) + "</select>"
+            + ('<a class="btn" href="' + base + str(idx - 1) + '">&larr; Prev</a>' if idx > 0 else "")
+            + ('<a class="btn" href="' + base + str(idx + 1) + '">Next &rarr;</a>' if idx < len(chapters) - 1 else "")
+        )
+        body = (
+            "<h1>" + html.escape(book_title) + "</h1>" + toolbar(nav)
+            + '<div class="mono muted" style="margin:4px 0 8px;">Section ' + str(idx + 1)
+            + " / " + str(len(chapters)) + " &middot; " + html.escape(cur_title) + "</div>"
+            + '<iframe class="doc-frame" src="' + chapter_src + '" title="' + html.escape(cur_title) + '"></iframe>'
+        )
+        return HTMLResponse(_themed_page(book_title, body, back_href, back_label))
+
+    body = (
+        "<h1>" + esc_name + "</h1>"
+        + '<div class="card"><p class="mono">No inline viewer for <code>' + html.escape(ext or "?")
+        + "</code> files. "
+        '<a class="btn" href="' + file_url + '" download>Download raw</a></p></div>'
+    )
+    return HTMLResponse(_themed_page(name, body, back_href, back_label))
+
+
+@app.get(
+    "/epubres/{path:path}",
+    responses={
+        200: {"description": "A resource served from inside an EPUB zip"},
+        403: {"description": "Path escapes the bucket root"},
+        404: {"description": "EPUB or internal resource not found"},
+        503: {"description": "Bucket not initialized"},
+    },
+)
+async def epub_resource(path: str) -> Response:
+    """Serve one file from inside an EPUB.
+
+    ``path`` is ``<bucket-rel-epub>.epub/<internal-zip-path>``; the path mirrors
+    the zip structure so relative links inside the XHTML resolve naturally.
+    """
+    if BUCKET is None:
+        raise HTTPException(status_code=503, detail="Bucket not initialized")
+    root = BUCKET.root.resolve()
+    marker = ".epub/"
+    k = path.lower().rfind(marker)
+    if k == -1:
+        raise HTTPException(status_code=404, detail="Not an EPUB resource path")
+    epub_rel = path[: k + 5]  # up to and including ".epub"
+    internal = path[k + len(marker):]
+    epub_abs = (root / epub_rel).resolve()
+    try:
+        epub_abs.relative_to(root)
+    except ValueError:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    if not epub_abs.exists() or not epub_abs.is_file():
+        raise HTTPException(status_code=404, detail="EPUB not found")
+    internal = posixpath.normpath(internal).lstrip("/")
+    if internal.startswith(".."):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    try:
+        with zipfile.ZipFile(epub_abs, "r") as zf:
+            data = zf.read(internal)
+    except (KeyError, zipfile.BadZipFile):
+        raise HTTPException(status_code=404, detail="Resource not found in EPUB")
+    ctype, _ = mimetypes.guess_type(internal)
+    return Response(data, media_type=ctype or "application/octet-stream")

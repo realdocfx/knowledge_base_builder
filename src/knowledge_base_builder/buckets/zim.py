@@ -517,7 +517,7 @@ class ZimBucket(BaseBucket):
     def _detect_fat32_mode(self, target_file: Path, total_size: int) -> bool:
         """Return True when the target filesystem is FAT32 and the payload exceeds
         the per-file chunk limit."""
-        from .os_utils import get_fs_type
+        from ..os_utils import get_fs_type
 
         fs_type = get_fs_type(target_file)
         if not fs_type or "FAT32" not in fs_type:
