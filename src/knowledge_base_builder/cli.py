@@ -550,16 +550,24 @@ def _extract_tarball(tarball_path: Path, dest: Path) -> None:
         tf.extractall(dest)
 
 
-def _patch_embedded_pth(python_dir: Path) -> None:
+def _patch_embedded_pth(python_dir: Path, target_os: str) -> None:
     """Patch the embeddable python*._pth to enable site-packages and import site."""
     pth_files = list(python_dir.glob("python*._pth"))
     if not pth_files:
         raise RuntimeError(f"No python*._pth file found in {python_dir}")
     pth = pth_files[0]
     lines = pth.read_text(encoding="utf-8").splitlines(keepends=True)
+    
     out = []
     import_site = False
-    site_pkg_line = "Lib\\site-packages\n"
+    
+    # Dynamically determine the site-packages string based on the target OS
+    if target_os == "windows":
+        site_pkg_line = "Lib\\site-packages\n"
+    else:
+        # For Linux/macOS python-build-standalone, site-packages is in lib/python3.X/
+        site_pkg_line = "lib/python3/site-packages\n"
+
     for line in lines:
         stripped = line.strip()
         if stripped.lower() == "import site":
@@ -588,7 +596,7 @@ def _provision_python_runtime(root: Path, python_version: str, target_os: str) -
 
     if python_exe.exists():
         console.print("[yellow]Embedded Python already present; skipping download.[/yellow]")
-        _patch_embedded_pth(python_dir)
+        _patch_embedded_pth(python_dir, target_os)
         return python_dir
 
     # Platform-specific Python runtime URLs
@@ -620,7 +628,7 @@ def _provision_python_runtime(root: Path, python_version: str, target_os: str) -
     else:
         _extract_tarball(zip_path, python_dir)
 
-    _patch_embedded_pth(python_dir)
+    _patch_embedded_pth(python_dir, target_os)
     return python_dir
 
 

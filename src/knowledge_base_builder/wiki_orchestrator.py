@@ -13,6 +13,7 @@ import requests
 
 from knowledge_base_builder import WikipediaEngine
 from knowledge_base_builder.buckets.zim import ZimBucket
+from knowledge_base_builder.os_utils import get_fs_type
 
 ATOM = "{http://www.w3.org/2005/Atom}"
 OPDS_ACQ = "http://opds-spec.org/acquisition/open-access"
@@ -294,21 +295,6 @@ class ZimDownloader:
         _, _, free = shutil.disk_usage(path)
         return free
 
-    @staticmethod
-    def _fs_type(path: Path) -> str:
-        try:
-            import ctypes
-            drive = path.anchor
-            if not drive:
-                return ""
-            fs_type = ctypes.create_string_buffer(256)
-            ctypes.windll.kernel32.GetVolumeInformationA(
-                drive.encode(), None, 0, None, None, None, fs_type, 256
-            )
-            return fs_type.value.decode().upper()
-        except Exception:
-            return ""
-
     def download(self, entry: dict, stage_dir: Path, final_dir: Path) -> Dict[str, Any]:
         identifier = entry["identifier"]
         final_path = final_dir / f"{identifier}.zim"
@@ -317,7 +303,7 @@ class ZimDownloader:
         if any(final_dir.glob(f"{identifier}.zim*")):
             return {"identifier": identifier, "status": "already_present"}
 
-        fs_type = self._fs_type(final_dir)
+        fs_type = get_fs_type(final_dir)
         direct_to_final = "FAT32" in fs_type and entry["size"] > 4 * 1024 * 1024 * 1024
 
         if direct_to_final:
