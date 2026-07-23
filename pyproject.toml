@@ -64,6 +64,8 @@ dev = [
     "build>=0.10.0",
     "twine>=4.0.0",
     "tomli>=2.0.0; python_version<'3.11'",
+    "pip-tools>=7.0.0",
+    "cyclonedx-bom>=4.0.0",
 ]
 
 [project.urls]

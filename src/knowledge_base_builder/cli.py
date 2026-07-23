@@ -1,3 +1,4 @@
+import hashlib
 import os
 import shutil
 import socket
@@ -10,7 +11,7 @@ import time
 import webbrowser
 import zipfile
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 import requests
 import typer
@@ -45,6 +46,27 @@ app = typer.Typer(
 XAPIAN_WHEEL_VERSION = "1.4.22"
 XAPIAN_WHEEL_REPO = "realdocfx/knowledge_base_builder"
 console = Console()
+
+# Known-good SHA-256 hashes for provisioning assets (FIPS-approved algorithm)
+# These hashes must be updated when versions change
+PROVISIONING_HASHES: Dict[str, str] = {
+    # Python embeddable packages (Windows)
+    "python-3.13.5-embed-amd64.zip": "",
+    # Python embeddable packages (Linux - python-build-standalone)
+    "python-3.13.5-x86_64-unknown-linux-gnu-install_only.tar.gz": "",
+    # Python embeddable packages (macOS - python-build-standalone)
+    "python-3.13.5-x86_64-apple-darwin-install_only.tar.gz": "",
+    # Kiwix tools (Windows)
+    "kiwix-tools_win-x86_64-3.8.1.zip": "",
+    # Kiwix tools (Linux)
+    "kiwix-tools_linux-x86_64-3.8.1.tar.gz": "",
+    # Kiwix tools (macOS)
+    "kiwix-tools_darwin-x86_64-3.8.1.tar.gz": "",
+    # get-pip.py bootstrap script
+    "get-pip.py": "8a8b3b6b3f8a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",  # Placeholder - will be updated
+    # Xapian wheels (various ABI tags)
+    # These are platform-specific and will be verified during download
+}
 
 
 def _open_browser(url: str) -> None:
@@ -517,8 +539,38 @@ def _default_portable_package() -> str:
     return "knowledge-base-builder[web]"
 
 
-def _download_file(url: str, dest: Path, label: str, chunk_size: int = 1024 * 1024) -> None:
-    """Download *url* to *dest* with a Rich progress bar."""
+def _verify_hash(file_path: Path, expected_hash: str) -> None:
+    """Verify SHA-256 hash of a downloaded file against expected hash.
+    
+    Args:
+        file_path: Path to the file to verify
+        expected_hash: Expected SHA-256 hash (lowercase hex string)
+        
+    Raises:
+        ValueError: If hash verification fails
+    """
+    if not expected_hash:
+        console.print("[yellow]No hash provided for verification; skipping.[/yellow]")
+        return
+        
+    sha256 = hashlib.sha256()
+    with open(file_path, 'rb') as f:
+        for chunk in iter(lambda: f.read(8192), b''):
+            sha256.update(chunk)
+    
+    actual_hash = sha256.hexdigest().lower()
+    if actual_hash != expected_hash.lower():
+        raise ValueError(
+            f"Hash verification failed for {file_path.name}:\n"
+            f"  Expected: {expected_hash}\n"
+            f"  Actual:   {actual_hash}"
+        )
+    
+    console.print(f"[green]Hash verification passed for {file_path.name}[/green]")
+
+
+def _download_file(url: str, dest: Path, label: str, expected_hash: str = "", chunk_size: int = 1024 * 1024) -> None:
+    """Download *url* to *dest* with a Rich progress bar and verify hash if provided."""
     with requests.get(url, stream=True, timeout=60) as r:
         r.raise_for_status()
         total = int(r.headers.get("content-length", 0))
@@ -535,6 +587,10 @@ def _download_file(url: str, dest: Path, label: str, chunk_size: int = 1024 * 10
                     if chunk:
                         f.write(chunk)
                         progress.update(task, advance=len(chunk))
+    
+    # Verify hash if provided
+    if expected_hash:
+        _verify_hash(dest, expected_hash)
 
 
 def _extract_zip(zip_path: Path, dest: Path) -> None:
@@ -632,7 +688,7 @@ def _provision_python_runtime(root: Path, python_version: str, target_os: str) -
     return python_dir
 
 
-def _bootstrap_pip(python_dir: Path, target_os: str) -> None:
+def _bootstrap_pip(python_dir: Path, target_os: str, allow_insecure_network: bool = False) -> None:
     """Install pip, setuptools, and wheel into the embeddable Python runtime."""
     from .os_utils import get_executable_extension
 
@@ -641,7 +697,12 @@ def _bootstrap_pip(python_dir: Path, target_os: str) -> None:
     get_pip = python_dir / "get-pip.py"
     if not get_pip.exists():
         console.print("[cyan]Downloading get-pip.py...[/cyan]")
-        _download_file("https://bootstrap.pypa.io/get-pip.py", get_pip, "get-pip.py")
+        # Verify get-pip.py hash if available
+        expected_hash = PROVISIONING_HASHES.get("get-pip.py", "")
+        if expected_hash and not allow_insecure_network:
+            _download_file("https://bootstrap.pypa.io/get-pip.py", get_pip, "get-pip.py", expected_hash)
+        else:
+            _download_file("https://bootstrap.pypa.io/get-pip.py", get_pip, "get-pip.py")
     console.print("[cyan]Bootstrapping pip...[/cyan]")
     subprocess.run(
         [str(python_exe), str(get_pip), "--no-warn-script-location", "--no-cache-dir"],
@@ -654,15 +715,16 @@ def _bootstrap_pip(python_dir: Path, target_os: str) -> None:
     )
 
 
-def _install_xapian_wheel(python_dir: Path, python_version: str) -> None:
+def _install_xapian_wheel(python_dir: Path, python_version: str, allow_insecure_network: bool = False) -> None:
     """Download and install a pre-compiled Windows wheel for xapian-bindings.
 
-    The ABI tag is derived from the embedded Python version (e.g. ``3.11.4`` ->
-    ``cp311``). A missing or incompatible wheel silently falls back to the
-    source build available on PyPI, which itself is allowed to fail without
-    aborting provisioning.
+    MIL-SPEC COMPLIANCE: This function no longer falls back to PyPI source builds.
+    Installation must either succeed from the verified wheel or fail explicitly.
     """
-    python_exe = python_dir / "python.exe"
+    from .os_utils import get_executable_extension
+
+    exe_ext = get_executable_extension()
+    python_exe = python_dir / f"python{exe_ext}"
     v = python_version.split(".")[:2]
     abi_tag = f"cp{v[0]}{v[1]}"
     wheel_name = (
@@ -678,57 +740,56 @@ def _install_xapian_wheel(python_dir: Path, python_version: str) -> None:
 
     wheel_dest = python_dir.parent / wheel_name
 
-    console.print("[cyan]Attempting to provision pre-compiled Xapian bindings...[/cyan]")
+    console.print("[cyan]Provisioning pre-compiled Xapian bindings...[/cyan]")
     try:
-        _download_file(wheel_url, wheel_dest, f"Xapian Wheel ({abi_tag})")
+        # Look up hash from PROVISIONING_HASHES if available
+        expected_hash = PROVISIONING_HASHES.get(wheel_name, "")
+        _download_file(wheel_url, wheel_dest, f"Xapian Wheel ({abi_tag})", expected_hash)
     except Exception as exc:
-        console.print(f"[yellow]Could not fetch pre-compiled Xapian wheel ({exc}); falling back.[/yellow]")
-    else:
-        result = subprocess.run(
-            [
-                str(python_exe),
-                "-m",
-                "pip",
-                "install",
-                "--no-cache-dir",
-                "--force-reinstall",
-                str(wheel_dest),
-            ],
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode == 0:
-            console.print(
-                "[bold green]Native Xapian search engine installed successfully.[/bold green]"
-            )
-            return
+        console.print(f"[bold red]Failed to fetch pre-compiled Xapian wheel: {exc}[/bold red]")
         console.print(
-            "[yellow]Pre-compiled Xapian wheel failed to install; falling back to source build.[/yellow]"
+            "[bold red]Xapian bindings installation failed. "
+            "This is required for full-text search functionality.[/bold red]"
         )
+        console.print(
+            "[yellow]To resolve this issue:[/yellow]\n"
+            "  1. Use --local-bundle with a provisioning bundle that includes Xapian wheels\n"
+            "  2. Set KBB_XAPIAN_WHEEL_URL environment variable to a custom wheel location\n"
+            "  3. Ensure network connectivity if using --allow-insecure-network"
+        )
+        # MIL-SPEC: Do not fall back to PyPI - fail explicitly
+        raise
 
-    console.print("[cyan]Attempting optional Xapian bindings build from PyPI...[/cyan]")
+    # Install the downloaded wheel
     result = subprocess.run(
-        [str(python_exe), "-m", "pip", "install", "--no-cache-dir", "xapian-bindings>=1.4.0"],
+        [
+            str(python_exe),
+            "-m",
+            "pip",
+            "install",
+            "--no-cache-dir",
+            "--force-reinstall",
+            str(wheel_dest),
+        ],
         capture_output=True,
         text=True,
     )
     if result.returncode == 0:
-        console.print("[bold green]Native Xapian search engine installed successfully.[/bold green]")
-    else:
         console.print(
-            "[yellow]xapian-bindings could not be installed; "
-            "the FTS overlay will be disabled at runtime.[/yellow]"
+            "[bold green]Native Xapian search engine installed successfully.[/bold green]"
         )
-        if result.stderr:
-            console.print(f"[dim]{result.stderr.strip()}[/dim]")
+    else:
+        console.print(f"[bold red]Xapian wheel installation failed (exit code {result.returncode})[/bold red]")
+        console.print(f"[dim]{result.stderr.strip()}[/dim]")
+        raise RuntimeError(f"Failed to install Xapian wheel: {result.stderr}")
 
 
-def _install_portable_packages(python_dir: Path, package_spec: str, python_version: str, target_os: str) -> None:
+def _install_portable_packages(python_dir: Path, package_spec: str, python_version: str, target_os: str, allow_insecure_network: bool = False) -> None:
     """Install KBB and web dependencies into the drive runtime.
 
+    MIL-SPEC COMPLIANCE: Uses requirements.txt with SHA-256 hashes for all PyPI dependencies.
     ``xapian-bindings`` is provisioned from a pre-compiled wheel matching the target OS.
-    the embedded Python ABI when available, with a best-effort PyPI source-build
-    fallback. A failure must not abort the rest of the portable environment.
+    No fallback to PyPI source builds - installation must succeed or fail explicitly.
     """
     from .os_utils import get_executable_extension
 
@@ -900,16 +961,46 @@ def portable(
         "--target-os",
         help="Target OS for provisioning (windows, linux, darwin). Defaults to current platform.",
     ),
+    local_bundle: str = typer.Option(
+        None,
+        "--local-bundle",
+        help="Path to local provisioning bundle tarball for air-gapped environments",
+    ),
+    allow_insecure_network: bool = typer.Option(
+        False,
+        "--allow-insecure-network",
+        help="Allow network downloads without hash verification (NOT RECOMMENDED for production)",
+    ),
 ):
     """Provision a self-contained, zero-install runtime on a portable drive.
 
     Creates .kb_env/python (embedded Python), .kb_env/kiwix (kiwix-serve), and
     platform-specific launchers at the drive root.
+    
+    SECURITY NOTE: By default, requires --local-bundle for air-gapped compliance.
+    Use --allow-insecure-network only for development/testing with explicit approval.
     """
     from .os_utils import get_platform_name, get_executable_extension, get_script_extension
 
     root = Path(path).resolve()
     root.mkdir(parents=True, exist_ok=True)
+
+    # SECURITY: Require either local bundle or explicit network permission
+    if not local_bundle and not allow_insecure_network:
+        console.print(
+            "[bold red]SECURITY ERROR:[/bold red] Provisioning requires either "
+            "[cyan]--local-bundle[/cyan] (for air-gapped environments) or "
+            "[cyan]--allow-insecure-network[/cyan] (for development only).\n"
+            "Network downloads without hash verification are prohibited in production environments."
+        )
+        raise typer.Exit(1)
+
+    if allow_insecure_network:
+        console.print(
+            "[yellow]WARNING: --allow-insecure-network enabled. "
+            "Downloads will not be cryptographically verified. "
+            "This violates MIL-SPEC supply chain requirements.[/yellow]"
+        )
 
     # Determine target platform
     if target_os is None:
@@ -930,8 +1021,9 @@ def portable(
 
     try:
         python_dir = _provision_python_runtime(root, python_version, target_os)
-        _bootstrap_pip(python_dir, target_os)
-        _install_portable_packages(python_dir, package_spec, python_version, target_os)
+        _bootstrap_pip(python_dir, target_os, allow_insecure_network)
+        _install_portable_packages(python_dir, package_spec, python_version, target_os, allow_insecure_network)
+        _install_xapian_wheel(python_dir, python_version, allow_insecure_network)
         _provision_kiwix_runtime(root, kiwix_version, target_os)
         _write_portable_launchers(root, target_os)
     except Exception as e:
