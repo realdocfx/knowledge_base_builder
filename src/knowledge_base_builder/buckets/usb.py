@@ -95,8 +95,12 @@ class UsbBucket(BaseBucket):
             if hasattr(os, 'O_DIRECTORY'):
                 try:
                     dir_fd = os.open(self.state_dir, os.O_RDONLY | os.O_DIRECTORY)
-                    os.fsync(dir_fd)
-                    os.close(dir_fd)
+                    try:
+                        os.fsync(dir_fd)
+                    finally:
+                        # Close even if fsync raises; otherwise the descriptor
+                        # leaks on every failed flush.
+                        os.close(dir_fd)
                 except OSError:
                     pass
 

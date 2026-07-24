@@ -1,4 +1,12 @@
 import hashlib
+
+# NOTE: the ZIM container stores a 16-byte MD5 digest in its trailer, so the
+# algorithm is fixed by the file format -- it cannot be upgraded to SHA-256
+# without breaking compatibility with libzim/kiwix-serve and every existing
+# archive. usedforsecurity=False marks it as a format-compatibility digest
+# rather than a security primitive, which keeps it legal on FIPS-enforcing
+# hosts where a bare hashlib.md5() raises ValueError and crashes the
+# download path. See tests/test_fips_compliance.py.
 import json
 import logging
 import os
@@ -284,7 +292,7 @@ class ZimBucket(BaseBucket):
         if offset > 0 and temp_file.exists():
             bytes_written = temp_file.stat().st_size
             if bytes_written >= total_size:
-                hasher = hashlib.md5()
+                hasher = hashlib.md5(usedforsecurity=False)
                 self._hash_file(hasher, temp_file, 0, total_size)
                 return self._verify_and_finalize(temp_file, target_file, hasher, total_size)
 
@@ -316,7 +324,7 @@ class ZimBucket(BaseBucket):
             state["chunks"] = chunks
             self.update_state(state)
 
-        hasher = hashlib.md5()
+        hasher = hashlib.md5(usedforsecurity=False)
         self._hash_file(hasher, temp_file, 0, total_size)
         return self._verify_and_finalize(temp_file, target_file, hasher, total_size)
 
@@ -339,7 +347,7 @@ class ZimBucket(BaseBucket):
         active_path = self._slice_temp_path(identifier, current_slice)
 
         if bytes_written >= total_size:
-            hasher = hashlib.md5()
+            hasher = hashlib.md5(usedforsecurity=False)
             self._hash_split_files(hasher, identifier, current_slice, total_size)
             return self._verify_and_finalize_split(identifier, current_slice, hasher, total_size)
 
@@ -437,7 +445,7 @@ class ZimBucket(BaseBucket):
         state["chunks"] = chunks
         self.update_state(state)
 
-        hasher = hashlib.md5()
+        hasher = hashlib.md5(usedforsecurity=False)
         self._hash_split_files(hasher, identifier, current_slice, total_size)
         return self._verify_and_finalize_split(identifier, current_slice, hasher, total_size)
 
