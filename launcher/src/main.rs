@@ -20,6 +20,29 @@ use std::os::windows::process::CommandExt;
 /// filesystem layout on the target host.
 const LOADING_HTML: &str = include_str!("../public/index.html");
 
+/// True when the host already has a WebView2 runtime installed locally.
+///
+/// Checked by looking for the Evergreen runtime's versioned install directory
+/// rather than the registry, to stay dependency-free. Being wrong is safe in
+/// both directions: a false negative merely uses the (working) bundled runtime,
+/// and a false positive is impossible because we require the executable itself.
+#[cfg(target_os = "windows")]
+fn host_webview2_present() -> bool {
+    const ROOTS: [&str; 2] = [
+        r"C:\Program Files (x86)\Microsoft\EdgeWebView\Application",
+        r"C:\Program Files\Microsoft\EdgeWebView\Application",
+    ];
+    ROOTS.iter().any(|root| {
+        std::fs::read_dir(root)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .any(|e| e.path().join("msedgewebview2.exe").is_file())
+            })
+            .unwrap_or(false)
+    })
+}
+
 /// Minimal, dependency-free HTTP probe: true ONLY on a real HTTP 200.
 ///
 /// A bare TCP connect is not sufficient (the socket can accept before the app
@@ -70,15 +93,21 @@ fn main() {
     let exe_path = std::env::current_exe().expect("Failed to resolve executable path");
     let usb_root = exe_path.parent().unwrap();
 
-    // Point WebView2 at the runtime bundled on the stick, so the launcher renders
-    // on ANY Windows host — even one with no WebView2 installed and no internet.
-    // Must be set before the WebView2 environment is created (before the window).
-    // Falls back to the host's WebView2 if the bundle is absent.
+    // Choose the WebView2 runtime. The bundle on the stick guarantees the console
+    // renders on a host with no WebView2 and no internet, but it is ~500 MB across
+    // 84 files: loading it off USB *while* the Python backend is also starting
+    // saturates the drive and stretched a 6s backend boot to 25-50s.
+    //
+    // So prefer the host's installed runtime when present (it lives on fast local
+    // disk and costs the stick nothing) and fall back to the bundled copy only
+    // when the host genuinely lacks one. The airgap guarantee is preserved; the
+    // common case simply stops paying for it.
     #[cfg(target_os = "windows")]
     {
-        let webview2_dir = usb_root.join(".kb_env").join("webview2");
-        if webview2_dir.join("msedgewebview2.exe").exists() {
-            std::env::set_var("WEBVIEW2_BROWSER_EXECUTABLE_FOLDER", &webview2_dir);
+        let bundled = usb_root.join(".kb_env").join("webview2");
+        let have_bundle = bundled.join("msedgewebview2.exe").is_file();
+        if have_bundle && !host_webview2_present() {
+            std::env::set_var("WEBVIEW2_BROWSER_EXECUTABLE_FOLDER", &bundled);
         }
     }
 
