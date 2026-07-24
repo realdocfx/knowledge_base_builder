@@ -1539,31 +1539,65 @@ async function loadStats() {
 }
 var _statsRetries = 0;
 
+/* Remote catalog queries routinely take 20-30s. Three things are mandatory:
+   a live elapsed counter (MIL-STD-1472H 5.17 requires progress >10s, never a
+   static label), a timeout LONGER than the real operation, and a neutral error
+   with a recovery action (5.17.10.7). Without these the panel simply froze on
+   "Executing search algorithm...". */
+function _remoteBusy(out, verb, t0) {
+  return setInterval(function () {
+    out.innerHTML = '<span class="mono">' + verb + ' remote catalog&hellip; ' +
+      Math.round((Date.now() - t0) / 1000) + 's elapsed (typically 20-30s)</span>';
+  }, 1000);
+}
+function _remoteFailed(out, t0, e) {
+  out.innerHTML = '<span class="mono danger-text">QUERY FAILED after ' +
+    Math.round((Date.now() - t0) / 1000) + 's: ' + escHtml(e && e.message ? e.message : String(e)) +
+    '. RECOVERY: check the query syntax and network reachability, then retry.</span>';
+}
+
 async function search() {
   const source = document.getElementById('source').value;
   const query = encodeURIComponent(document.getElementById('query').value);
   const limit = document.getElementById('limit').value;
-  document.getElementById('results').innerHTML = '<span class="mono">Executing search algorithm...</span>';
-  const results = await api(`/api/search?source=${source}&query=${query}&limit=${limit}`);
-  let html = '<table><tr><th>Identifier</th><th>Title</th><th>Size</th><th>Action</th></tr>';
-  for (const r of results) {
-    html += `<tr>
-      <td class="mono">${r.identifier}</td>
-      <td>${r.title || ''}</td>
-      <td class="mono">${r.size_formatted || r.size || ''}</td>
-      <td><button onclick="download('${source}', '${r.identifier}')">PULL</button></td>
-    </tr>`;
+  const out = document.getElementById('results');
+  const t0 = Date.now();
+  const tick = _remoteBusy(out, 'Searching', t0);
+  try {
+    const results = await api(`/api/search?source=${source}&query=${query}&limit=${limit}`, 180000);
+    clearInterval(tick);
+    if (!results || !results.length) { out.innerHTML = '<span class="mono">No results for this query.</span>'; return; }
+    let html = '<table><tr><th>Identifier</th><th>Title</th><th>Size</th><th>Action</th></tr>';
+    for (const r of results) {
+      html += `<tr>
+        <td class="mono">${escHtml(r.identifier)}</td>
+        <td>${escHtml(r.title || '')}</td>
+        <td class="mono">${escHtml(r.size_formatted || r.size || '')}</td>
+        <td><button onclick="download('${source}', '${r.identifier}')">PULL</button></td>
+      </tr>`;
+    }
+    out.innerHTML = html + '</table>';
+  } catch (e) {
+    clearInterval(tick);
+    _remoteFailed(out, t0, e);
   }
-  html += '</table>';
-  document.getElementById('results').innerHTML = html;
 }
 
 async function estimate() {
   const source = document.getElementById('source').value;
   const query = encodeURIComponent(document.getElementById('query').value);
   const limit = document.getElementById('limit').value;
-  const est = await api(`/api/estimate?source=${source}&query=${query}&limit=${limit}`);
-  document.getElementById('results').innerHTML = `<pre>${JSON.stringify(est, null, 2)}</pre>`;
+  const out = document.getElementById('results');
+  const t0 = Date.now();
+  const tick = _remoteBusy(out, 'Estimating from', t0);
+  try {
+    const est = await api(`/api/estimate?source=${source}&query=${query}&limit=${limit}`, 180000);
+    clearInterval(tick);
+    out.innerHTML = `<pre>${escHtml(JSON.stringify(est, null, 2))}</pre>`;
+  } catch (e) {
+    clearInterval(tick);
+    _remoteFailed(out, t0, e);
+  }
 }
 
 function escHtml(s) { var d = document.createElement('div'); d.textContent = s == null ? '' : s; return d.innerHTML; }
