@@ -1107,7 +1107,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   /* Pre-paint: apply the saved optics BEFORE first paint so Stealth Night never
      flashes a bright frame (critical for night light-discipline). */
   (function(){try{var m=localStorage.getItem('kbb-view-mode');
-    if(m==='stealth-night'||m==='standard'){document.documentElement.setAttribute('data-view-mode',m);}
+    if(m!=='stealth-night'&&m!=='standard'){m='stealth-night';}
+    document.documentElement.setAttribute('data-view-mode',m);
     var b=localStorage.getItem('kbb-stealth-bright');
     if(b){document.documentElement.style.setProperty('--stealth-bright',(b/100).toFixed(2));}
   }catch(e){}})();
@@ -1252,6 +1253,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .reader-bar{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:6px;flex-wrap:wrap;}
   iframe#wiki-frame{flex-grow:1;width:100%;border:2px solid;border-color:var(--bevel-in);background:var(--iframe-bg);filter:var(--iframe-filter);}
   /* Generic progress + loading indicators (reused by the wiki reader and clone) */
+  #viewport{display:flex;flex-direction:column;height:78vh;min-height:460px;}
+  #viewport[hidden]{display:none;}
+  iframe#viewport-frame{flex-grow:1;width:100%;border:2px solid;border-color:var(--bevel-in);background:var(--iframe-bg);filter:var(--iframe-filter);}
   .frame-loader{position:absolute;inset:0;display:flex;flex-direction:column;gap:12px;align-items:center;justify-content:center;background:var(--panel);z-index:5;}
   .reader-container.loaded .frame-loader{display:none;}
   .spinner{width:34px;height:34px;border:3px solid var(--mid);border-top-color:var(--phosphor);border-radius:50%;animation:kbspin .8s linear infinite;}
@@ -1312,11 +1316,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       </ul>
       <div class="menu-h">Actions</div>
       <button class="btn small" type="button" onclick="loadStats()">Refresh Telemetry</button>
-      <button class="btn small" type="button" onclick="openView('/files/')">Open File System</button>
+      <button class="btn small" type="button" onclick="openView('/files/', 'Local File System')">Open File System</button>
       <button class="btn small" type="button" onclick="toggleWikiFullscreen()">Fullscreen Wiki</button>
       <button class="btn small" type="button" onclick="openClone()">Duplicate Drive</button>
-      <button class="btn small" type="button" onclick="openView('/documentation')">Documentation</button>
-      <button class="btn small" type="button" onclick="openView('/docs')">API Console</button>
+      <button class="btn small" type="button" onclick="openView('/documentation', 'Documentation &amp; Manual')">Documentation</button>
+      <button class="btn small" type="button" onclick="openView('/docs', 'API Console')">API Console</button>
       <div class="menu-h" id="settings">Settings</div>
       <button class="btn small primary" type="button" onclick="toggleStealthMode()">Toggle View Mode</button>
       <div class="stealth-only">
@@ -1336,6 +1340,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <div class="metric"><div class="metric-k">Telemetry</div><div class="metric-n">Initializing&hellip;</div></div>
     </div>
 
+    <div class="card" id="viewport" hidden>
+      <div class="reader-bar">
+        <span class="mono ok-text" id="viewport-title">Viewer</span>
+        <a href="#" id="viewport-close" onclick="closeView();return false;">[ Close &mdash; Back to Console ]</a>
+      </div>
+      <iframe id="viewport-frame" src="about:blank" title="Document Viewer"></iframe>
+    </div>
+
     <div class="section-header" id="wiki">I. Local Intelligence Database</div>
     <div class="card reader-container" id="readerContainer">
       <div class="reader-bar">
@@ -1349,7 +1361,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="card" id="files">
       <h2>Local File Index (Archive.org)</h2>
       <p class="mono muted">Browse downloaded raw PDFs, media, and manuals secured by the ArchiveEngine.</p>
-      <button class="btn" type="button" onclick="openView('/files/')">Open Local File System</button>
+      <button class="btn" type="button" onclick="openView('/files/', 'Local File System')">Open Local File System</button>
     </div>
 
     <div class="card" id="search">
@@ -1435,10 +1447,25 @@ async function api(path, timeoutMs) {
    launcher webview. window.open('_blank') opens a real tab in a browser, but
    the Tauri/WebView2 launcher has no tabs and silently ignores it, so we fall
    back to navigating in place (the target pages carry a "Portal" back link). */
-function openView(url) {
-  var w = null;
-  try { w = window.open(url, '_blank'); } catch (e) {}
-  if (!w) { window.location.href = url; }
+function openView(url, title) {
+  /* Render secondary surfaces INSIDE the console, like the ZIM reader.
+     window.open is silently ignored by the launcher webview (no tabs), and
+     navigating the top-level document strands the operator on targets such as
+     /docs that have no back-to-console affordance. */
+  var vp = document.getElementById('viewport');
+  var fr = document.getElementById('viewport-frame');
+  var tt = document.getElementById('viewport-title');
+  if (!vp || !fr) return;
+  if (tt) tt.textContent = title || url;
+  fr.src = url;
+  vp.hidden = false;
+  vp.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+function closeView() {
+  var vp = document.getElementById('viewport');
+  var fr = document.getElementById('viewport-frame');
+  if (fr) fr.src = 'about:blank';  /* stop any background work in the frame */
+  if (vp) vp.hidden = true;
 }
 /* The embedded ZIM reader expands to cover the viewport in place — no new
    window, so it works identically in a browser and in the launcher. */
@@ -1599,8 +1626,8 @@ function setStealthBrightness(v) {
   try { localStorage.setItem('kbb-stealth-bright', v); } catch (e) {}
 }
 (function initMode() {
-  var mode = 'standard';
-  try { mode = localStorage.getItem('kbb-view-mode') || 'standard'; } catch (e) {}
+  var mode = 'stealth-night';  /* operational default */
+  try { mode = localStorage.getItem('kbb-view-mode') || 'stealth-night'; } catch (e) {}
   applyMode(mode);
   try {
     var b = localStorage.getItem('kbb-stealth-bright');
@@ -1613,7 +1640,7 @@ function setStealthBrightness(v) {
   // fullscreen-wiki tab, the dashboard follows without a reload.
   window.addEventListener('storage', function (e) {
     if (e.key === 'kbb-view-mode') {
-      applyMode(localStorage.getItem('kbb-view-mode') || 'standard');
+      applyMode(localStorage.getItem('kbb-view-mode') || 'stealth-night');
     } else if (e.key === 'kbb-stealth-bright') {
       var b = localStorage.getItem('kbb-stealth-bright');
       if (b) {
@@ -1832,7 +1859,8 @@ BRAND_SVG = (
 PREPAINT_SCRIPT = """<script>
   /* Pre-paint: apply saved optics BEFORE first paint (night light-discipline). */
   (function(){try{var m=localStorage.getItem('kbb-view-mode');
-    if(m==='stealth-night'||m==='standard'){document.documentElement.setAttribute('data-view-mode',m);}
+    if(m!=='stealth-night'&&m!=='standard'){m='stealth-night';}
+    document.documentElement.setAttribute('data-view-mode',m);
     var b=localStorage.getItem('kbb-stealth-bright');
     if(b){document.documentElement.style.setProperty('--stealth-bright',(b/100).toFixed(2));}
   }catch(e){}})();
