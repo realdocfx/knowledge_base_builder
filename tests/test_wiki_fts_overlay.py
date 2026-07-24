@@ -54,9 +54,12 @@ def test_extract_fulltext_index_writes_xapian_and_metadata(tmp_path):
     archive_instance.get_entry_by_path.return_value = fake_entry
     archive_instance.has_new_namespace_scheme = True
 
-    fake_archive_class = MagicMock()
-    fake_archive_class.return_value.__enter__ = MagicMock(return_value=archive_instance)
-    fake_archive_class.return_value.__exit__ = MagicMock(return_value=False)
+    # zim.py instantiates Archive directly (`archive = Archive(path)`) and closes
+    # it in a finally block -- it is NOT used as a context manager. Mocking
+    # __enter__/__exit__ therefore never applied, and auto-generated MagicMocks
+    # leaked through as `item.content`, failing with "a bytes-like object is
+    # required". The mock must return the instance itself.
+    fake_archive_class = MagicMock(return_value=archive_instance)
 
     with patch("libzim.reader.Archive", fake_archive_class):
         result = bucket.extract_fulltext_index("test_wiki")
@@ -256,7 +259,13 @@ def test_start_kiwix_server_retries_on_eaddrinuse(tmp_path):
             raise OSError("busy")
         return MagicMock()
 
+    # _start_kiwix_server bails out early when the drive holds no archives, so the
+    # discovery call must be stubbed too -- otherwise the empty tmp_path short
+    # circuits the function and the retry logic under test never runs.
     with patch(
+        "knowledge_base_builder.web.discover_archives",
+        return_value=[("test_wiki", primary)],
+    ), patch(
         "knowledge_base_builder.web._select_kiwix_archive", return_value=primary
     ):
         with patch(
