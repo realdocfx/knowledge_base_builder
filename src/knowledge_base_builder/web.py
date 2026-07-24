@@ -1253,7 +1253,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .reader-bar{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:6px;flex-wrap:wrap;}
   iframe#wiki-frame{flex-grow:1;width:100%;border:2px solid;border-color:var(--bevel-in);background:var(--iframe-bg);filter:var(--iframe-filter);}
   /* Generic progress + loading indicators (reused by the wiki reader and clone) */
-  #viewport{display:flex;flex-direction:column;height:78vh;min-height:460px;}
+  /* Presents like the reader's fullscreen mode: the opened surface owns the
+     window, with the close control as the route back. */
+  #viewport{position:fixed;inset:0;z-index:9998;display:flex;flex-direction:column;height:100vh;margin:0;padding:10px;border-radius:0;max-width:none;background:var(--panel);}
   #viewport[hidden]{display:none;}
   iframe#viewport-frame{flex-grow:1;width:100%;border:2px solid;border-color:var(--bevel-in);background:var(--iframe-bg);filter:var(--iframe-filter);}
   .frame-loader{position:absolute;inset:0;display:flex;flex-direction:column;gap:12px;align-items:center;justify-content:center;background:var(--panel);z-index:5;}
@@ -1459,6 +1461,7 @@ function openView(url, title) {
   if (tt) tt.textContent = title || url;
   fr.src = url;
   vp.hidden = false;
+  document.body.style.overflow = 'hidden';
   vp.scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
 function closeView() {
@@ -1466,6 +1469,7 @@ function closeView() {
   var fr = document.getElementById('viewport-frame');
   if (fr) fr.src = 'about:blank';  /* stop any background work in the frame */
   if (vp) vp.hidden = true;
+  document.body.style.overflow = '';
 }
 /* The embedded ZIM reader expands to cover the viewport in place — no new
    window, so it works identically in a browser and in the launcher. */
@@ -1903,7 +1907,22 @@ function applyBright(v){if(v)document.documentElement.style.setProperty('--steal
 # level; nested frames inherit an ancestor's filter and must not double-invert.
 WIKI_STEALTH_INJECT = """
 <style id="kbb-stealth-style">
-html.kbb-stealth{filter:invert(1) sepia(1) hue-rotate(75deg) saturate(3.2) brightness(var(--kbb-bright,.72)) contrast(1.05);background:#ffffff !important;}
+/* Tactical night optic (MIL-STD-1472H 5.10.1): emission is confined to the
+   520-555nm green band to preserve dark adaptation. The colours are DECLARED,
+   exactly as the KBB-rendered pages declare theirs -- not synthesised by
+   inverting the document. invert() produced negative photographs and left
+   saturated off-band colour intact, so it was never a compliant night optic.
+   Contrast: #33dd33 on #000000 is ~11.5:1, above the 10:1 preferred figure. */
+html.kbb-stealth{background:#000000 !important;filter:brightness(var(--kbb-bright,.72));}
+html.kbb-stealth body{background:#000000 !important;color:#33dd33 !important;}
+html.kbb-stealth *:not(img):not(video):not(canvas):not(svg):not(picture){
+  background-color:transparent !important;background-image:none !important;
+  color:#33dd33 !important;border-color:#0f6b23 !important;box-shadow:none !important;}
+html.kbb-stealth a,html.kbb-stealth a *{color:#66ff66 !important;}
+/* Raster media cannot be re-coloured by declaration, so collapse it to
+   luminance first, then tint into the band. */
+html.kbb-stealth img,html.kbb-stealth video,html.kbb-stealth canvas,html.kbb-stealth picture{
+  filter:grayscale(1) sepia(1) hue-rotate(65deg) saturate(5) !important;}
 </style>
 <script>
 (function(){

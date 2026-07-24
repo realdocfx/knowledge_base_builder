@@ -105,6 +105,54 @@ items, ZIM slices, search state).
 
 ---
 
+## Operator interface (MIL-STD-1472H)
+
+### Optics: Daylight Mosaic and Tactical Night-Green
+
+The console ships two optics. **Tactical Night-Green is the default** — an
+unconfigured drive must never flash a bright screen at an operator in the field.
+Your choice is remembered per host and applied *before first paint*, so it cannot
+flash bright and then switch on the next launch.
+
+| | Daylight Mosaic | Tactical Night-Green |
+|---|---|---|
+| Use | Lit environments | Low light / dark adaptation (§5.10.1) |
+| Emission | Full spectrum | Confined to ~520–555 nm green |
+| Body text contrast | High-contrast dark-on-light | `#33dd33` on `#000000` — **11.5:1** |
+| Link contrast | — | `#66ff66` on `#000000` — **16.1:1** |
+
+Both exceed the 6:1 floor and the 10:1 preferred figure of MIL-STD-1472H.
+
+**Switch optics:** the `[MODE: …]` control in the masthead, or **Alt+N**.
+**Night brightness:** the *Stealth brightness* slider (sidebar, night mode only)
+dims the whole console without altering hue, so the band is preserved.
+
+The optic follows the operator everywhere — the console, the file explorer, the
+inline reader, **and the Wikipedia/ZIM content**. The wiki is re-coloured by
+*declaration* (green-on-black, exactly as the KBB pages are), not by inverting
+the page: inversion renders photographs as negatives and leaves saturated
+off-band colour intact, which defeats dark adaptation. Photographs and diagrams
+are collapsed to luminance and tinted into the band, because raster imagery
+cannot be re-coloured by declaration.
+
+### Navigation stays in one window
+
+Every secondary surface — **Local File System**, **Documentation & Manual**, and
+the **API Console** — opens *inside* the console, presented full-window like the
+reader's fullscreen mode, with `[ Close — Back to Console ]` as the route home.
+Nothing opens a second window: the launcher has no tabs and no browser chrome, so
+a new window would either be silently discarded or strand you with no way back.
+
+The sidebar is the single authoritative navigation list; the masthead carries only
+the optic control and never restates a destination (§5.17.1.3).
+
+### Control-plane access
+
+`/api/*` requires a per-launch token. `Launch_KBB.exe` and `kb-builder portal`
+both hand you a pre-authorised URL, which the console swaps for a session cookie.
+If you open a bare `http://127.0.0.1:<port>/` by hand the page renders but its
+panels report LINK DOWN — use the tokenised URL the launcher/CLI printed.
+
 ## Reference
 
 **Progress indicator.** Both duplication modes and other long steps show a progress
