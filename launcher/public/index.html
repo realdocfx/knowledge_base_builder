@@ -1,1 +1,128 @@
-Loading KBB Console...
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>KBB // Booting</title>
+<style>
+  /* Contrast per MIL-STD-1472H 5.1.3: primary text #eafaea on #070b07 (~18:1),
+     status text #b8e6b8 (~12:1), accent #00d000 (~9:1) — all well above the 6:1
+     minimum / 10:1 preferred, so the night-green optic stays legible. */
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: #070b07; color: #eafaea;
+    font-family: "Courier New", Courier, monospace;
+    display: flex; align-items: center; justify-content: center; overflow: hidden;
+  }
+  .wrap { text-align: center; width: min(600px, 88vw); }
+  .logo { color: #00d000; }
+  .logo svg { width: 78px; height: 78px; }
+  h1 { font-size: 28px; letter-spacing: 3px; margin: 16px 0 2px; color: #eafaea; }
+  h1 span { color: #00d000; font-size: 12px; letter-spacing: 4px; display: block; margin-top: 6px; }
+
+  .phase { margin-top: 26px; font-size: 14px; color: #eafaea; letter-spacing: .5px; }
+  .bar { position: relative; height: 16px; margin: 12px 0 8px; background: #10201a;
+         border: 1px solid #1e7a34; overflow: hidden; }
+  .fill { height: 100%; width: 0%; background: #00d000; transition: width .25s linear; }
+  .pct { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+         font-size: 11px; color: #eafaea; text-shadow: 0 0 3px #000; letter-spacing: 1px; }
+  .sub { font-size: 12px; color: #b8e6b8; letter-spacing: .5px; min-height: 18px; }
+  .step { font-size: 11px; color: #7fbf7f; margin-top: 8px; letter-spacing: 1px; }
+  .hint { margin-top: 20px; font-size: 11px; color: #6ea36e; letter-spacing: 1px; }
+
+  /* Neutral, descriptive failure state with an explicit recovery action (5.17.10.7) */
+  .err { display: none; }
+  body[data-error="1"] .err { display: block; }
+  body[data-error="1"] .boot { display: none; }
+  body[data-error="1"] .logo svg { color: #ff8a8a; }
+  .err .etitle { font-size: 15px; color: #ff8a8a; margin-top: 24px; }
+  .err .ebody { font-size: 12px; color: #e6c9c9; margin-top: 10px; line-height: 1.6; }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="logo" aria-hidden="true">
+      <svg viewBox="0 0 32 32" fill="none" stroke="currentColor" stroke-width="2">
+        <rect x="3" y="3" width="26" height="26"/><circle cx="16" cy="16" r="7"/>
+        <line x1="16" y1="1" x2="16" y2="9"/><line x1="16" y1="23" x2="16" y2="31"/>
+        <line x1="1" y1="16" x2="9" y2="16"/><line x1="23" y1="16" x2="31" y2="16"/>
+        <circle cx="16" cy="16" r="1.6" fill="currentColor" stroke="none"/>
+      </svg>
+    </div>
+    <h1>KBB<span>// C2 KNOWLEDGE PORTAL</span></h1>
+
+    <div class="boot" role="status" aria-live="polite">
+      <div class="phase" id="phase">Initializing secure runtime</div>
+      <div class="bar"><div class="fill" id="fill"></div><div class="pct" id="pct">0%</div></div>
+      <div class="sub" id="sub">Starting&hellip;</div>
+      <div class="step" id="step">STEP 1 OF 3</div>
+      <div class="hint">Airgapped console &middot; loopback only &middot; no host install</div>
+    </div>
+
+    <div class="err">
+      <div class="etitle">STARTUP FAILED &mdash; portal backend did not respond</div>
+      <div class="ebody" id="errbody">
+        The embedded portal did not answer within the allotted time.<br>
+        RECOVERY: close this window and relaunch. If it persists, verify free space
+        on the drive, then re-provision it (see docs/MANUAL.md, Scenario 1).
+      </div>
+    </div>
+  </div>
+<script>
+(function () {
+  var NOMINAL_SECS = 35;     // measured cold boot from USB ~33s; bar fills against this
+  var phaseEl = document.getElementById("phase");
+  var fillEl  = document.getElementById("fill");
+  var pctEl   = document.getElementById("pct");
+  var subEl   = document.getElementById("sub");
+  var stepEl  = document.getElementById("step");
+  var lastElapsed = 0, done = false;
+
+  function setPct(p) {
+    p = Math.max(0, Math.min(100, p));
+    fillEl.style.width = p.toFixed(1) + "%";
+    pctEl.textContent = p.toFixed(0) + "%";
+  }
+
+  /* Determinate boot telemetry pushed by the Rust launcher.
+     phase: 1 init, 2 waiting on backend, 3 ready. */
+  function boot(phase, name, attempt, max, elapsed) {
+    if (done) return;
+    lastElapsed = elapsed;
+    if (name) phaseEl.textContent = name;
+    stepEl.textContent = "STEP " + phase + " OF 3";
+    if (phase >= 3) {
+      done = true;
+      setPct(100);
+      subEl.textContent = "Backend online after " + elapsed + "s — opening console";
+      return;
+    }
+    // Phase 2 occupies 5–95%, filling against the nominal boot budget so the
+    // operator sees real movement rather than an ambiguous spinner.
+    setPct(5 + Math.min(90, (elapsed / NOMINAL_SECS) * 90));
+    // Explicit retry sub-status (MIL-STD-1472H 5.17: never look frozen).
+    subEl.textContent = "Probe " + attempt + " of " + max + "  ·  elapsed " + elapsed + "s";
+  }
+
+  // Drain anything the launcher queued before this script parsed, then take over.
+  var q = window.__kbbBootQueue || [];
+  window.__kbbBoot = function (p, n, a, m, e) { boot(p, n, a, m, e); };
+  for (var i = 0; i < q.length; i++) { window.__kbbBoot.apply(null, q[i]); }
+
+  // Local ticker so elapsed time keeps moving between launcher probes.
+  setInterval(function () {
+    if (done) return;
+    lastElapsed += 1;
+    setPct(5 + Math.min(90, (lastElapsed / NOMINAL_SECS) * 90));
+  }, 1000);
+
+  window.kbbBootFailed = function () {
+    done = true;
+    document.body.setAttribute("data-error", "1");
+  };
+})();
+</script>
+</body>
+</html>

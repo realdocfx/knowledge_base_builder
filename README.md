@@ -187,6 +187,12 @@ Then open `http://127.0.0.1:8080` in your browser. The dashboard embeds the nati
 
 ### 9. Airgapped Launcher Deployment (Windows)
 
+> 📖 For step-by-step walkthroughs — first build from GitHub, making a **virgin**
+> stick from an existing one, and **full duplication** — see the
+> [**Field Manual**](src/knowledge_base_builder/docs/MANUAL.md) (also readable in the
+> portal itself under **Documentation**). Duplication (scenarios 2 & 3) is done
+> entirely from the portal's **Drive Provisioning** panel, no terminal required.
+
 For zero-install, single-click deployment on a portable USB drive, provision the
 hardened Rust/Tauri launcher. It renders the portal in a **bundled** WebView2
 runtime, so it works on any Windows host — even one with no WebView2 installed and

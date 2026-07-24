@@ -14,4 +14,3 @@ tauri-build = { version = "1.5" }
 # allowlist ({ all: false }) in tauri.conf.json.
 [dependencies]
 tauri = { version = "1.5" }
-reqwest = { version = "0.11", features = ["blocking"] }

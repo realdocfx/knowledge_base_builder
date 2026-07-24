@@ -18,6 +18,7 @@ import re
 import shutil
 import socket
 import subprocess
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -39,6 +40,7 @@ except ImportError:  # pragma: no cover - optional FTS dependency
     xapian = None  # type: ignore
 
 from .archive_index import ArchiveIndex
+from . import cloning
 from .buckets.usb import UsbBucket
 from .engines import ArchiveEngine, WikipediaEngine
 from .presentation import _physical_zim_path, discover_archives
@@ -55,7 +57,10 @@ app = FastAPI(
 # never matches a real port — a regex is required to allow any loopback port.
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex=r"^http://(127\.0\.0\.1|localhost)(:\d+)?$",
+    # Loopback origins plus the Tauri launcher's webview origin (tauri://localhost on
+    # POSIX, https://tauri.localhost on Windows/WebView2) so the launcher's loading
+    # screen can reach the portal without tripping CORS.
+    allow_origin_regex=r"^(https?://(127\.0\.0\.1|localhost)(:\d+)?|https?://tauri\.localhost|tauri://localhost)$",
     allow_credentials=True,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
@@ -264,9 +269,14 @@ def _start_kiwix_server(root: Path) -> Optional[Tuple[str, str]]:
             errors="replace",
         )
 
-        # Wait for the TCP socket to accept connections first.
+        # Wait for the TCP socket to accept connections. kiwix-serve opens and
+        # validates every ZIM before it listens, which for a multi-GB library can
+        # take minutes; a short budget here made us kill a perfectly healthy engine
+        # and respawn it on another port (leaking processes and never succeeding).
+        # The generous budget costs nothing: this runs on a background thread and
+        # never blocks the portal from binding.
         connected = False
-        for _ in range(60):  # 60 * 0.5s = 30 seconds
+        for _ in range(600):  # 600 * 0.5s = 5 minutes
             if KIWIX_PROCESS.poll() is not None:
                 stderr = KIWIX_PROCESS.stderr.read() if KIWIX_PROCESS.stderr else ""
                 if _addr_in_use(stderr):
@@ -308,21 +318,12 @@ def _start_kiwix_server(root: Path) -> Optional[Tuple[str, str]]:
             start_port = port + 1
             continue
 
-        # Then wait until the catalog endpoint is actually serving, so the iframe
-        # does not hit a 404 while kiwix-serve is still loading archives.
+        # kiwix-serve is accepting TCP connections. Return IMMEDIATELY without
+        # waiting for its catalog to finish indexing — for large ZIMs that can take
+        # tens of seconds, and blocking here delayed the whole portal from binding
+        # (the cause of the launcher's "connection refused"). The dashboard reader
+        # iframe shows a loading spinner until kiwix finishes loading its archives.
         url = f"http://127.0.0.1:{port}"
-        catalog_url = f"{url}/wiki/catalog/v2/entries"
-        for _ in range(180):  # 180 * 2s = 6 minutes (large ZIMs need time)
-            if KIWIX_PROCESS.poll() is not None:
-                return None
-            try:
-                with urllib.request.urlopen(catalog_url, timeout=5) as resp:
-                    if resp.status == 200:
-                        return url, primary.stem
-            except Exception:
-                time.sleep(2)
-
-        # Fallback: return the URL even if the catalog did not respond in time.
         return url, primary.stem
 
     return None
@@ -340,28 +341,72 @@ async def lifespan(_app: FastAPI):
     BUCKET = UsbBucket(str(root))
     BUCKET.initialize()
 
-    try:
-        kiwix_result = _start_kiwix_server(root)
-    except RuntimeError:
-        # Portal can still function for stats/search/files without the ZIM reader.
-        kiwix_result = None
-
     _app.state.bucket_root = root
     _app.state.kiwix_url = None
     _app.state.kiwix_book_name = None
     _app.state.kiwix_reader_url = None
     _app.state.wiki_fts_path = None
     _app.state.kiwix_client = None
+    _app.state.kiwix_state = "starting"  # starting | ready | unavailable
+    _app.state.kiwix_started_at = time.time()
     _app.state.xapian_available = xapian is not None
 
-    if kiwix_result:
-        kiwix_url, kiwix_book_name = kiwix_result
-        KIWIX_CLIENT = httpx.AsyncClient(base_url=kiwix_url, timeout=30.0)
-        _app.state.kiwix_url = kiwix_url
-        _app.state.kiwix_book_name = kiwix_book_name
-        _app.state.kiwix_reader_url = f"/wiki/viewer#{kiwix_book_name}"
-        _app.state.wiki_fts_path = _wiki_fts_path(root, kiwix_book_name)
-        _app.state.kiwix_client = KIWIX_CLIENT
+    def _boot_kiwix() -> None:
+        """Start kiwix-serve OFF the startup path.
+
+        kiwix-serve opens and validates every ZIM before it accepts connections;
+        for a multi-GB library that takes tens of seconds. Doing it inline delayed
+        uvicorn from binding at all, so the launcher's webview hit
+        ERR_CONNECTION_REFUSED. The portal must never block on the ZIM engine: it
+        binds immediately and the reader attaches when kiwix reports ready.
+        """
+        global KIWIX_CLIENT
+        try:
+            result = _start_kiwix_server(root)
+        except RuntimeError:
+            result = None  # binary missing: portal still serves stats/search/files
+        except Exception:
+            logger.exception("kiwix-serve failed to start")
+            result = None
+        if not result:
+            _app.state.kiwix_state = "unavailable"
+        else:
+            kiwix_url, kiwix_book_name = result
+            _app.state.kiwix_url = kiwix_url
+            _app.state.kiwix_book_name = kiwix_book_name
+            # The socket is up, but kiwix still indexes its archives before it can
+            # serve anything. Report that as a distinct phase and only mark ready
+            # once the catalog actually answers — otherwise the reader attaches to
+            # an engine that cannot respond and the iframe hangs for minutes.
+            _app.state.kiwix_state = "indexing"
+            catalog = f"{kiwix_url}/wiki/catalog/v2/entries"
+            for _ in range(600):  # generous: very large libraries take a while
+                if KIWIX_PROCESS is not None and KIWIX_PROCESS.poll() is not None:
+                    _app.state.kiwix_state = "unavailable"
+                    break
+                try:
+                    with urllib.request.urlopen(catalog, timeout=5) as resp:
+                        if resp.status == 200:
+                            break
+                except Exception:
+                    time.sleep(2)
+            if _app.state.kiwix_state != "unavailable":
+                KIWIX_CLIENT = httpx.AsyncClient(base_url=kiwix_url, timeout=30.0)
+                _app.state.kiwix_reader_url = f"/wiki/viewer#{kiwix_book_name}"
+                _app.state.wiki_fts_path = _wiki_fts_path(root, kiwix_book_name)
+                _app.state.kiwix_client = KIWIX_CLIENT
+                _app.state.kiwix_state = "ready"
+
+        # Only NOW build the search index. Running it during boot saturated the
+        # drive's I/O and starved both kiwix and the telemetry endpoints, which is
+        # what made the console sit at "Initializing…" for minutes.
+        try:
+            if ArchiveIndex(root).needs_rebuild():
+                ArchiveIndex(root).rebuild()
+        except Exception:
+            logger.exception("Background index rebuild failed")
+
+    threading.Thread(target=_boot_kiwix, daemon=True).start()
 
     yield
 
@@ -382,42 +427,35 @@ app.router.lifespan_context = lifespan
 
 @app.get("/", response_class=HTMLResponse)
 async def dashboard() -> str:
-    kiwix_url = getattr(app.state, "kiwix_url", None)
-    kiwix_reader = getattr(app.state, "kiwix_reader_url", None)
-    if kiwix_url and BUCKET:
-        archives = discover_archives(BUCKET.root)
-        if archives and kiwix_reader:
-            iframe_src = kiwix_reader
-        else:
-            iframe_src = kiwix_url
+    """Render the console immediately, regardless of ZIM engine state.
 
-        html = DASHBOARD_HTML.replace("{{KIWIX_URL}}", kiwix_url)
-        html = html.replace("{{WIKI_ENTRY_URL}}", iframe_src)
-        return html
-
-    placeholder = "about:blank#kiwix-serve-not-installed"
-    return DASHBOARD_HTML.replace("{{KIWIX_URL}}", placeholder).replace("{{WIKI_ENTRY_URL}}", placeholder).replace(
-        f'<iframe id="wiki-frame" src="{placeholder}" title="ZIM Reader"></iframe>',
-        '<div class="card panel-inset"><h2 class="danger-text">ZIM Engine Offline</h2><p class="mono">The native kiwix-serve C++ binary is required to process ServiceWorkers and REST APIs for 1:1 Wikipedia functionality. Run <code>kb-builder portable &lt;drive&gt;</code> to inject the autonomous runtime.</p></div>'
-    )
+    kiwix-serve boots in the background (it can take tens of seconds to open a
+    multi-GB library), so the reader iframe starts blank and ``pollKiwix()``
+    points it at the reader the moment ``/api/kiwix/status`` reports ready. The
+    console is therefore never held hostage by the ZIM engine.
+    """
+    kiwix_url = getattr(app.state, "kiwix_url", None) or ""
+    kiwix_reader = getattr(app.state, "kiwix_reader_url", None) or "about:blank"
+    html = DASHBOARD_HTML.replace("{{KIWIX_URL}}", kiwix_url)
+    return html.replace("{{WIKI_ENTRY_URL}}", kiwix_reader)
 
 
 @app.get("/api/stats")
-async def api_stats() -> Dict[str, Any]:
+def api_stats() -> Dict[str, Any]:
     if BUCKET is None:
         raise HTTPException(status_code=503, detail="Bucket not initialized")
     return BUCKET.get_stats()
 
 
 @app.get("/api/state")
-async def api_state() -> Dict[str, Any]:
+def api_state() -> Dict[str, Any]:
     if BUCKET is None:
         raise HTTPException(status_code=503, detail="Bucket not initialized")
     return BUCKET.get_state()
 
 
 @app.get("/api/archives")
-async def api_archives() -> List[Dict[str, str]]:
+def api_archives() -> List[Dict[str, str]]:
     if BUCKET is None:
         raise HTTPException(status_code=503, detail="Bucket not initialized")
     return [{"name": name, "path": str(path)} for name, path in discover_archives(BUCKET.root)]
@@ -440,7 +478,7 @@ async def api_search(
 
 
 @app.get("/api/search/local")
-async def api_search_local(
+def api_search_local(
     q: str = Query(...),
     limit: int = Query(50, ge=1, le=500),
 ) -> List[Dict[str, Any]]:
@@ -451,6 +489,78 @@ async def api_search_local(
         return ArchiveIndex(BUCKET.root).search(q, limit=limit)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/api/drives")
+def api_drives() -> List[Dict[str, Any]]:
+    """List candidate target drives for cloning (the current bucket is excluded)."""
+    if BUCKET is None:
+        raise HTTPException(status_code=503, detail="Bucket not initialized")
+    return cloning.list_drives(exclude=str(BUCKET.root))
+
+
+@app.post("/api/clone")
+async def api_clone(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+    """Start a background drive clone.
+
+    ``mode`` is ``runtime`` (copy only the bootable runtime, then init a fresh
+    empty bucket — a virgin stick) or ``full`` (an exact duplicate).
+    """
+    if BUCKET is None:
+        raise HTTPException(status_code=503, detail="Bucket not initialized")
+    dst = str(payload.get("dst") or "").strip()
+    mode = str(payload.get("mode") or "full").lower()
+    if mode not in ("runtime", "full"):
+        raise HTTPException(status_code=400, detail="mode must be 'runtime' or 'full'")
+    if not dst:
+        raise HTTPException(status_code=400, detail="Destination drive required")
+    src_path = BUCKET.root.resolve()
+    dst_path = Path(dst).resolve()
+    if not dst_path.exists() or not dst_path.is_dir():
+        raise HTTPException(status_code=400, detail=f"Destination {dst_path} is not accessible")
+    if dst_path == src_path:
+        raise HTTPException(status_code=400, detail="Destination must differ from the source drive")
+    if not cloning.start_clone_thread(src_path, dst_path, mode):
+        raise HTTPException(status_code=409, detail="A clone is already in progress")
+    return {"started": True, "src": str(src_path), "dst": str(dst_path), "mode": mode}
+
+
+@app.get("/api/clone/status")
+def api_clone_status() -> Dict[str, Any]:
+    """Progress of the current/last clone (state, bytes, files, skipped)."""
+    return cloning.get_status()
+
+
+@app.get("/api/kiwix/status")
+async def api_kiwix_status() -> Dict[str, Any]:
+    """ZIM engine boot state, so the reader attaches as soon as kiwix is ready."""
+    started = getattr(app.state, "kiwix_started_at", None)
+    return {
+        "state": getattr(app.state, "kiwix_state", "unavailable"),
+        "reader_url": getattr(app.state, "kiwix_reader_url", None),
+        "book": getattr(app.state, "kiwix_book_name", None),
+        "elapsed": round(time.time() - started, 1) if started else 0,
+    }
+
+
+@app.get("/api/index/status")
+async def api_index_status() -> Dict[str, Any]:
+    """State/progress of the local full-text index (idle/running/done/error)."""
+    if BUCKET is None:
+        raise HTTPException(status_code=503, detail="Bucket not initialized")
+    return ArchiveIndex(BUCKET.root).get_status()
+
+
+@app.post("/api/index/rebuild")
+async def api_index_rebuild() -> Dict[str, Any]:
+    """Trigger a background rebuild of the local full-text index."""
+    if BUCKET is None:
+        raise HTTPException(status_code=503, detail="Bucket not initialized")
+    root = BUCKET.root
+    if ArchiveIndex(root).get_status().get("state") == "running":
+        return {"started": False, "reason": "already running"}
+    threading.Thread(target=lambda: ArchiveIndex(root).rebuild(), daemon=True).start()
+    return {"started": True}
 
 
 @app.get("/api/estimate")
@@ -1014,10 +1124,22 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .metric .metric-n{font-family:var(--font-mono);font-size:1.35rem;font-weight:bold;color:var(--mono-ink);line-height:1.15;word-break:break-all;}
 
   /* ---- Wiki reader ----------------------------------------------------- */
-  .reader-container{display:flex;flex-direction:column;height:72vh;min-height:420px;}
+  .reader-container{display:flex;flex-direction:column;height:72vh;min-height:420px;position:relative;}
   .reader-container.reader-fullscreen{position:fixed;inset:0;z-index:9999;height:100vh;margin:0;padding:8px;border-radius:0;max-width:none;background:var(--panel);}
   .reader-bar{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:6px;flex-wrap:wrap;}
   iframe#wiki-frame{flex-grow:1;width:100%;border:2px solid;border-color:var(--bevel-in);background:var(--iframe-bg);filter:var(--iframe-filter);}
+  /* Generic progress + loading indicators (reused by the wiki reader and clone) */
+  .frame-loader{position:absolute;inset:0;display:flex;flex-direction:column;gap:12px;align-items:center;justify-content:center;background:var(--panel);z-index:5;}
+  .reader-container.loaded .frame-loader{display:none;}
+  .spinner{width:34px;height:34px;border:3px solid var(--mid);border-top-color:var(--phosphor);border-radius:50%;animation:kbspin .8s linear infinite;}
+  @keyframes kbspin{to{transform:rotate(360deg);}}
+  .progress-overlay{position:fixed;inset:0;z-index:10000;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.55);}
+  .progress-overlay[hidden]{display:none;}
+  .progress-box{width:min(520px,88vw);}
+  .progress-title{font-weight:bold;margin-bottom:12px;}
+  .progress-track{height:14px;background:var(--field);border:1px solid;border-color:var(--bevel-in);overflow:hidden;}
+  .progress-fill{height:100%;width:0;background:var(--phosphor);transition:width .2s ease;}
+  .progress-detail{font-size:.74rem;margin-top:10px;word-break:break-all;color:var(--ink-soft);}
 
   /* ---- Tables ---------------------------------------------------------- */
   table{width:100%;border-collapse:collapse;font-size:.85rem;margin-top:10px;background:var(--field);}
@@ -1073,11 +1195,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <li><a href="#files">Local Files</a></li>
         <li><a href="#search">Local Search</a></li>
         <li><a href="#remote">Remote Acquisition</a></li>
+        <li><a href="#provision">Drive Provisioning</a></li>
       </ul>
       <div class="menu-h">Actions</div>
       <button class="btn small" type="button" onclick="loadStats()">Refresh Telemetry</button>
       <button class="btn small" type="button" onclick="openView('/files/')">Open File System</button>
       <button class="btn small" type="button" onclick="toggleWikiFullscreen()">Fullscreen Wiki</button>
+      <button class="btn small" type="button" onclick="openClone()">Duplicate Drive</button>
+      <button class="btn small" type="button" onclick="openView('/documentation')">Documentation</button>
       <button class="btn small" type="button" onclick="openView('/docs')">API Console</button>
       <div class="menu-h" id="settings">Settings</div>
       <button class="btn small primary" type="button" onclick="toggleStealthMode()">Toggle View Mode</button>
@@ -1099,12 +1224,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
 
     <div class="section-header" id="wiki">I. Local Intelligence Database</div>
-    <div class="card reader-container">
+    <div class="card reader-container" id="readerContainer">
       <div class="reader-bar">
         <span class="mono ok-text" id="engineStatus">Status: ZIM Engine Active | Mode: 1:1 Interactivity</span>
         <a href="{{WIKI_ENTRY_URL}}" id="wikiFsToggle" onclick="toggleWikiFullscreen();return false;">[ Expand to Fullscreen ]</a>
       </div>
-      <iframe id="wiki-frame" src="{{WIKI_ENTRY_URL}}" title="ZIM Reader"></iframe>
+      <iframe id="wiki-frame" src="{{WIKI_ENTRY_URL}}" title="ZIM Reader" onload="wikiLoaded()"></iframe>
+      <div class="frame-loader" id="wikiLoader"><div class="spinner"></div><span class="mono">Loading ZIM reader&hellip;</span></div>
     </div>
 
     <div class="card" id="files">
@@ -1115,9 +1241,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
     <div class="card" id="search">
       <h2>Search Local Archive (FTS5)</h2>
-      <p class="mono muted">Deterministic offline full-text search across already-secured Archive.org payloads.</p>
+      <p class="mono muted">Full-content offline search across secured payloads — name &amp; metadata rank above body text.</p>
+      <div class="row" style="align-items:center;">
+        <span id="index-status" class="mono muted" style="flex:1; min-width:200px;">Index: checking&hellip;</span>
+        <div class="progress-track" id="index-track" style="flex:1; min-width:120px; display:none;"><div class="progress-fill" id="index-fill"></div></div>
+        <button class="btn small" type="button" onclick="rebuildIndex()">Rebuild Index</button>
+      </div>
       <div class="row">
-        <input id="local-query" type="text" placeholder="e.g., 'manual OR guide'" style="flex:1; min-width:180px;">
+        <input id="local-query" type="text" placeholder="e.g., first aid, reloading, sabotage" style="flex:1; min-width:180px;" onkeydown="if(event.key==='Enter')searchLocal()">
         <input id="local-limit" type="number" value="25" style="width:80px;" title="Result Limit">
         <button class="btn primary" type="button" onclick="searchLocal()">Search Local</button>
       </div>
@@ -1140,6 +1271,33 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       </div>
       <div id="results"></div>
     </div>
+
+    <div class="section-header" id="provision">III. Drive Provisioning</div>
+    <div class="card" id="clone">
+      <h2>Duplicate / Provision a New Drive</h2>
+      <p class="mono muted">Copy this stick to another drive with no terminal steps. Choose
+        <strong>Virgin</strong> for a bootable, content-free stick ready to fill, or
+        <strong>Full duplicate</strong> to clone everything including downloaded content.</p>
+      <div class="row">
+        <select id="clone-target" style="flex:1; min-width:220px;"><option value="">Scan for drives&hellip;</option></select>
+        <button class="btn" type="button" onclick="loadDrives()">Refresh Drives</button>
+      </div>
+      <div class="row" style="gap:20px;">
+        <label class="mono"><input type="radio" name="clone-mode" value="runtime" checked> Virgin (runtime only)</label>
+        <label class="mono"><input type="radio" name="clone-mode" value="full"> Full duplicate (incl. content)</label>
+      </div>
+      <button class="btn primary" type="button" onclick="startClone()">Duplicate to Selected Drive</button>
+      <div id="clone-msg" class="mono muted" style="margin-top:6px;"></div>
+    </div>
+
+    <div id="progressOverlay" class="progress-overlay" hidden>
+      <div class="progress-box card panel-inset">
+        <div class="progress-title" id="progressTitle">Working&hellip;</div>
+        <div class="progress-track"><div class="progress-fill" id="progressFill"></div></div>
+        <div class="progress-detail mono" id="progressDetail"></div>
+        <div style="margin-top:14px;text-align:right;"><button class="btn small" id="progressClose" type="button" onclick="hideProgress()" hidden>Close</button></div>
+      </div>
+    </div>
   </main>
 
  </div>
@@ -1148,7 +1306,17 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <footer class="foot">KBB // C2 Knowledge Portal &middot; Netscape-Mosaic &amp; Stealth-Night dual-optics &middot; offline-autonomous, OS-independent</footer>
 
 <script>
-async function api(path) { const r = await fetch(path); return await r.json(); }
+/* Every call is bounded: a hung request must never leave a panel silently
+   stuck on "Initializing…" (MIL-STD-1472H 5.17 — no ambiguous dead states). */
+async function api(path, timeoutMs) {
+  const ctl = new AbortController();
+  const t = setTimeout(function () { ctl.abort(); }, timeoutMs || 15000);
+  try {
+    const r = await fetch(path, { signal: ctl.signal, cache: 'no-store' });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    return await r.json();
+  } finally { clearTimeout(t); }
+}
 
 /* ---- Navigation that works in a browser tab AND the single-window -------
    launcher webview. window.open('_blank') opens a real tab in a browser, but
@@ -1168,6 +1336,135 @@ function toggleWikiFullscreen() {
   document.body.style.overflow = on ? 'hidden' : '';
   var a = document.getElementById('wikiFsToggle');
   if (a) a.textContent = on ? '[ Exit Fullscreen ]' : '[ Expand to Fullscreen ]';
+}
+
+/* ---- Generic progress overlay (reused by clone + long operations) ------ */
+function showProgress(title) {
+  document.getElementById('progressTitle').textContent = title || 'Working…';
+  document.getElementById('progressDetail').textContent = '';
+  document.getElementById('progressFill').style.width = '0%';
+  document.getElementById('progressClose').hidden = true;
+  document.getElementById('progressOverlay').hidden = false;
+}
+function updateProgress(pct, detail) {
+  document.getElementById('progressFill').style.width = (pct || 0).toFixed(1) + '%';
+  if (detail != null) document.getElementById('progressDetail').textContent = detail;
+}
+function finishProgress(title, detail) {
+  document.getElementById('progressTitle').textContent = title;
+  if (detail != null) document.getElementById('progressDetail').textContent = detail;
+  document.getElementById('progressFill').style.width = '100%';
+  document.getElementById('progressClose').hidden = false;
+}
+function hideProgress() { document.getElementById('progressOverlay').hidden = true; }
+
+/* ---- ZIM reader: attach when the engine is up, with live status -------- */
+function wikiLoaded() {
+  var f = document.getElementById('wiki-frame');
+  // about:blank fires onload immediately — keep the loader up until the real
+  // reader document has loaded.
+  if (!f || !f.src || f.src.indexOf('about:blank') === 0) return;
+  var c = document.getElementById('readerContainer');
+  if (c) c.classList.add('loaded');
+}
+var _kiwixAttached = false;
+async function pollKiwix() {
+  var loader = document.getElementById('wikiLoader');
+  var label = loader ? loader.querySelector('span') : null;
+  var status = document.getElementById('engineStatus');
+  var st;
+  try { st = await api('/api/kiwix/status'); } catch (e) { setTimeout(pollKiwix, 1500); return; }
+  if (st.state === 'ready' && st.reader_url) {
+    if (!_kiwixAttached) {
+      _kiwixAttached = true;
+      if (label) label.textContent = 'Loading ZIM reader…';
+      var f = document.getElementById('wiki-frame');
+      if (f) f.src = st.reader_url;
+      var a = document.getElementById('wikiFsToggle');
+      if (a) a.href = st.reader_url;
+      if (status) status.textContent = 'Status: ZIM Engine Active | Mode: 1:1 Interactivity';
+    }
+    return;
+  }
+  if (st.state === 'unavailable') {
+    if (loader) loader.innerHTML = '<span class="mono danger-text">ZIM engine unavailable — kiwix-serve not found or failed to start.</span>';
+    if (status) { status.textContent = 'Status: ZIM Engine Offline'; status.className = 'mono danger-text'; }
+    return;
+  }
+  // Still starting/indexing: show the phase AND elapsed so it can never look
+  // frozen (MIL-STD-1472H 5.17). "indexing" means the socket is up but kiwix is
+  // still opening its archives — the reader is deliberately not attached yet.
+  var secs = Math.round(st.elapsed || 0);
+  var phase = (st.state === 'indexing')
+    ? 'Indexing ZIM archives (first run is slow)'
+    : 'Starting ZIM engine';
+  if (label) label.textContent = phase + '… (' + secs + 's)';
+  if (status) status.textContent = 'Status: ' + phase + '… (' + secs + 's)';
+  setTimeout(pollKiwix, 1000);
+}
+
+/* ---- Drive provisioning / duplication (scenarios 2 & 3) --------------- */
+function fmtGB(b) { return (b / 1073741824).toFixed(1) + ' GB'; }
+async function loadDrives() {
+  var sel = document.getElementById('clone-target');
+  sel.innerHTML = '<option value="">Scanning…</option>';
+  try {
+    var drives = await api('/api/drives');
+    if (!drives.length) {
+      sel.innerHTML = '<option value="">No target drive found — insert one and Refresh</option>';
+      return;
+    }
+    sel.innerHTML = drives.map(function (d) {
+      return '<option value="' + d.path + '">' + d.path + ' — ' + d.type +
+             ', ' + fmtGB(d.free) + ' free / ' + fmtGB(d.total) + '</option>';
+    }).join('');
+  } catch (e) {
+    sel.innerHTML = '<option value="">Error listing drives</option>';
+  }
+}
+function openClone() {
+  var el = document.getElementById('clone');
+  if (el) el.scrollIntoView({ behavior: 'smooth' });
+  loadDrives();
+}
+async function startClone() {
+  var dst = document.getElementById('clone-target').value;
+  var mode = document.querySelector('input[name="clone-mode"]:checked').value;
+  var msg = document.getElementById('clone-msg');
+  if (!dst) { msg.textContent = 'Select a target drive first.'; return; }
+  var label = mode === 'runtime' ? 'a VIRGIN stick (runtime only)' : 'a FULL duplicate (all content)';
+  if (!confirm('Copy this stick to ' + dst + ' as ' + label + '?\\n\\n' +
+               'Files on ' + dst + ' with the same names will be overwritten.')) return;
+  msg.textContent = '';
+  var res = await fetch('/api/clone', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ dst: dst, mode: mode })
+  });
+  if (!res.ok) {
+    var err = await res.json().catch(function () { return {}; });
+    msg.textContent = 'Clone error: ' + (err.detail || res.status);
+    return;
+  }
+  showProgress('Duplicating to ' + dst);
+  pollClone();
+}
+async function pollClone() {
+  var s;
+  try { s = await api('/api/clone/status'); } catch (e) { setTimeout(pollClone, 1000); return; }
+  if (s.state === 'running') {
+    var pct = s.total_bytes ? Math.min(100, s.done_bytes / s.total_bytes * 100) : 0;
+    updateProgress(pct, fmtGB(s.done_bytes) + ' / ' + fmtGB(s.total_bytes) + '  —  ' +
+                   s.done_files + '/' + s.total_files + ' files  —  ' + (s.current || ''));
+    setTimeout(pollClone, 500);
+  } else if (s.state === 'done') {
+    var skip = (s.skipped && s.skipped.length) ? ' (' + s.skipped.length + ' file(s) skipped)' : '';
+    finishProgress('Duplicate complete' + skip, fmtGB(s.done_bytes) + ' copied to ' + s.dst);
+    document.getElementById('clone-msg').textContent = 'Done: ' + fmtGB(s.done_bytes) + ' to ' + s.dst + skip;
+  } else if (s.state === 'error') {
+    finishProgress('Duplicate failed', s.error || 'unknown error');
+  } else {
+    hideProgress();
+  }
 }
 
 /* ---- Optics: Standard Mosaic <-> Stealth Night Green ------------------- */
@@ -1232,10 +1529,15 @@ async function loadStats() {
     }
     document.getElementById('stats').innerHTML = html;
   } catch (e) {
+    // Never leave a dead panel: state the fault and that we are retrying.
+    _statsRetries += 1;
     document.getElementById('stats').innerHTML =
-      '<div class="metric"><div class="metric-k">Telemetry</div><div class="metric-n danger-text">LINK DOWN</div></div>';
+      '<div class="metric"><div class="metric-k">Telemetry</div><div class="metric-n danger-text">LINK DOWN</div></div>' +
+      '<div class="metric"><div class="metric-k">Recovery</div><div class="metric-n">retry ' + _statsRetries + '…</div></div>';
+    setTimeout(loadStats, 3000);
   }
 }
+var _statsRetries = 0;
 
 async function search() {
   const source = document.getElementById('source').value;
@@ -1264,23 +1566,64 @@ async function estimate() {
   document.getElementById('results').innerHTML = `<pre>${JSON.stringify(est, null, 2)}</pre>`;
 }
 
+function escHtml(s) { var d = document.createElement('div'); d.textContent = s == null ? '' : s; return d.innerHTML; }
 async function searchLocal() {
-  const query = encodeURIComponent(document.getElementById('local-query').value);
-  const limit = document.getElementById('local-limit').value;
-  document.getElementById('local-results').innerHTML = '<span class="mono">Searching local FTS5 index...</span>';
-  const results = await api(`/api/search/local?q=${query}&limit=${limit}`);
-  let html = '<table><tr><th>Identifier</th><th>File</th><th>Title</th><th>Format</th><th>Size</th></tr>';
-  for (const r of results) {
-    html += `<tr>
-      <td class="mono">${r.identifier}</td>
-      <td class="mono">${r.file_name}</td>
-      <td>${r.title || ''}</td>
-      <td>${r.format || ''}</td>
-      <td class="mono">${r.size || ''}</td>
-    </tr>`;
+  var q = document.getElementById('local-query').value.trim();
+  var limit = document.getElementById('local-limit').value;
+  var box = document.getElementById('local-results');
+  if (!q) { box.innerHTML = '<span class="mono muted">Enter a search term.</span>'; return; }
+  box.innerHTML = '<span class="mono">Searching…</span>';
+  var results;
+  try { results = await api('/api/search/local?q=' + encodeURIComponent(q) + '&limit=' + limit); }
+  catch (e) { box.innerHTML = '<span class="mono danger-text">Search error.</span>'; return; }
+  if (!results.length) {
+    box.innerHTML = '<span class="mono muted">No matches. If the index is still building, wait for it to finish (see status above) or click Rebuild Index.</span>';
+    return;
   }
-  html += '</table>';
-  document.getElementById('local-results').innerHTML = html;
+  function render(list) {
+    return list.map(function (r) {
+      var read = '/read?path=' + encodeURIComponent(r.rel_path || '');
+      var snip = r.snippet ? '<div class="mono muted" style="font-size:.72rem;margin-top:2px;">' + escHtml(r.snippet) + '</div>' : '';
+      return '<div style="padding:7px 0;border-bottom:1px solid var(--mid);">' +
+        '<a href="' + read + '" onclick="openView(this.href);return false;"><strong>' +
+        escHtml(r.title || r.file_name) + '</strong></a> ' +
+        '<span class="mono muted" style="font-size:.72rem;">' + escHtml(r.file_name) +
+        (r.format ? ' · ' + escHtml(r.format) : '') + '</span>' + snip + '</div>';
+    }).join('');
+  }
+  var nameHits = results.filter(function (r) { return r.tier === 'name'; });
+  var bodyHits = results.filter(function (r) { return r.tier !== 'name'; });
+  var html = '';
+  if (nameHits.length) html += '<div class="mono ok-text" style="margin-top:8px;">Name / metadata (' + nameHits.length + ')</div>' + render(nameHits);
+  if (bodyHits.length) html += '<div class="mono muted" style="margin-top:12px;">Body text (' + bodyHits.length + ')</div>' + render(bodyHits);
+  box.innerHTML = html;
+}
+
+/* ---- Local full-text index status + rebuild --------------------------- */
+async function refreshIndexStatus() {
+  var el = document.getElementById('index-status');
+  var track = document.getElementById('index-track');
+  var fill = document.getElementById('index-fill');
+  if (!el) return;
+  var s;
+  try { s = await api('/api/index/status'); } catch (e) { return; }
+  if (s.state === 'running') {
+    var pct = s.total ? Math.min(100, (s.done / s.total) * 100) : 0;
+    el.textContent = 'Index: building ' + (s.done || 0) + '/' + (s.total || 0) + '…';
+    if (track) { track.style.display = ''; fill.style.width = pct.toFixed(1) + '%'; }
+    setTimeout(refreshIndexStatus, 800);
+  } else {
+    if (track) track.style.display = 'none';
+    var n = s.file_count || 0;
+    if (s.state === 'error') el.textContent = 'Index: error — ' + (s.error || 'unknown');
+    else if (!n && !s.built_at) el.textContent = 'Index: empty — click Rebuild Index';
+    else el.textContent = 'Index: ready — ' + n + ' file(s)' + (s.built_at ? ', built ' + String(s.built_at).replace('T', ' ').slice(0, 16) + ' UTC' : '');
+  }
+}
+async function rebuildIndex() {
+  document.getElementById('index-status').textContent = 'Index: starting rebuild…';
+  try { await fetch('/api/index/rebuild', { method: 'POST' }); } catch (e) {}
+  setTimeout(refreshIndexStatus, 400);
 }
 
 async function download(source, identifier) {
@@ -1295,6 +1638,13 @@ async function download(source, identifier) {
 
 loadStats();
 setInterval(loadStats, 10000);
+loadDrives();
+pollKiwix();
+refreshIndexStatus();
+/* Resume the progress overlay if a duplicate is already running (e.g. page reload). */
+api('/api/clone/status').then(function (s) {
+  if (s && s.state === 'running') { showProgress('Duplicating to ' + (s.dst || '')); pollClone(); }
+}).catch(function () {});
 </script>
 </body>
 </html>
@@ -1563,6 +1913,129 @@ def _themed_page(title: str, body_html: str, back_href: str = "/", back_label: s
         + MODE_SCRIPT
         + "\n</body>\n</html>"
     )
+
+
+_DOCS_DIR = Path(__file__).resolve().parent / "docs"
+
+_DOC_CSS = (
+    "<style>.doc{max-width:900px;}.doc h1,.doc h2,.doc h3,.doc h4{margin-top:1.2em;}"
+    ".doc table{border-collapse:collapse;margin:12px 0;}"
+    ".doc th,.doc td{border:1px solid var(--mid);padding:4px 9px;text-align:left;}"
+    ".doc pre{background:var(--field);padding:10px;overflow:auto;border:1px solid;border-color:var(--bevel-in);}"
+    ".doc code{font-family:var(--font-mono);}"
+    ".doc blockquote{border-left:3px solid var(--phosphor);margin:10px 0;padding:4px 12px;color:var(--ink-soft);}"
+    ".doc hr{border:0;border-top:1px solid var(--mid);margin:18px 0;}.doc li{margin:3px 0;}</style>"
+)
+
+
+def _md_inline(text: str) -> str:
+    """Inline markdown (code/bold/links) on an already-HTML-escaped string."""
+    text = re.sub(r"`([^`]+)`", r"<code>\1</code>", text)
+    text = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", text)
+    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r'<a href="\2" rel="noopener">\1</a>', text)
+    return text
+
+
+def _render_markdown(md: str) -> str:
+    """Minimal self-contained Markdown -> HTML for the bundled docs."""
+    lines = md.replace("\r\n", "\n").split("\n")
+    out: List[str] = []
+    i, n = 0, len(lines)
+    list_open = {"kind": None}
+
+    def close_list() -> None:
+        if list_open["kind"]:
+            out.append("</%s>" % list_open["kind"])
+            list_open["kind"] = None
+
+    def cells(row: str) -> List[str]:
+        return [c.strip() for c in row.strip().strip("|").split("|")]
+
+    while i < n:
+        line = lines[i]
+        s = line.strip()
+        if s.startswith("```"):
+            close_list()
+            i += 1
+            code: List[str] = []
+            while i < n and not lines[i].strip().startswith("```"):
+                code.append(html.escape(lines[i]))
+                i += 1
+            i += 1
+            out.append("<pre><code>" + "\n".join(code) + "</code></pre>")
+            continue
+        if "|" in line and i + 1 < n and "-" in lines[i + 1] and re.match(r"^\s*\|?[\s:|-]+\|?\s*$", lines[i + 1]):
+            close_list()
+            out.append("<table><thead><tr>" + "".join("<th>" + _md_inline(html.escape(c)) + "</th>" for c in cells(line)) + "</tr></thead><tbody>")
+            i += 2
+            while i < n and "|" in lines[i] and lines[i].strip():
+                out.append("<tr>" + "".join("<td>" + _md_inline(html.escape(c)) + "</td>" for c in cells(lines[i])) + "</tr>")
+                i += 1
+            out.append("</tbody></table>")
+            continue
+        m = re.match(r"^(#{1,6})\s+(.*)$", s)
+        if m:
+            close_list()
+            lv = len(m.group(1))
+            out.append("<h%d>%s</h%d>" % (lv, _md_inline(html.escape(m.group(2))), lv))
+            i += 1
+            continue
+        if re.match(r"^(-{3,}|\*{3,}|_{3,})$", s):
+            close_list()
+            out.append("<hr>")
+            i += 1
+            continue
+        if s.startswith(">"):
+            close_list()
+            quote: List[str] = []
+            while i < n and lines[i].strip().startswith(">"):
+                quote.append(_md_inline(html.escape(re.sub(r"^\s*>\s?", "", lines[i]))))
+                i += 1
+            out.append("<blockquote>" + "<br>".join(quote) + "</blockquote>")
+            continue
+        lm = re.match(r"^\s*([-*+]|\d+\.)\s+(.*)$", line)
+        if lm:
+            kind = "ol" if lm.group(1)[0].isdigit() else "ul"
+            if list_open["kind"] != kind:
+                close_list()
+                out.append("<%s>" % kind)
+                list_open["kind"] = kind
+            out.append("<li>" + _md_inline(html.escape(lm.group(2))) + "</li>")
+            i += 1
+            continue
+        if not s:
+            close_list()
+            i += 1
+            continue
+        close_list()
+        out.append("<p>" + _md_inline(html.escape(s)) + "</p>")
+        i += 1
+    close_list()
+    return "\n".join(out)
+
+
+@app.get("/documentation", response_class=HTMLResponse)
+async def docs_index() -> str:
+    """Themed index of the bundled KBB documentation (kept off /docs, which is Swagger)."""
+    items = sorted(_DOCS_DIR.glob("*.md")) if _DOCS_DIR.is_dir() else []
+    rows = "".join(
+        '<li><a href="/documentation/view?name=%s">%s</a></li>'
+        % (urllib.parse.quote(p.stem), html.escape(p.stem.replace("_", " ").title()))
+        for p in items
+    )
+    body = _DOC_CSS + "<h1>Documentation</h1><ul>" + (rows or "<li>No documents bundled.</li>") + "</ul>"
+    return _themed_page("Documentation", body)
+
+
+@app.get("/documentation/view", response_class=HTMLResponse)
+async def docs_view(name: str = Query(...)) -> str:
+    """Render a single bundled Markdown document in the themed chrome."""
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "", name)
+    path = _DOCS_DIR / (safe + ".md")
+    if not safe or not path.is_file():
+        raise HTTPException(status_code=404, detail="Document not found")
+    body = _DOC_CSS + '<article class="doc">' + _render_markdown(path.read_text(encoding="utf-8", errors="replace")) + "</article>"
+    return _themed_page(path.stem.replace("_", " ").title(), body, back_href="/documentation", back_label="Docs")
 
 
 def _render_library_listing(path: str, target: Path, root: Path) -> str:
