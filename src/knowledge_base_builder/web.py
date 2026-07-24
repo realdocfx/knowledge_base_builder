@@ -30,6 +30,7 @@ from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 
 import httpx
 from fastapi import BackgroundTasks, Body, FastAPI, HTTPException, Query, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
 
 try:
@@ -46,8 +47,47 @@ from .presentation import _physical_zim_path, discover_archives
 app = FastAPI(
     title="Knowledge-Base-Builder C2 Portal",
     description="Tactical dashboard for local knowledge-base logistics.",
-    version="0.4.3",
+    version="0.5.0",
 )
+
+# Enforce strict loopback-only CORS for airgapped security.
+# NB: Starlette matches allow_origins by EXACT string, so "http://127.0.0.1:*"
+# never matches a real port — a regex is required to allow any loopback port.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origin_regex=r"^http://(127\.0\.0\.1|localhost)(:\d+)?$",
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+)
+
+
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    """Add airgapped security headers to all responses."""
+    response: Response = await call_next(request)
+    
+    # Content Security Policy - restrict to loopback and local resources only
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self' 'unsafe-inline' 'unsafe-eval' data: blob:; "
+        "connect-src 'self' ws://127.0.0.1:* wss://127.0.0.1:* ws://localhost:* wss://localhost:*; "
+        "frame-src 'self' http://127.0.0.1:* http://localhost:*; "
+        "img-src 'self' data: blob:; "
+        "style-src 'self' 'unsafe-inline'; "
+        "script-src 'self' 'unsafe-inline' 'unsafe-eval';"
+    )
+    
+    # Additional security headers
+    response.headers["X-Frame-Options"] = "SAMEORIGIN"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, private"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    
+    return response
+
 
 logger = logging.getLogger(__name__)
 
@@ -975,6 +1015,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
   /* ---- Wiki reader ----------------------------------------------------- */
   .reader-container{display:flex;flex-direction:column;height:72vh;min-height:420px;}
+  .reader-container.reader-fullscreen{position:fixed;inset:0;z-index:9999;height:100vh;margin:0;padding:8px;border-radius:0;max-width:none;background:var(--panel);}
   .reader-bar{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:6px;flex-wrap:wrap;}
   iframe#wiki-frame{flex-grow:1;width:100%;border:2px solid;border-color:var(--bevel-in);background:var(--iframe-bg);filter:var(--iframe-filter);}
 
@@ -1035,9 +1076,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       </ul>
       <div class="menu-h">Actions</div>
       <button class="btn small" type="button" onclick="loadStats()">Refresh Telemetry</button>
-      <button class="btn small" type="button" onclick="window.open('/files/','_blank')">Open File System</button>
-      <button class="btn small" type="button" onclick="window.open('{{WIKI_ENTRY_URL}}','_blank')">Fullscreen Wiki</button>
-      <button class="btn small" type="button" onclick="window.open('/docs','_blank')">API Console</button>
+      <button class="btn small" type="button" onclick="openView('/files/')">Open File System</button>
+      <button class="btn small" type="button" onclick="toggleWikiFullscreen()">Fullscreen Wiki</button>
+      <button class="btn small" type="button" onclick="openView('/docs')">API Console</button>
       <div class="menu-h" id="settings">Settings</div>
       <button class="btn small primary" type="button" onclick="toggleStealthMode()">Toggle View Mode</button>
       <div class="stealth-only">
@@ -1061,7 +1102,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="card reader-container">
       <div class="reader-bar">
         <span class="mono ok-text" id="engineStatus">Status: ZIM Engine Active | Mode: 1:1 Interactivity</span>
-        <a href="{{WIKI_ENTRY_URL}}" target="_blank" rel="noopener">[ Expand to Fullscreen ]</a>
+        <a href="{{WIKI_ENTRY_URL}}" id="wikiFsToggle" onclick="toggleWikiFullscreen();return false;">[ Expand to Fullscreen ]</a>
       </div>
       <iframe id="wiki-frame" src="{{WIKI_ENTRY_URL}}" title="ZIM Reader"></iframe>
     </div>
@@ -1069,7 +1110,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="card" id="files">
       <h2>Local File Index (Archive.org)</h2>
       <p class="mono muted">Browse downloaded raw PDFs, media, and manuals secured by the ArchiveEngine.</p>
-      <button class="btn" type="button" onclick="window.open('/files/', '_blank')">Open Local File System</button>
+      <button class="btn" type="button" onclick="openView('/files/')">Open Local File System</button>
     </div>
 
     <div class="card" id="search">
@@ -1108,6 +1149,26 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
 <script>
 async function api(path) { const r = await fetch(path); return await r.json(); }
+
+/* ---- Navigation that works in a browser tab AND the single-window -------
+   launcher webview. window.open('_blank') opens a real tab in a browser, but
+   the Tauri/WebView2 launcher has no tabs and silently ignores it, so we fall
+   back to navigating in place (the target pages carry a "Portal" back link). */
+function openView(url) {
+  var w = null;
+  try { w = window.open(url, '_blank'); } catch (e) {}
+  if (!w) { window.location.href = url; }
+}
+/* The embedded ZIM reader expands to cover the viewport in place — no new
+   window, so it works identically in a browser and in the launcher. */
+function toggleWikiFullscreen() {
+  var c = document.querySelector('.reader-container');
+  if (!c) return;
+  var on = c.classList.toggle('reader-fullscreen');
+  document.body.style.overflow = on ? 'hidden' : '';
+  var a = document.getElementById('wikiFsToggle');
+  if (a) a.textContent = on ? '[ Exit Fullscreen ]' : '[ Expand to Fullscreen ]';
+}
 
 /* ---- Optics: Standard Mosaic <-> Stealth Night Green ------------------- */
 function applyMode(mode) {

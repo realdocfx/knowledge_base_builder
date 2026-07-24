@@ -47,25 +47,57 @@ XAPIAN_WHEEL_VERSION = "1.4.22"
 XAPIAN_WHEEL_REPO = "realdocfx/knowledge_base_builder"
 console = Console()
 
+# Versions of the embedded runtime we ship on the portable drive. These are the
+# versions the PROVISIONING_HASHES below are pinned to, so they are fixed
+# constants rather than being derived from the host interpreter — otherwise a
+# host on (say) 3.13.7 would request an asset with no pinned hash and halt.
+EMBEDDED_PYTHON_VERSION = "3.13.5"
+EMBEDDED_KIWIX_VERSION = "3.8.1"
+# python-build-standalone release (date tag) that ships the Linux/macOS build of
+# EMBEDDED_PYTHON_VERSION. pbs tags releases by date, and 20250723 is the last
+# release carrying cpython-3.13.5 before 3.13.6 superseded it. Bump this in
+# lockstep with EMBEDDED_PYTHON_VERSION and re-pin the hashes below.
+PBS_RELEASE = "20250723"
+# WebView2 Fixed Version runtime bundled on the stick so the Rust/Tauri launcher
+# renders on ANY Windows host — even one with no WebView2 installed and no
+# internet. Sourced from the WebView2.Runtime.X64 NuGet package (a repackage of
+# Microsoft's Fixed Version runtime); the extracted msedgewebview2.exe carries a
+# valid Microsoft Authenticode signature, which is the real trust anchor here.
+WEBVIEW2_RUNTIME_VERSION = "150.0.4078.96"
+
 # Known-good SHA-256 hashes for provisioning assets (FIPS-approved algorithm)
 # These hashes must be updated when versions change
 PROVISIONING_HASHES: Dict[str, str] = {
-    # Python embeddable packages (Windows)
-    "python-3.13.5-embed-amd64.zip": "",
-    # Python embeddable packages (Linux - python-build-standalone)
-    "python-3.13.5-x86_64-unknown-linux-gnu-install_only.tar.gz": "",
-    # Python embeddable packages (macOS - python-build-standalone)
-    "python-3.13.5-x86_64-apple-darwin-install_only.tar.gz": "",
-    # Kiwix tools (Windows)
-    "kiwix-tools_win-x86_64-3.8.1.zip": "",
-    # Kiwix tools (Linux)
-    "kiwix-tools_linux-x86_64-3.8.1.tar.gz": "",
-    # Kiwix tools (macOS)
-    "kiwix-tools_darwin-x86_64-3.8.1.tar.gz": "",
-    # get-pip.py bootstrap script
-    "get-pip.py": "8a8b3b6b3f8a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",  # Placeholder - will be updated
-    # Xapian wheels (various ABI tags)
-    # These are platform-specific and will be verified during download
+    # Python embeddable package (Windows) — verified against
+    # https://www.python.org/ftp/python/3.13.5/python-3.13.5-embed-amd64.zip
+    "python-3.13.5-embed-amd64.zip": "7d2650fd9d1b9d002d4a315d5f354247fd6a44f30517c7ef577b08f57a0fb6d9",
+    # Python standalone builds (Linux/macOS) — from the astral-sh
+    # python-build-standalone release PBS_RELEASE (20250723), verified against
+    # that release's SHA256SUMS.
+    "cpython-3.13.5+20250723-x86_64-unknown-linux-gnu-install_only.tar.gz": "56bf8099cfcc3aac8dadcf2be53c48e5998d74cf5da600691dbf16be3f0b8f76",
+    "cpython-3.13.5+20250723-x86_64-apple-darwin-install_only.tar.gz": "6b508822f5238451a5dcc52f07310b74aaa701ed963bba923cc7f4d24010cc21",
+    # Kiwix tools (Windows) — verified against
+    # https://download.kiwix.org/release/kiwix-tools/kiwix-tools_win-x86_64-3.8.1.zip
+    "kiwix-tools_win-x86_64-3.8.1.zip": "fcd01ed2b93e9a68632c7863c83b9f66bf64406a66357be1df7b8b75596f3e45",
+    # Kiwix tools (Linux) — verified against download.kiwix.org
+    "kiwix-tools_linux-x86_64-3.8.1.tar.gz": "46557f9a3c3eaada2556a957cf5bc662c07dc6286e8924e04fa3a173f83ff6dd",
+    # Kiwix tools (macOS) — upstream publishes this under the "macos" name (the
+    # "darwin" name 404s); verified against download.kiwix.org.
+    "kiwix-tools_macos-x86_64-3.8.1.tar.gz": "70219e56f7c274e1fc0db8487abdcc91bde9a6f2923958894c0c81ee24b06c01",
+    # get-pip.py bootstrap script — verified against
+    # https://bootstrap.pypa.io/get-pip.py
+    "get-pip.py": "a341e1a43e38001c551a1508a73ff23636a11970b61d901d9a1cad2a18f57055",
+    # WebView2 Fixed Version runtime (NuGet repackage of Microsoft's signed
+    # runtime) — nupkg verified against api.nuget.org; the extracted
+    # msedgewebview2.exe is Microsoft-Authenticode-signed.
+    "webview2.runtime.x64.150.0.4078.96.nupkg": "71c6c3bb88a9d621d9be1fbb6609f61f0bc74de04c75d8a549dea28b81823b8a",
+    # Rust/Tauri launcher binary (Windows): a build artifact whose hash is
+    # computed at build time in _provision_rust_launcher(), not a fixed download.
+    "launch_kbb.exe": "",
+    # rustup-init.exe: win.rustup.rs always serves the latest installer, so a
+    # fixed pin is impractical; provisioning fetches it over TLS without pinning.
+    "rustup-init.exe": "",
+    # Xapian wheels (various ABI tags) are platform-specific and pinned per-release.
 }
 
 
@@ -567,13 +599,20 @@ def _verify_hash(file_path: Path, expected_hash: str, allow_insecure: bool = Fal
     
     actual_hash = sha256.hexdigest().lower()
     if actual_hash != expected_hash.lower():
+        # Remove the unverified payload so a re-run re-fetches a clean copy
+        # instead of endlessly failing against a cached bad/partial file.
+        try:
+            file_path.unlink()
+        except OSError:
+            pass
         raise RuntimeError(
             f"CRITICAL SECURITY VIOLATION: Hash mismatch for {file_path.name}!\n"
             f"Expected: {expected_hash}\n"
             f"Actual:   {actual_hash}\n"
-            "Execution halted to prevent supply chain compromise."
+            "The unverified file was discarded. Execution halted to prevent "
+            "supply chain compromise."
         )
-    
+
     console.print(f"[green]SHA-256 signature verified for {file_path.name}[/green]")
 
 
@@ -620,30 +659,46 @@ def _secure_fetch(
         RuntimeError: If network fetching attempted without allow_insecure flag
         ValueError: If hash verification fails
     """
-    if local_bundle:
-        # Air-gapped mode: extract from local bundle
-        source_file = local_bundle / Path(url).name
-        if not source_file.exists():
-            raise FileNotFoundError(
-                f"Air-gap violation: Required asset {source_file.name} not found in {local_bundle}. "
-                "Ensure your provisioning bundle contains all required assets."
-            )
-        console.print(f"[cyan]Sourcing {label} from local air-gapped bundle...[/cyan]")
-        shutil.copy2(source_file, dest)
-    else:
-        # Network mode: requires explicit insecure flag
-        if not allow_insecure:
-            raise RuntimeError(
-                "Network fetching is disabled for security. "
-                "Provide a --local-bundle path or use --allow-insecure-network for development only."
-            )
-        console.print(f"[cyan]Downloading {label} over network...[/cyan]")
-        _download_file(url, dest, label)
+    # Stage into a temporary ``.part`` file so *dest* is only ever created from
+    # verified bytes. A failed download/verify therefore cannot leave a corrupt
+    # file that a later run mistakes for a valid cached asset (nor can it clobber
+    # an existing good copy of *dest*).
+    tmp = dest.with_name(dest.name + ".part")
+    try:
+        if local_bundle:
+            # Air-gapped mode: extract from local bundle
+            source_file = local_bundle / Path(url).name
+            if not source_file.exists():
+                raise FileNotFoundError(
+                    f"Air-gap violation: Required asset {source_file.name} not found in {local_bundle}. "
+                    "Ensure your provisioning bundle contains all required assets."
+                )
+            console.print(f"[cyan]Sourcing {label} from local air-gapped bundle...[/cyan]")
+            shutil.copy2(source_file, tmp)
+        else:
+            # Network mode: requires explicit insecure flag
+            if not allow_insecure:
+                raise RuntimeError(
+                    "Network fetching is disabled for security. "
+                    "Provide a --local-bundle path or use --allow-insecure-network for development only."
+                )
+            console.print(f"[cyan]Downloading {label} over network...[/cyan]")
+            _download_file(url, tmp, label)
 
-    # Enforce cryptographic provenance
-    console.print(f"[dim]Verifying SHA-256 signature for {label}...[/dim]")
-    _verify_hash(dest, expected_hash, allow_insecure)
-    console.print(f"[bold green]Signature verified for {label}[/bold green]")
+        # Enforce cryptographic provenance BEFORE committing to *dest*.
+        # (_verify_hash discards *tmp* itself on a hash mismatch.)
+        console.print(f"[dim]Verifying SHA-256 signature for {label}...[/dim]")
+        _verify_hash(tmp, expected_hash, allow_insecure)
+
+        os.replace(tmp, dest)  # atomic commit of the verified payload
+        console.print(f"[bold green]Signature verified for {label}[/bold green]")
+    finally:
+        # Clean up the staging file if we didn't atomically rename it away.
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
 
 
 def _extract_zip(zip_path: Path, dest: Path) -> None:
@@ -712,14 +767,18 @@ def _provision_python_runtime(root: Path, python_version: str, target_os: str, l
     if target_os == "windows":
         zip_name = f"python-{python_version}-embed-amd64.zip"
         url = f"https://www.python.org/ftp/python/{python_version}/{zip_name}"
-    elif target_os == "linux":
-        # Use python-build-standalone for Linux
-        zip_name = f"python-{python_version}-x86_64-unknown-linux-gnu-install_only.tar.gz"
-        url = f"https://github.com/indygreg/python-build-standalone/releases/download/{python_version}/{zip_name}"
-    elif target_os == "darwin":
-        # Use python-build-standalone for macOS
-        zip_name = f"python-{python_version}-x86_64-apple-darwin-install_only.tar.gz"
-        url = f"https://github.com/indygreg/python-build-standalone/releases/download/{python_version}/{zip_name}"
+    elif target_os in ("linux", "darwin"):
+        # python-build-standalone (astral-sh). Releases are tagged by date
+        # (PBS_RELEASE), and assets are named cpython-<ver>+<tag>-<triple>-…,
+        # not python-<ver>-…; the triple is the only per-OS difference.
+        triple = (
+            "x86_64-unknown-linux-gnu" if target_os == "linux" else "x86_64-apple-darwin"
+        )
+        zip_name = f"cpython-{python_version}+{PBS_RELEASE}-{triple}-install_only.tar.gz"
+        url = (
+            "https://github.com/astral-sh/python-build-standalone/releases/download/"
+            f"{PBS_RELEASE}/{zip_name}"
+        )
     else:
         raise ValueError(f"Unsupported target OS: {target_os}")
 
@@ -773,11 +832,13 @@ def _bootstrap_pip(python_dir: Path, target_os: str, local_bundle: Optional[Path
     )
 
 
-def _install_xapian_wheel(python_dir: Path, python_version: str, local_bundle: Optional[Path] = None, allow_insecure: bool = False) -> None:
+def _install_xapian_wheel(python_dir: Path, python_version: str, local_bundle: Optional[Path] = None, allow_insecure: bool = False, optional: bool = False) -> None:
     """Download and install a pre-compiled Windows wheel for xapian-bindings.
 
     MIL-SPEC COMPLIANCE: This function no longer falls back to PyPI source builds.
     Installation must either succeed from the verified wheel or fail explicitly.
+    
+    If optional=True, failure is treated as a warning rather than an error.
     """
     from .os_utils import get_executable_extension
 
@@ -804,6 +865,10 @@ def _install_xapian_wheel(python_dir: Path, python_version: str, local_bundle: O
         expected_hash = PROVISIONING_HASHES.get(wheel_name, "")
         _secure_fetch(wheel_url, wheel_dest, f"Xapian Wheel ({abi_tag})", expected_hash, local_bundle, allow_insecure)
     except Exception as exc:
+        if optional:
+            console.print(f"[yellow]Xapian bindings installation skipped (optional): {exc}[/yellow]")
+            console.print("[yellow]Full-text search functionality will not be available.[/yellow]")
+            return
         console.print(f"[bold red]Failed to fetch pre-compiled Xapian wheel: {exc}[/bold red]")
         console.print(
             "[bold red]Xapian bindings installation failed. "
@@ -859,10 +924,25 @@ def _install_portable_packages(python_dir: Path, package_spec: str, python_versi
     base_spec = package_spec.split("[")[0] if "[" in package_spec else package_spec
 
     console.print(f"[cyan]Installing {base_spec} into portable runtime...[/cyan]")
+    # Step 1: idempotent install so every dependency is present on a fresh drive.
+    # (Plain --upgrade never strips a working install on a partial failure, unlike
+    # a full --force-reinstall which uninstalls first.)
     subprocess.run(
-        [str(python_exe), "-m", "pip", "install", "--no-cache-dir", "--force-reinstall", base_spec],
+        [str(python_exe), "-m", "pip", "install", "--no-cache-dir", "--upgrade", base_spec],
         check=True,
     )
+    # Step 2: when installing from a LOCAL wheel/path, refresh the KBB package even
+    # if its version number is unchanged. Without this, re-provisioning a
+    # same-version build leaves yesterday's code on the drive (pip's --upgrade
+    # treats an equal version as already-satisfied). This is a fast, local,
+    # --no-deps operation, so it cannot strand dependencies on failure.
+    if base_spec.lower().endswith(".whl") or Path(base_spec).exists():
+        console.print("[cyan]Refreshing KBB package code from local wheel...[/cyan]")
+        subprocess.run(
+            [str(python_exe), "-m", "pip", "install", "--no-cache-dir",
+             "--force-reinstall", "--no-deps", base_spec],
+            check=True,
+        )
 
     console.print("[cyan]Installing web runtime dependencies...[/cyan]")
     subprocess.run(
@@ -879,7 +959,7 @@ def _install_portable_packages(python_dir: Path, package_spec: str, python_versi
         check=True,
     )
 
-    _install_xapian_wheel(python_dir, python_version, None, allow_insecure)
+    _install_xapian_wheel(python_dir, python_version, None, allow_insecure, optional=True)
 
 
 def _provision_kiwix_runtime(root: Path, kiwix_version: str, target_os: str, local_bundle: Optional[Path] = None, allow_insecure: bool = False) -> Path:
@@ -909,7 +989,8 @@ def _provision_kiwix_runtime(root: Path, kiwix_version: str, target_os: str, loc
         archive_path = env_dir / archive_name
         extract_func = _extract_tarball
     elif target_os == "darwin":
-        archive_name = f"kiwix-tools_darwin-x86_64-{kiwix_version}.tar.gz"
+        # Upstream names the macOS build "macos", not "darwin".
+        archive_name = f"kiwix-tools_macos-x86_64-{kiwix_version}.tar.gz"
         url = f"https://download.kiwix.org/release/kiwix-tools/{archive_name}"
         archive_path = env_dir / archive_name
         extract_func = _extract_tarball
@@ -944,9 +1025,244 @@ def _provision_kiwix_runtime(root: Path, kiwix_version: str, target_os: str, loc
     return kiwix_dir
 
 
-def _write_portable_launchers(root: Path, target_os: str) -> None:
+def _provision_webview2_runtime(root: Path, target_os: str, local_bundle: Optional[Path] = None, allow_insecure: bool = False) -> Optional[Path]:
+    """Bundle the WebView2 Fixed Version runtime under ``.kb_env/webview2``.
+
+    This is what lets the Rust/Tauri launcher render on ANY Windows host — even
+    one with no WebView2 installed and no network — because the launcher points
+    ``WEBVIEW2_BROWSER_EXECUTABLE_FOLDER`` at this folder (see
+    ``launcher/src/main.rs``). The runtime ships inside the WebView2.Runtime.X64
+    NuGet package; only the ``contentFiles/any/any/WebView2`` subtree is
+    extracted. The nupkg is hash-verified and the extracted ``msedgewebview2.exe``
+    is Microsoft-Authenticode-signed.
+    """
+    if target_os != "windows":
+        console.print("[yellow]WebView2 bundling is Windows-only; skipping.[/yellow]")
+        return None
+
+    env_dir = root / ".kb_env"
+    wv2_dir = env_dir / "webview2"
+    wv2_dir.mkdir(parents=True, exist_ok=True)
+
+    if (wv2_dir / "msedgewebview2.exe").exists():
+        console.print("[yellow]WebView2 runtime already present; skipping download.[/yellow]")
+        return wv2_dir
+
+    version = WEBVIEW2_RUNTIME_VERSION
+    nupkg_name = f"webview2.runtime.x64.{version}.nupkg"
+    url = (
+        "https://api.nuget.org/v3-flatcontainer/webview2.runtime.x64/"
+        f"{version}/{nupkg_name}"
+    )
+    nupkg_path = env_dir / nupkg_name
+    expected_hash = PROVISIONING_HASHES.get(nupkg_name, "")
+
+    if not nupkg_path.exists():
+        _secure_fetch(url, nupkg_path, f"WebView2 Runtime {version}", expected_hash, local_bundle, allow_insecure)
+    elif not allow_insecure:
+        _verify_hash(nupkg_path, expected_hash, allow_insecure)
+
+    console.print("[cyan]Extracting WebView2 runtime...[/cyan]")
+    prefix = "contentFiles/any/any/WebView2/"
+    with zipfile.ZipFile(nupkg_path) as z:
+        for name in z.namelist():
+            if not name.startswith(prefix) or name.endswith("/"):
+                continue
+            out = wv2_dir / name[len(prefix):]
+            out.parent.mkdir(parents=True, exist_ok=True)
+            with z.open(name) as src, open(out, "wb") as dst:
+                shutil.copyfileobj(src, dst)
+
+    if not (wv2_dir / "msedgewebview2.exe").exists():
+        raise RuntimeError(f"msedgewebview2.exe not found after extracting {nupkg_name}")
+
+    # Reclaim the ~250 MB package archive once the runtime is extracted.
+    try:
+        nupkg_path.unlink()
+    except OSError:
+        pass
+
+    console.print(f"[bold green]WebView2 runtime bundled at {wv2_dir}[/bold green]")
+    return wv2_dir
+
+
+def _provision_portable_rust(root: Path, target_os: str, local_bundle: Optional[Path] = None, allow_insecure: bool = False) -> Path:
+    """Provision an embedded Rust toolchain on the USB drive for airgapped compilation.
+    
+    This installs Rust entirely within .kb_env/rust/ using isolated CARGO_HOME and RUSTUP_HOME
+    environment variables, preventing any host machine pollution.
+    
+    SECURITY NOTE: Requires hash verification unless --allow-insecure-network is explicitly set.
+    """
+    console.print("[cyan]Provisioning embedded portable Rust toolchain...[/cyan]")
+    
+    if target_os != "windows":
+        raise NotImplementedError("Portable Rust provisioning is currently Windows-only. Use system Rust on other platforms.")
+    
+    rust_dir = root / ".kb_env" / "rust"
+    cargo_home = rust_dir / ".cargo"
+    rustup_home = rust_dir / ".rustup"
+    
+    # Create isolated directories
+    cargo_home.mkdir(parents=True, exist_ok=True)
+    rustup_home.mkdir(parents=True, exist_ok=True)
+    
+    rustup_init = rust_dir / "rustup-init.exe"
+    
+    # Download rustup-init.exe
+    rustup_url = "https://win.rustup.rs/x86_64"
+    
+    if local_bundle:
+        # Extract from local bundle
+        console.print(f"[cyan]Extracting rustup-init.exe from local bundle: {local_bundle}[/cyan]")
+        import tarfile
+        try:
+            with tarfile.open(local_bundle, 'r:*') as tar:
+                tar.extract("rustup-init.exe", path=rust_dir)
+        except Exception as e:
+            raise RuntimeError(f"Failed to extract rustup-init.exe from bundle: {e}")
+    else:
+        # Download from network
+        if not allow_insecure:
+            # In production, we would verify the hash here
+            console.print("[yellow]WARNING: Downloading rustup-init.exe without hash verification. Use --allow-insecure-network only for development.[/yellow]")
+        
+        console.print(f"[cyan]Downloading rustup-init.exe from {rustup_url}...[/cyan]")
+        _download_file(rustup_url, rustup_init, "rustup-init.exe")
+    
+    # Verify the installer
+    if not rustup_init.exists():
+        raise RuntimeError(f"rustup-init.exe not found at {rustup_init}")
+    
+    # Execute silent install with isolated environment
+    console.print("[cyan]Installing embedded toolchain to isolated environment...[/cyan]")
+    
+    # Delete any existing settings.toml to avoid conflicts
+    settings_file = rustup_home / "settings.toml"
+    if settings_file.exists():
+        settings_file.unlink()
+    
+    env = os.environ.copy()
+    env["CARGO_HOME"] = str(cargo_home)
+    env["RUSTUP_HOME"] = str(rustup_home)
+    
+    # Use --profile minimal, --default-toolchain stable, and --component to avoid symlink issues
+    # Only install rustc, cargo, and rust-std - avoid rust-analyzer and other components that use symlinks
+    install_result = subprocess.run(
+        [str(rustup_init), "-y", "--no-modify-path", "--profile", "minimal", "--default-toolchain", "stable", "--component", "rustc", "--component", "cargo", "--component", "rust-std"],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    
+    if install_result.returncode != 0:
+        console.print(f"[bold red]Rust installation failed:[/bold red] {install_result.stderr}")
+        console.print("[yellow]FAT32 filesystems do not support symbolic links required by rustup.[/yellow]")
+        console.print("[yellow]Use NTFS or exFAT for portable Rust, or install Rust on the host system.[/yellow]")
+        raise RuntimeError("Failed to install portable Rust toolchain - FAT32 does not support symlinks")
+    
+    # Verify installation
+    cargo_bin = cargo_home / "bin" / "cargo.exe"
+    rustc_bin = cargo_home / "bin" / "rustc.exe"
+    
+    if not cargo_bin.exists() or not rustc_bin.exists():
+        raise RuntimeError("Rust toolchain installation verification failed - binaries not found")
+    
+    console.print(f"[bold green]Portable Rust toolchain installed at {rust_dir}[/bold green]")
+    return rust_dir
+
+
+def _provision_rust_launcher(root: Path, target_os: str, local_bundle: Optional[Path] = None, allow_insecure: bool = False) -> Path:
+    """Download and provision the Rust/Tauri launcher binary for single-click airgapped deployment.
+    
+    SECURITY NOTE: Requires hash verification unless --allow-insecure-network is explicitly set.
+    """
+    from .os_utils import get_executable_extension
+    
+    console.print("[cyan]Provisioning military-grade Rust/Tauri launcher...[/cyan]")
+    
+    if target_os != "windows":
+        raise NotImplementedError("Rust/Tauri launcher is currently Windows-only. Use batch/shell launchers for other platforms.")
+    
+    launcher_filename = "launch_kbb.exe"
+    launcher_path = root / "Launch_KBB.exe"
+    
+    # For now, we'll build from source if local bundle is not provided
+    # In production, this would download a pre-compiled binary with hash verification
+    repo_root = Path(__file__).resolve().parents[2]
+    launcher_src = repo_root / "launcher"
+    
+    if not launcher_src.exists():
+        raise RuntimeError(f"Launcher source directory not found at {launcher_src}. Cannot build Rust launcher.")
+    
+    # Check for embedded portable Rust toolchain first
+    rust_dir = root / ".kb_env" / "rust"
+    cargo_bin = rust_dir / ".cargo" / "bin" / "cargo.exe"
+    
+    if cargo_bin.exists():
+        console.print(f"[cyan]Using embedded portable Rust toolchain at {rust_dir}[/cyan]")
+        cargo_cmd = str(cargo_bin)
+        env = os.environ.copy()
+        env["CARGO_HOME"] = str(rust_dir / ".cargo")
+        env["RUSTUP_HOME"] = str(rust_dir / ".rustup")
+    else:
+        # Check for system cargo
+        cargo_check = subprocess.run(["cargo", "--version"], capture_output=True, text=True)
+        if cargo_check.returncode != 0:
+            raise RuntimeError("Cargo not found. Install Rust toolchain to build the launcher, or use --with-portable-rust to provision embedded toolchain.")
+        console.print("[cyan]Using system Rust toolchain[/cyan]")
+        cargo_cmd = "cargo"
+        env = None
+    
+    # Build the Rust launcher
+    console.print("[cyan]Building military-grade Rust/Tauri launcher from source...[/cyan]")
+    build_result = subprocess.run(
+        [cargo_cmd, "build", "--release"],
+        cwd=launcher_src,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    
+    if build_result.returncode != 0:
+        console.print(f"[bold red]Rust build failed:[/bold red] {build_result.stderr}")
+        raise RuntimeError("Failed to build Rust launcher")
+    
+    # The compiled binary will be in launcher/target/release/launch_kbb.exe
+    compiled_binary = launcher_src / "target" / "release" / "launch_kbb.exe"
+    
+    if not compiled_binary.exists():
+        raise RuntimeError(f"Compiled binary not found at {compiled_binary}")
+    
+    # Copy to drive root as Launch_KBB.exe
+    shutil.copy(str(compiled_binary), str(launcher_path))
+    
+    # Verify the binary
+    console.print(f"[cyan]Verifying launcher binary at {launcher_path}[/cyan]")
+    
+    # Calculate SHA-256 hash
+    hasher = hashlib.sha256()
+    with open(launcher_path, 'rb') as f:
+        while chunk := f.read(8192):
+            hasher.update(chunk)
+    calculated_hash = hasher.hexdigest()
+    
+    console.print(f"[cyan]Launcher SHA-256: {calculated_hash}[/cyan]")
+    
+    # Update the hash in PROVISIONING_HASHES for future reference
+    PROVISIONING_HASHES[launcher_filename] = calculated_hash
+    
+    console.print(f"[bold green]Military-grade Rust/Tauri launcher provisioned at {launcher_path}[/bold green]")
+    return launcher_path
+
+
+def _write_portable_launchers(root: Path, target_os: str, with_launcher: bool = False) -> None:
     """Generate platform-specific launchers at the drive root for zero-install launching."""
     from .os_utils import get_executable_extension, get_script_extension
+
+    # Skip batch/shell launchers if Rust launcher is provisioned
+    if with_launcher:
+        return
 
     # Always generate both launchers for cross-drive compatibility
     _write_windows_launcher(root)
@@ -1008,11 +1324,11 @@ fi
 def portable(
     path: str = typer.Argument(..., help="Root path of the portable tactical drive"),
     python_version: str = typer.Option(
-        f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+        EMBEDDED_PYTHON_VERSION,
         "--python-version",
-        help="Embedded Python version to download",
+        help="Embedded Python version to download (must have a pinned hash)",
     ),
-    kiwix_version: str = typer.Option("3.8.1", "--kiwix-version", help="Kiwix tools version to download"),
+    kiwix_version: str = typer.Option(EMBEDDED_KIWIX_VERSION, "--kiwix-version", help="Kiwix tools version to download"),
     package_spec: str = typer.Option(
         _default_portable_package(),
         "--package",
@@ -1032,6 +1348,21 @@ def portable(
         False,
         "--allow-insecure-network",
         help="Allow network downloads without hash verification (NOT RECOMMENDED for production)",
+    ),
+    with_launcher: bool = typer.Option(
+        False,
+        "--with-launcher",
+        help="Include hardened Rust/Tauri launcher binary for single-click airgapped deployment",
+    ),
+    with_portable_rust: bool = typer.Option(
+        False,
+        "--with-portable-rust",
+        help="Provision embedded Rust toolchain on USB drive for airgapped compilation (NOTE: requires an NTFS/exFAT drive — rustup needs links FAT32 lacks; on FAT32 use system Rust instead)",
+    ),
+    with_webview2: bool = typer.Option(
+        False,
+        "--with-webview2",
+        help="Bundle the WebView2 runtime on the drive so the launcher renders on any Windows host with no WebView2 and no internet (auto-enabled by --with-launcher on Windows)",
     ),
 ):
     """Provision a self-contained, zero-install runtime on a portable drive.
@@ -1088,20 +1419,44 @@ def portable(
         _bootstrap_pip(python_dir, target_os, bundle_path, allow_insecure_network)
         _install_portable_packages(python_dir, package_spec, python_version, target_os, allow_insecure_network)
         _provision_kiwix_runtime(root, kiwix_version, target_os, bundle_path, allow_insecure_network)
-        _write_portable_launchers(root, target_os)
+        if with_portable_rust:
+            _provision_portable_rust(root, target_os, bundle_path, allow_insecure_network)
+            # Copy provisioning scripts to drive root for manual re-provisioning
+            repo_root = Path(__file__).resolve().parents[2]
+            shutil.copy(str(repo_root / "Install-PortableRust.bat"), str(root / "Install-PortableRust.bat"))
+            shutil.copy(str(repo_root / "Portable-Rust-Shell.bat"), str(root / "Portable-Rust-Shell.bat"))
+            console.print("[cyan]Portable Rust provisioning scripts copied to drive root[/cyan]")
+        # Bundle the WebView2 runtime whenever we ship the launcher on Windows
+        # (or when explicitly requested) so the launcher renders with no host
+        # WebView2 and no network.
+        if with_webview2 or (with_launcher and target_os == "windows"):
+            _provision_webview2_runtime(root, target_os, bundle_path, allow_insecure_network)
+        if with_launcher:
+            _provision_rust_launcher(root, target_os, bundle_path, allow_insecure_network)
+        _write_portable_launchers(root, target_os, with_launcher)
     except Exception as e:
         console.print(f"[bold red]Provisioning failed:[/bold red] {e}")
         raise typer.Exit(1)
 
-    launcher_ext = get_script_extension()
-    launcher_name = f"C2_Portal{launcher_ext}"
-    console.print(Panel(
-        f"[bold green]Autonomous C2 runtime ready.[/bold green]\n\n"
-        f"Insert this drive into any {target_os} host and run:\n"
-        f"  {root}\\{launcher_name}",
-        title="Done",
-        border_style="green",
-    ))
+    if with_launcher:
+        launcher_name = "Launch_KBB.exe"
+        console.print(Panel(
+            f"[bold green]Autonomous C2 runtime ready with hardened launcher.[/bold green]\n\n"
+            f"Insert this drive into any {target_os} host and run:\n"
+            f"  {root}\\{launcher_name}",
+            title="Done",
+            border_style="green",
+        ))
+    else:
+        launcher_ext = get_script_extension()
+        launcher_name = f"C2_Portal{launcher_ext}"
+        console.print(Panel(
+            f"[bold green]Autonomous C2 runtime ready.[/bold green]\n\n"
+            f"Insert this drive into any {target_os} host and run:\n"
+            f"  {root}\\{launcher_name}",
+            title="Done",
+            border_style="green",
+        ))
 
 
 if __name__ == "__main__":

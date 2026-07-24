@@ -1,0 +1,17 @@
+[package]
+name = "launch_kbb"
+version = "0.5.0"
+description = "Military-grade airgapped USB bootstrapper for KBB"
+authors = ["KBB Tactical Procurement"]
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "1.5" }
+
+# No "api-all": the launcher only opens a window at the local portal URL and
+# invokes no JS-side Tauri APIs, so the default features suffice. This also
+# keeps the JS bridge closed (smaller attack surface) and matches the
+# allowlist ({ all: false }) in tauri.conf.json.
+[dependencies]
+tauri = { version = "1.5" }
+reqwest = { version = "0.11", features = ["blocking"] }

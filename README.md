@@ -21,6 +21,10 @@ A hyper-ergonomic CLI tool for downloading and managing Internet Archive and Wik
 - **Wikipedia Integration**: OpenZIM binary support and Wikimedia Enterprise API streaming
 - **Size Estimation**: Preview download sizes before starting transfers
 - **Military-Grade Resilience**: Active checksum recovery, deterministic rate limiting, and graceful mission abort protection
+- **C2 Knowledge Portal**: FastAPI dashboard that embeds the native `kiwix-serve` reader, serves Archive.org files, searches both backends, and reads PDF/EPUB/text inline — with a dual-optic (mosaic / stealth-night-green) theme
+- **Hierarchical Offline Search**: full-content SQLite FTS5 index over the secured library, ranking name/metadata matches above body-text matches (no cloud, no AI vectors)
+- **Airgapped Portable Launcher (Windows)**: single-click `Launch_KBB.exe` with an embedded Python runtime and a **bundled WebView2** runtime, so the portal renders on any Windows host with no WebView2 and no internet
+- **Hash-Verified Provisioning**: every downloaded runtime asset (Python, kiwix-tools, get-pip, WebView2) is checked against a pinned SHA-256 before use
 
 ## Installation
 
@@ -98,6 +102,7 @@ kb-builder pull ia "grateful dead" /path/to/usb/drive --sort "downloads desc"
 
 # Limit number of items
 kb-builder pull ia "collection:prelinger" /path/to/usb/drive --limit 50
+```
 
 ### 5. Download Wikipedia Content
 
@@ -159,7 +164,7 @@ The orchestrator:
 
 **Note:** The pull command uses military-grade retry logic with exponential backoff by default, ensuring reliable downloads even under adverse network conditions. It also features graceful mission abort protection - press `Ctrl+C` at any time to cleanly stop the operation while preserving all downloaded items in the state file.
 
-### 5. Serve Downloaded ZIMs
+### 7. Serve Downloaded ZIMs
 
 Launch the native `kiwix-serve` ZIM browser (install kiwix-serve first; no pure-Python fallback is provided because only the C++ server supports the ZIM's ServiceWorker and search APIs):
 
@@ -167,7 +172,7 @@ Launch the native `kiwix-serve` ZIM browser (install kiwix-serve first; no pure-
 kb-builder serve D:\
 ```
 
-### 6. Launch the C2 Knowledge Portal
+### 8. Launch the C2 Knowledge Portal
 
 Start the FastAPI dashboard to view bucket telemetry, search both backends, trigger downloads, browse Archive.org files, and read Wikipedia ZIMs from a single interface:
 
@@ -180,7 +185,82 @@ kb-builder portal D:\
 
 Then open `http://127.0.0.1:8080` in your browser. The dashboard embeds the native `kiwix-serve` ZIM reader directly; Archive.org files are served statically from `/files/`.
 
-### 7. Check Bucket Status
+### 9. Airgapped Launcher Deployment (Windows)
+
+For zero-install, single-click deployment on a portable USB drive, provision the
+hardened Rust/Tauri launcher. It renders the portal in a **bundled** WebView2
+runtime, so it works on any Windows host — even one with no WebView2 installed and
+no internet.
+
+```bash
+# Provision a portable runtime + hardened launcher (downloads verified by SHA-256)
+kb-builder portable D:\ --with-launcher --allow-insecure-network
+
+# Or fully air-gapped, sourcing every asset from a pre-staged bundle directory
+kb-builder portable D:\ --with-launcher --local-bundle .\bundle
+```
+
+`--with-launcher` builds `Launch_KBB.exe` from `launcher/` using the **host's** Rust
+toolchain, copies only the finished binary to the drive root, and bundles the
+WebView2 runtime automatically (equivalent to also passing `--with-webview2`).
+
+The result is a self-contained drive:
+
+```
+D:\
+├── Launch_KBB.exe          # Rust/Tauri bootstrapper (~5.6 MB)
+└── .kb_env\
+    ├── python\             # Embedded Python + the installed KBB package
+    ├── kiwix\              # Static kiwix-serve binary
+    └── webview2\           # Bundled WebView2 Fixed-Version runtime (offline render)
+```
+
+**Usage on the target host:**
+1. Insert the drive into any Windows 10/11 host.
+2. Double-click `Launch_KBB.exe`.
+3. The launcher picks a free loopback port, starts the embedded portal backend,
+   waits for its `/api/stats` healthcheck, and opens a WebView2 window at
+   `http://127.0.0.1:<port>`.
+4. Closing the window terminates the backend.
+
+**Security posture:**
+- **Loopback-only**: backend bound to `127.0.0.1`; CSP and CORS restrict to loopback.
+- **No JS bridge**: the launcher enables no Tauri JS APIs (`allowlist.all = false`).
+- **Verified provisioning**: every downloaded asset is checked against a pinned
+  SHA-256 (`PROVISIONING_HASHES` in `cli.py`). `--allow-insecure-network` is required
+  to fetch over the network; `--local-bundle <dir>` installs fully air-gapped.
+- **FAT32-compatible**: large ZIMs are split into `.zimaa`/`.zimab` slices; state
+  writes are atomic.
+
+> **WebView2 is Windows-only.** macOS uses the always-present system WKWebView; Linux
+> uses the host's WebKitGTK. The stick's embedded Python/kiwix backends are currently
+> Windows binaries — cross-OS support is in progress.
+
+#### Building the launcher (Rust)
+
+`Launch_KBB.exe` is an ordinary Rust binary. `kb-builder portable ... --with-launcher`
+builds it for you with the host's Rust, or build it directly:
+
+```bash
+cd launcher
+cargo build --release   # produces launcher/target/release/launch_kbb.exe
+```
+
+The *target* host needs no Rust, no internet, and no WebView2 — only the built
+`Launch_KBB.exe` and `.kb_env/` are shipped.
+
+> **FAT32 note:** `--with-portable-rust` (installing a Rust toolchain *onto the drive*
+> under `.kb_env/rust/`, driven by `Install-PortableRust.bat` /
+> `Portable-Rust-Shell.bat`) requires an **NTFS or exFAT** drive — rustup needs the
+> hard/symlinks that FAT32 lacks. On a FAT32 drive, use the host's Rust (the default
+> `--with-launcher` behaviour) instead.
+
+> **Windows build tip:** if `cargo build` fails intermittently with `os error 32`
+> ("file used by another process"), Windows Defender is scanning cargo's output.
+> Exclude the build processes in an elevated shell:
+> `Add-MpPreference -ExclusionProcess "rustc.exe","cargo.exe"`.
+
+### 10. Check Bucket Status
 
 ```bash
 kb-builder stats /path/to/usb/drive
@@ -197,6 +277,7 @@ kb-builder stats /path/to/usb/drive
 | `pull-kiwix` | Download a single Kiwix ZIM by direct URL |
 | `serve` | Browse downloaded ZIMs in a local web server |
 | `portal` | Launch the FastAPI C2 Knowledge Portal dashboard |
+| `portable` | Provision a self-contained runtime on a portable drive (use `--with-launcher` for hardened bootstrapper) |
 | `stats` | Show bucket statistics and sync status |
 | `configure` | Configure backend credentials |
 
