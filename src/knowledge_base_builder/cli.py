@@ -13,7 +13,6 @@ import zipfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import requests
 import typer
 from rich.console import Console
 from rich.table import Table
@@ -24,7 +23,6 @@ from rich.console import Group
 
 from . import __version__ as _kbb_version
 from .buckets import UsbBucket, ZimBucket
-from .engines import ArchiveEngine, WikipediaEngine
 from .presentation import serve_bucket
 
 # Progress description template constant
@@ -122,7 +120,16 @@ def _wait_and_open_browser(host: str, port: int, url: str) -> None:
 
 
 def get_engine(source: str, verbose: bool = False, **kwargs):
-    """Factory that returns the correct engine for the source backend."""
+    """Factory that returns the correct engine for the source backend.
+
+    The engines are imported here rather than at module scope: `internetarchive`
+    (and the `requests` tree it pulls) costs ~2.4s to load, and `kb-builder
+    portal` boots through this module without needing either. Deferring the
+    import cut CLI import cost from 2.63s to a fraction of that, which matters
+    far more on USB media. Guarded by tests/test_import_performance.py.
+    """
+    from .engines import ArchiveEngine, WikipediaEngine
+
     source = source.lower()
     if source == "ia":
         return ArchiveEngine(verbose=verbose)
@@ -497,6 +504,8 @@ def pull_kiwix(
     try:
         bucket = ZimBucket(target)
         bucket.initialize()
+        from .engines import WikipediaEngine
+
         engine = WikipediaEngine(verbose=verbose)
         stats = engine.pull_zim_url(url, target)
         console.print(
@@ -618,6 +627,10 @@ def _verify_hash(file_path: Path, expected_hash: str, allow_insecure: bool = Fal
 
 def _download_file(url: str, dest: Path, label: str, expected_hash: str = "", chunk_size: int = 1024 * 1024) -> None:
     """Download *url* to *dest* with a Rich progress bar and verify hash if provided."""
+    # Imported here, not at module scope: `requests` costs ~2.1s to load and
+    # only provisioning downloads need it (see tests/test_import_performance.py).
+    import requests
+
     with requests.get(url, stream=True, timeout=60) as r:
         r.raise_for_status()
         total = int(r.headers.get("content-length", 0))
@@ -960,6 +973,16 @@ def _install_portable_packages(python_dir: Path, package_spec: str, python_versi
     )
 
     _install_xapian_wheel(python_dir, python_version, None, allow_insecure, optional=True)
+
+    # Pre-warm bytecode on the drive. Without this the FIRST launch after any
+    # (re)provision has to compile ~2000 modules straight off USB: measured ~35s
+    # cold versus ~3.9s once cached. Shipping the drive pre-compiled removes that
+    # penalty entirely, which matters most on slow/removable media.
+    console.print("[cyan]Precompiling bytecode for fast first launch...[/cyan]")
+    subprocess.run(
+        [str(python_exe), "-m", "compileall", "-q", str(python_dir / "Lib" / "site-packages")],
+        check=False,  # a single unreadable module must never fail provisioning
+    )
 
 
 def _provision_kiwix_runtime(root: Path, kiwix_version: str, target_os: str, local_bundle: Optional[Path] = None, allow_insecure: bool = False) -> Path:

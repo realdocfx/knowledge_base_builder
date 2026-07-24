@@ -42,7 +42,6 @@ except ImportError:  # pragma: no cover - optional FTS dependency
 from .archive_index import ArchiveIndex
 from . import cloning
 from .buckets.usb import UsbBucket
-from .engines import ArchiveEngine, WikipediaEngine
 from .presentation import _physical_zim_path, discover_archives
 
 
@@ -72,6 +71,23 @@ NAV_SECTIONS = [
     {"id": "remote", "label": "Remote Acquisition"},
     {"id": "provision", "label": "Drive Provisioning"},
 ]
+
+
+def _make_engine(source: str):
+    """Instantiate a remote backend, importing it lazily.
+
+    Deliberately NOT a module-level import: `internetarchive` (plus the
+    `requests` tree it pulls) costs seconds to load and is only needed once a
+    remote query runs. Keeping it here means launching the portal never pays it.
+    See tests/test_import_performance.py.
+    """
+    from .engines import ArchiveEngine, WikipediaEngine
+
+    if source == "ia":
+        return ArchiveEngine()
+    if source == "wiki":
+        return WikipediaEngine()
+    raise ValueError(f"Unknown source '{source}'")
 
 
 def render_offline_swagger() -> str:
@@ -505,10 +521,7 @@ async def api_search(
     query: str = Query(...),
     limit: int = Query(50, ge=1, le=500),
 ) -> List[Dict[str, Any]]:
-    if source == "ia":
-        engine = ArchiveEngine()
-    else:
-        engine = WikipediaEngine()
+    engine = _make_engine(source)
     try:
         return list(engine.search(query, max_results=limit))
     except Exception as exc:
@@ -624,10 +637,7 @@ async def api_estimate(
     query: str = Query(...),
     limit: int = Query(50, ge=1, le=500),
 ) -> Dict[str, Any]:
-    if source == "ia":
-        engine = ArchiveEngine()
-    else:
-        engine = WikipediaEngine()
+    engine = _make_engine(source)
     try:
         return engine.estimate(query, max_results=limit)
     except Exception as exc:
@@ -651,14 +661,11 @@ async def api_download(
     def run_job() -> None:
         JOBS[job_id]["status"] = "running"
         try:
+            engine = _make_engine(source)
             if source == "ia":
-                engine = ArchiveEngine()
                 result = engine.pull(identifier, str(target_path), formats=formats)
-            elif source == "wiki":
-                engine = WikipediaEngine()
-                result = engine.pull(identifier, str(target_path))
             else:
-                raise ValueError(f"Unknown source '{source}'")
+                result = engine.pull(identifier, str(target_path))
             JOBS[job_id]["status"] = "completed"
             JOBS[job_id]["result"] = result
         except Exception as exc:
