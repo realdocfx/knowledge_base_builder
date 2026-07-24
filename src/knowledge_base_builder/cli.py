@@ -553,7 +553,25 @@ def portal(
 
     portal_app.state.bucket_root = str(Path(path).resolve())
     display_host = "127.0.0.1" if host in ("0.0.0.0", "::") else host
-    url = f"http://{display_host}:{port}"
+    # Hand the operator a pre-authorised URL: /api/* now requires the
+    # control-plane token, which the dashboard swaps for a session cookie.
+    from .web import get_auth_token
+
+
+    # The Rust launcher cannot mint a CSPRNG token (Rust std has no secure RNG),
+    # so it hands us a path and we publish ours there. Written via a .part file
+    # and atomically renamed, so the launcher never reads a half-written token.
+    _token_file = os.environ.get("KBB_TOKEN_FILE")
+    if _token_file:
+        try:
+            _tp = Path(_token_file)
+            _tmp = _tp.with_suffix(_tp.suffix + ".part")
+            _tmp.write_text(get_auth_token(), encoding="utf-8")
+            os.replace(_tmp, _tp)
+        except OSError:
+            pass  # launcher falls back to its own timeout messaging
+
+    url = f"http://{display_host}:{port}/?t={get_auth_token()}"
     console.print(f"[cyan]Starting C2 Knowledge Portal at {url} ...[/cyan]")
     if not no_browser:
         threading.Thread(

@@ -13,6 +13,7 @@ import json
 import logging
 import mimetypes
 import os
+import secrets
 import posixpath
 import re
 import shutil
@@ -58,6 +59,43 @@ app = FastAPI(
 
 # Swagger UI shipped with the package so the API console works with no network.
 SWAGGER_ASSETS = Path(__file__).resolve().parent / "assets"
+
+# --- Control-plane authentication -------------------------------------------
+# Loopback is not a trust boundary: any unprivileged local process, or a web page
+# the operator visits issuing a cross-site request to 127.0.0.1, could otherwise
+# drive /api/download and turn the portal into an arbitrary-fetch primitive
+# pointed at operator storage. Every /api/* call therefore requires an ephemeral
+# token minted per process. The launcher supplies one via KBB_AUTH_TOKEN so it
+# can hand the operator a pre-authorised URL.
+AUTH_COOKIE = "kbb_session"
+_AUTH_TOKEN: Optional[str] = None
+
+
+def get_auth_token() -> str:
+    """Return this process's control-plane token, minting one on first use."""
+    global _AUTH_TOKEN
+    if _AUTH_TOKEN is None:
+        _AUTH_TOKEN = os.environ.get("KBB_AUTH_TOKEN") or secrets.token_urlsafe(32)
+    return _AUTH_TOKEN
+
+
+def request_is_authorised(request) -> bool:
+    """True when *request* may proceed.
+
+    Only ``/api/*`` is gated. The console shell and its static assets carry no
+    authority and must stay reachable, otherwise the operator could never load
+    the page that exchanges ``?t=`` for a session cookie.
+    """
+    if not request.url.path.startswith("/api/"):
+        return True
+    token = get_auth_token()
+    header = request.headers.get("Authorization", "")
+    if header.startswith("Bearer ") and secrets.compare_digest(header[7:], token):
+        return True
+    cookie = request.cookies.get(AUTH_COOKIE, "")
+    return bool(cookie) and secrets.compare_digest(cookie, token)
+
+
 
 # Single source of truth for in-page navigation. The masthead deliberately does
 # NOT restate these: paraphrased duplicates of the same destinations ("Status"
@@ -119,6 +157,17 @@ app.add_middleware(
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def enforce_api_auth(request: Request, call_next):
+    """Reject unauthenticated control-plane calls before they reach a handler."""
+    if not request_is_authorised(request):
+        return JSONResponse(
+            {"detail": "unauthorised: missing or invalid control-plane token"},
+            status_code=401,
+        )
+    return await call_next(request)
 
 
 @app.middleware("http")
@@ -480,7 +529,7 @@ app.router.lifespan_context = lifespan
 
 
 @app.get("/", response_class=HTMLResponse)
-async def dashboard() -> str:
+async def dashboard(t: str = "") -> Any:
     """Render the console immediately, regardless of ZIM engine state.
 
     kiwix-serve boots in the background (it can take tens of seconds to open a
@@ -491,7 +540,19 @@ async def dashboard() -> str:
     kiwix_url = getattr(app.state, "kiwix_url", None) or ""
     kiwix_reader = getattr(app.state, "kiwix_reader_url", None) or "about:blank"
     html = DASHBOARD_HTML.replace("{{KIWIX_URL}}", kiwix_url)
-    return html.replace("{{WIKI_ENTRY_URL}}", kiwix_reader)
+    response = HTMLResponse(html.replace("{{WIKI_ENTRY_URL}}", kiwix_reader))
+    # Exchange a one-shot ?t= for an HttpOnly session cookie. Keeping the token
+    # out of page script means a hostile script on the host cannot read it back
+    # out of the DOM, while same-origin fetch() still carries it automatically.
+    if t and secrets.compare_digest(t, get_auth_token()):
+        response.set_cookie(
+            AUTH_COOKIE,
+            get_auth_token(),
+            httponly=True,
+            samesite="strict",
+            path="/",
+        )
+    return response
 
 
 @app.get("/api/stats")

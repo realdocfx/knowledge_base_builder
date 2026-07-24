@@ -137,6 +137,13 @@ fn main() {
     // Enforce airgapped environment variables
     cmd.env("PYTHONPATH", &kbb_app);
     cmd.env("KBB_AIRGAPPED", "1");
+    // /api/* now requires a control-plane token. Rust std has no CSPRNG, so the
+    // backend mints it with Python's `secrets` and publishes it here; we read it
+    // back and navigate pre-authorised. Stale files are removed first so we can
+    // never present a previous run's token.
+    let token_path = std::env::temp_dir().join(format!("kbb_token_{}.txt", port));
+    let _ = std::fs::remove_file(&token_path);
+    cmd.env("KBB_TOKEN_FILE", &token_path);
     
     // Prevent the Python console window from flashing on Windows hosts
     #[cfg(target_os = "windows")]
@@ -203,13 +210,21 @@ fn main() {
                 let started = std::time::Instant::now();
                 for attempt in 1..=MAX_PROBES {
                     let elapsed = started.elapsed().as_secs();
-                    let ready = probe_http_ok(port, "/api/stats");
+                    let ready = probe_http_ok(port, "/");
                     if ready {
                         let _ = win.eval(&format!(
                             "window.__kbbBoot(3,'Console ready',{},{},{});",
                             attempt, MAX_PROBES, elapsed
                         ));
-                        let _ = win.eval(&format!("window.location.replace({:?})", url));
+                        // Append the token so the console can exchange it for an
+                        // HttpOnly session cookie; without it every /api/* call 401s.
+                        let target = match std::fs::read_to_string(&token_path) {
+                            Ok(tok) if !tok.trim().is_empty() => {
+                                format!("{}/?t={}", url, tok.trim())
+                            }
+                            _ => url.clone(),
+                        };
+                        let _ = win.eval(&format!("window.location.replace({:?})", target));
                         return;
                     }
                     let _ = win.eval(&format!(
