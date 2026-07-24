@@ -82,7 +82,8 @@ kb-builder = "knowledge_base_builder.cli:app"
 where = ["src"]
 
 [tool.setuptools.package-data]
-knowledge_base_builder = ["docs/*.md"]
+# assets/* vendors swagger-ui so /docs renders with no CDN (airgapped drives).
+knowledge_base_builder = ["docs/*.md", "assets/*"]
 
 [tool.black]
 line-length = 88

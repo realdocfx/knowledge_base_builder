@@ -50,7 +50,45 @@ app = FastAPI(
     title="Knowledge-Base-Builder C2 Portal",
     description="Tactical dashboard for local knowledge-base logistics.",
     version="0.5.0",
+    # FastAPI's stock /docs loads swagger-ui from cdn.jsdelivr.net, which is
+    # unreachable on an airgapped drive (and blocked by our own CSP), so the page
+    # rendered blank. We serve a locally-vendored Swagger instead.
+    docs_url=None,
+    redoc_url=None,
 )
+
+# Swagger UI shipped with the package so the API console works with no network.
+SWAGGER_ASSETS = Path(__file__).resolve().parent / "assets"
+
+# Single source of truth for in-page navigation. The masthead deliberately does
+# NOT restate these: paraphrased duplicates of the same destinations ("Status"
+# vs "System Status") add cognitive load and invite mis-selection
+# (MIL-STD-1472H 5.17.1.3).
+NAV_SECTIONS = [
+    {"id": "overview", "label": "System Status"},
+    {"id": "wiki", "label": "Wiki Reader"},
+    {"id": "files", "label": "Local Files"},
+    {"id": "search", "label": "Local Search"},
+    {"id": "remote", "label": "Remote Acquisition"},
+    {"id": "provision", "label": "Drive Provisioning"},
+]
+
+
+def render_offline_swagger() -> str:
+    """Swagger UI bound to locally-served assets (no CDN — airgap safe)."""
+    return """<!doctype html>
+<html><head><meta charset="utf-8"><title>KBB // API Console</title>
+<link rel="stylesheet" href="/assets/swagger-ui.css">
+</head><body style="margin:0;background:#fff;">
+<div id="swagger-ui"></div>
+<script src="/assets/swagger-ui-bundle.js"></script>
+<script>
+window.onload = function () {
+  window.ui = SwaggerUIBundle({ url: '/openapi.json', dom_id: '#swagger-ui' });
+};
+</script>
+</body></html>
+"""
 
 # Enforce strict loopback-only CORS for airgapped security.
 # NB: Starlette matches allow_origins by EXACT string, so "http://127.0.0.1:*"
@@ -529,6 +567,23 @@ async def api_clone(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
 def api_clone_status() -> Dict[str, Any]:
     """Progress of the current/last clone (state, bytes, files, skipped)."""
     return cloning.get_status()
+
+
+@app.get("/assets/{name}")
+def api_asset(name: str) -> Any:
+    """Serve a vendored UI asset (swagger-ui) from the drive, never a CDN."""
+    safe = Path(name).name  # defeat traversal: keep the basename only
+    target = SWAGGER_ASSETS / safe
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail="asset not found")
+    media = "text/css" if safe.endswith(".css") else "application/javascript"
+    return FileResponse(target, media_type=media)
+
+
+@app.get("/docs", response_class=HTMLResponse)
+def api_docs() -> str:
+    """Offline API console: Swagger UI served from local assets."""
+    return render_offline_swagger()
 
 
 @app.get("/api/kiwix/status")
@@ -1174,11 +1229,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     KBB <span>// C2 KNOWLEDGE PORTAL</span>
   </a>
   <nav>
-    <a href="#overview">Status</a>
-    <a href="#wiki">Wiki</a>
-    <a href="#files">Files</a>
-    <a href="#remote">Acquire</a>
-    <a href="#settings">Settings</a>
     <button class="lang-btn" id="modeToggle" type="button" onclick="toggleStealthMode()" title="Toggle Stealth Night Green (Alt+N)">[MODE: STANDARD]</button>
   </nav>
 </header>
@@ -1190,12 +1240,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="card panel-inset">
       <div class="menu-h">Navigation</div>
       <ul>
-        <li><a href="#overview">System Status</a></li>
-        <li><a href="#wiki">Wiki Reader</a></li>
-        <li><a href="#files">Local Files</a></li>
-        <li><a href="#search">Local Search</a></li>
-        <li><a href="#remote">Remote Acquisition</a></li>
-        <li><a href="#provision">Drive Provisioning</a></li>
+{{NAV_ITEMS}}
       </ul>
       <div class="menu-h">Actions</div>
       <button class="btn small" type="button" onclick="loadStats()">Refresh Telemetry</button>
@@ -1683,6 +1728,16 @@ api('/api/clone/status').then(function (s) {
 </body>
 </html>
 """
+
+# Render the navigation model into the dashboard exactly once, so the sidebar can
+# never drift from NAV_SECTIONS and the masthead never re-states it.
+DASHBOARD_HTML = DASHBOARD_HTML.replace(
+    "{{NAV_ITEMS}}",
+    "\n".join(
+        '        <li><a href="#{}">{}</a></li>'.format(s["id"], s["label"])
+        for s in NAV_SECTIONS
+    ),
+)
 
 
 # ==========================================================================
