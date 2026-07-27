@@ -14,14 +14,29 @@ public API keeps working, so the optimisation cannot silently regress.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import textwrap
+from pathlib import Path
 
 import pytest
 
 # Expensive third-party trees that must not load just to start the portal.
 _HEAVY_MODULES = ("internetarchive", "requests")
+
+# The probes run in a FRESH interpreter, which does not inherit pytest's
+# `pythonpath = src`. Without this the tests silently depended on an editable
+# install and failed on a clean clone -- the same blind spot that let a NameError
+# reach production. Give every child the working tree explicitly.
+_SRC = str(Path(__file__).resolve().parents[1] / "src")
+
+
+def _child_env() -> dict:
+    env = dict(os.environ)
+    existing = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = _SRC + (os.pathsep + existing if existing else "")
+    return env
 
 
 def _modules_loaded_by(statement: str) -> set:
@@ -35,7 +50,7 @@ def _modules_loaded_by(statement: str) -> set:
         """
     ).format(statement=statement, heavy=_HEAVY_MODULES)
     proc = subprocess.run(
-        [sys.executable, "-c", code], capture_output=True, text=True, timeout=300
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=300, env=_child_env()
     )
     if proc.returncode != 0:
         pytest.fail(f"probe failed for {statement!r}:\n{proc.stderr[-2000:]}")
@@ -69,7 +84,7 @@ def test_public_api_still_resolves(name):
         """
     )
     proc = subprocess.run(
-        [sys.executable, "-c", code], capture_output=True, text=True, timeout=300
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=300, env=_child_env()
     )
     assert proc.returncode == 0 and "ok" in proc.stdout, (
         f"knowledge_base_builder.{name} no longer resolves:\n{proc.stderr[-1500:]}"
@@ -87,6 +102,6 @@ def test_engines_submodule_api_still_resolves():
         """
     )
     proc = subprocess.run(
-        [sys.executable, "-c", code], capture_output=True, text=True, timeout=300
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=300, env=_child_env()
     )
     assert proc.returncode == 0 and "ok" in proc.stdout, proc.stderr[-1500:]

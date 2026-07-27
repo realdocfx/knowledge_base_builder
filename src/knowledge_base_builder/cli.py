@@ -1,5 +1,10 @@
 import hashlib
 import os
+# `datetime` is used by `pull` to stamp last_sync. It was previously missing, so
+# every completed sync raised NameError, was swallowed by the outer handler, and
+# reported "Critical Sync Failure" with exit 1 -- the primary acquisition command
+# never returned success. Guarded by tests/test_cli_pull.py.
+from datetime import datetime
 import shutil
 import socket
 import stat

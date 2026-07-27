@@ -9,7 +9,7 @@ import shutil
 import subprocess
 import webbrowser
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 
 def _format_bytes(num_bytes: int) -> str:
