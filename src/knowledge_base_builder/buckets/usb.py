@@ -109,7 +109,17 @@ class UsbBucket(BaseBucket):
             raise RuntimeError(f"Critical failure during atomic state write: {e}")
 
     def mark_item_completed(self, identifier: str, size_bytes: int = 0) -> None:
-        """$O(1)$ in-memory update followed by mathematically perfect atomic disk write."""
+        """Record a completed item and checkpoint it durably.
+
+        Cost is O(S) in the serialised size of the state document, not O(1): the
+        file is read, parsed, mutated, re-serialised, fsync'd and atomically
+        renamed. Over an N-item sync the aggregate is therefore quadratic in bytes
+        written. That is acceptable at the scale this runs at (hundreds of items,
+        a few KB of state) and is deliberately traded for crash durability, but
+        the previous "O(1)" annotation described the inverse of the behaviour.
+        Converting to an append-only journal with periodic compaction is the
+        standard remedy if item counts grow.
+        """
         state = self.get_state()
 
         if identifier not in state.setdefault("completed_items", []):
@@ -137,8 +147,14 @@ class UsbBucket(BaseBucket):
         self.update_state(state)
 
     def is_item_completed(self, identifier: str) -> bool:
-        """$O(1)$ lookup against the parsed application state."""
-        return identifier in self.get_state().get("completed_items", [])
+        """Report whether *identifier* has already been completed.
+
+        Membership itself is O(1) via a set, but the enclosing call is O(S): the
+        state document is re-read and re-parsed so a concurrently-running CLI
+        download is observed rather than a stale in-process cache. The previous
+        "O(1) lookup" annotation ignored both the read and a linear list scan.
+        """
+        return identifier in set(self.get_state().get("completed_items", []))
 
     def get_stats(self) -> Dict[str, Any]:
         """Get bucket statistics."""

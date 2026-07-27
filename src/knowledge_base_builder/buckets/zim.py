@@ -29,6 +29,15 @@ class ZimBucket(BaseBucket):
     STATE_DIR = ".kb_state"
     CHUNK_SIZE = 8192
     FAT32_CHUNK_LIMIT = 3900 * 1024 * 1024
+    # How often resume state is checkpointed during a transfer. Each checkpoint is
+    # a read, parse, re-serialise, fsync and atomic rename, so cadence is a direct
+    # trade between resume granularity and write amplification on flash media.
+    # The single-file path previously used CHUNK_SIZE * 128 (1 MiB), i.e. 102,400
+    # fsync'd writes for a 100 GB archive, while the split path checkpointed only
+    # at slice rotation. Both now use this one value: losing at most 100 MiB of
+    # progress on an unclean eject is a good trade for two orders of magnitude
+    # less wear.
+    STATE_FLUSH_INTERVAL = 100 * 1024 * 1024
 
     def __init__(self, target_path: str):
         super().__init__(target_path)
@@ -98,7 +107,17 @@ class ZimBucket(BaseBucket):
         self._flush_state_to_disk()
 
     def _flush_state_to_disk(self) -> None:
-        """Performs a mathematically perfect atomic write to disk."""
+        """Write state via a temp file, fsync and atomic rename.
+
+        "Atomic" here is a property of the underlying filesystem, not of
+        os.replace: NTFS/ext4/APFS provide it, FAT32 has no journal and its
+        directory-entry update is not atomic, so a power loss mid-rename on a
+        FAT32 stick can still lose this write. The directory-fsync barrier below
+        is additionally unavailable on Windows (no O_DIRECTORY). What IS
+        guaranteed everywhere: the previous state file is never truncated in
+        place, so a failed write leaves the prior state intact rather than a
+        half-written document.
+        """
         if not hasattr(self, '_state_cache'):
             return
 
@@ -115,8 +134,12 @@ class ZimBucket(BaseBucket):
             if hasattr(os, 'O_DIRECTORY'):
                 try:
                     dir_fd = os.open(self.state_dir, os.O_RDONLY | os.O_DIRECTORY)
-                    os.fsync(dir_fd)
-                    os.close(dir_fd)
+                    try:
+                        os.fsync(dir_fd)
+                    finally:
+                        # Close even if fsync raises. usb.py already did this;
+                        # this copy leaked a descriptor on every failed flush.
+                        os.close(dir_fd)
                 except OSError:
                     pass
 
@@ -129,8 +152,9 @@ class ZimBucket(BaseBucket):
         """Record a completed ZIM download."""
         state = self.get_state()
 
-        if identifier not in state.setdefault("completed_items", []):
-            state["completed_items"].append(identifier)
+        completed = state.setdefault("completed_items", [])
+        if identifier not in set(completed):  # set: avoid a linear scan per item
+            completed.append(identifier)
 
         if identifier in state.get("failed_items", []):
             state["failed_items"].remove(identifier)
@@ -154,8 +178,13 @@ class ZimBucket(BaseBucket):
         self.update_state(state)
 
     def is_item_completed(self, identifier: str) -> bool:
-        """Check whether a ZIM file has already been completed."""
-        return identifier in self.get_state().get("completed_items", [])
+        """Report whether a ZIM has already been completed.
+
+        Membership is O(1) via a set; the enclosing call is O(S) because the state
+        document is re-read so a concurrent CLI download is observed rather than a
+        stale in-process cache.
+        """
+        return identifier in set(self.get_state().get("completed_items", []))
 
     def get_stats(self) -> Dict[str, Any]:
         """Get bucket statistics."""
@@ -328,13 +357,15 @@ class ZimBucket(BaseBucket):
         if headers:
             response_stream = self._reopen_stream(response_stream.url, headers)
 
+        last_state_flush = bytes_written
         with open(temp_file, 'ab' if bytes_written > 0 else 'wb') as f:
             for chunk in response_stream.iter_content(chunk_size=self.CHUNK_SIZE):
                 if chunk:
                     f.write(chunk)
                     bytes_written += len(chunk)
 
-                    if bytes_written % (self.CHUNK_SIZE * 128) == 0:
+                    if bytes_written - last_state_flush >= self.STATE_FLUSH_INTERVAL:
+                        last_state_flush = bytes_written
                         chunks[identifier] = bytes_written
                         state["chunks"] = chunks
                         self.update_state(state)
