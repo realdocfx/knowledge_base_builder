@@ -22,6 +22,18 @@ from knowledge_base_builder.os_utils import (
 )
 
 
+# Built at import time, OUTSIDE any sys.platform patch. Constructing a
+# pathlib.Path while sys.platform is patched to "linux" instantiates PosixPath,
+# which raises NotImplementedError on a Windows host under Python 3.11. Worse,
+# pytest's own failure reporter also builds a Path, so the exception recurred
+# during reporting and turned a would-be assertion failure into an INTERNALERROR
+# that aborted the entire session. Caught by the windows-latest/py3.11 CI leg --
+# the only combination that exhibits it.
+_WIN_PATH = Path("C:\\")
+_LINUX_PATH = Path("/mnt/usb")
+_DARWIN_PATH = Path("/Volumes/USB")
+
+
 @pytest.fixture
 def mock_linux_env():
     """Simulates a Linux environment on a Windows host."""
@@ -72,36 +84,36 @@ class TestFilesystemDetection:
 
     def test_get_fs_type_windows_ntfs(self, mock_windows_env):
         """Test NTFS detection on Windows."""
-        result = get_fs_type(Path("C:\\"))
+        result = get_fs_type(_WIN_PATH)
         assert result == "NTFS"
 
     def test_get_fs_type_linux_ext4(self, mock_linux_env):
         """Test ext4 detection on Linux."""
-        result = get_fs_type(Path("/mnt/usb"))
+        result = get_fs_type(_LINUX_PATH)
         assert result == "EXT4"
 
     def test_get_fs_type_macos_apfs(self, mock_darwin_env):
         """Test APFS detection on macOS."""
-        result = get_fs_type(Path("/Volumes/USB"))
+        result = get_fs_type(_DARWIN_PATH)
         assert result == "APFS"
 
     def test_get_fs_type_linux_fat32(self, mock_linux_env):
         """Test FAT32 detection on Linux."""
         with patch("subprocess.run") as mock_run:
             mock_run.return_value.stdout = "Filesystem     Type\n/dev/sdb1      vfat"
-            result = get_fs_type(Path("/mnt/usb"))
+            result = get_fs_type(_LINUX_PATH)
             assert result == "VFAT"  # df reports vfat for FAT32
 
     def test_get_fs_type_failure_windows(self, mock_windows_env):
         """Test graceful failure on Windows when ctypes fails."""
         with patch("ctypes.windll.kernel32.GetVolumeInformationA", side_effect=Exception):
-            result = get_fs_type(Path("C:\\"))
+            result = get_fs_type(_WIN_PATH)
             assert result == ""
 
     def test_get_fs_type_failure_posix(self, mock_linux_env):
         """Test graceful failure on POSIX when df fails."""
         with patch("subprocess.run", side_effect=Exception):
-            result = get_fs_type(Path("/mnt/usb"))
+            result = get_fs_type(_LINUX_PATH)
             assert result == ""
 
 

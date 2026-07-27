@@ -7,7 +7,6 @@ ServiceWorker environment that the ZIM's bundled Wikipedia JavaScript requires.
 
 import shutil
 import subprocess
-import webbrowser
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -109,7 +108,11 @@ def launch_kiwix_server(root: Path, port: int, archives: List[Tuple[str, Path]])
     """
     binary = _find_kiwix_binary(root)
 
-    cmd = [binary, "--port", str(port)]
+    # --address 127.0.0.1 is mandatory: without it kiwix-serve binds every
+    # interface and publishes the operator's whole ZIM library to the local
+    # network with no authentication. web.py's portal path already did this; this
+    # module -- the same job, used by `kb-builder serve` -- did not.
+    cmd = [binary, "--port", str(port), "--address", "127.0.0.1"]
     # kiwix-serve accepts the logical .zim path for split archives, but
     # passing the first physical slice (.zimaa) is robust across libzim versions.
     for _, logical in archives:
@@ -134,11 +137,15 @@ def serve_bucket(path: str, port: int, open_browser: bool = True) -> None:
     if not archives:
         raise RuntimeError(f"No finalized ZIM archives found in {root}")
 
-    url = f"http://localhost:{port}"
+    url = f"http://127.0.0.1:{port}"
     process = launch_kiwix_server(root, port, archives)
     print(f"Serving {len(archives)} archive(s) at {url} via kiwix-serve")
     if open_browser:
-        webbrowser.open(url)
+        # Use the shared abstraction rather than webbrowser directly, so the
+        # platform handling in os_utils applies here too.
+        from .os_utils import open_browser as _open_browser
+
+        _open_browser(url)
     try:
         process.wait()
     except KeyboardInterrupt:
