@@ -218,46 +218,50 @@ class ZimBucket(BaseBucket):
         ]
 
         try:
+            # libzim.Archive is NOT a context manager and has NO close() method:
+            # it is released by garbage collection. An earlier `finally:
+            # archive.close()` crashed every extraction with "'libzim.Archive'
+            # object has no attribute 'close'".
             archive = Archive(str(physical_path))
-            try:
-                entry = None
-                for path in index_paths:
-                    try:
-                        entry = archive.get_entry_by_path(path)
-                        break
-                    except KeyError:
-                        continue
 
-                if entry is None:
-                    logger.warning("No Xapian fulltext index found in %s", identifier)
-                    return False
+            # Modern Kiwix ZIMs (e.g. wikipedia_*_all_maxi 2023+) no longer embed
+            # a Xapian fulltext index; kiwix-serve provides search for them another
+            # way. That is an expected, non-fatal condition -- log it as info, not
+            # as a failure, and skip the KBB wiki full-text overlay for this book.
+            if not getattr(archive, "has_fulltext_index", False):
+                logger.info(
+                    "%s embeds no Xapian fulltext index; kiwix-serve search still "
+                    "applies, but the KBB wiki full-text overlay is unavailable for "
+                    "this archive",
+                    identifier,
+                )
+                return False
 
-                item = entry.get_item()
-                if not getattr(item, "size", 0):
-                    logger.warning("Empty Xapian fulltext index entry in %s", identifier)
-                    return False
+            entry = None
+            for path in index_paths:
+                if archive.has_entry_by_path(path):
+                    entry = archive.get_entry_by_path(path)
+                    break
+            if entry is None:
+                logger.info("No Xapian fulltext index entry located in %s", identifier)
+                return False
 
-                # Write the libzim memoryview directly to disk to avoid a
-                # second multi-GB contiguous allocation.
-                with open(fts_file, "wb") as f:
-                    f.write(item.content)
+            item = entry.get_item()
+            if not getattr(item, "size", 0):
+                logger.warning("Empty Xapian fulltext index entry in %s", identifier)
+                return False
 
-                new_namespace = False
-                try:
-                    new_namespace = bool(archive.has_new_namespace_scheme)
-                except Exception:
-                    pass
+            # Write the libzim memoryview directly to disk to avoid a second
+            # multi-GB contiguous allocation.
+            with open(fts_file, "wb") as f:
+                f.write(item.content)
 
-                metadata = {
-                    "book_name": identifier,
-                    "new_namespace": new_namespace,
-                }
-                meta_file.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+            new_namespace = bool(getattr(archive, "has_new_namespace_scheme", False))
+            metadata = {"book_name": identifier, "new_namespace": new_namespace}
+            meta_file.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
-                logger.info("Extracted FTS index for %s (%d bytes)", identifier, item.size)
-                return True
-            finally:
-                archive.close()
+            logger.info("Extracted FTS index for %s (%d bytes)", identifier, item.size)
+            return True
         except Exception as exc:
             logger.warning("Failed to extract FTS index for %s: %s", identifier, exc)
             return False

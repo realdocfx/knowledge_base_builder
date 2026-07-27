@@ -50,15 +50,20 @@ def test_extract_fulltext_index_writes_xapian_and_metadata(tmp_path):
     fake_entry = MagicMock()
     fake_entry.get_item.return_value = fake_item
 
-    archive_instance = MagicMock()
+    # spec= against the REAL libzim.reader.Archive: a bare MagicMock auto-creates
+    # any attribute, so a call to archive.close() -- which the real Archive does
+    # NOT have -- silently succeeded and hid a production crash
+    # ("'libzim.Archive' object has no attribute 'close'"). Specing makes the mock
+    # reject methods the real object lacks, so the test now fails if the code
+    # calls a non-existent method. Archive is instantiated directly (not a context
+    # manager), so the class mock returns the instance itself.
+    import libzim.reader
+
+    archive_instance = MagicMock(spec=libzim.reader.Archive)
+    archive_instance.has_fulltext_index = True
+    archive_instance.has_entry_by_path.side_effect = lambda p: p == "X/fulltext/xapian"
     archive_instance.get_entry_by_path.return_value = fake_entry
     archive_instance.has_new_namespace_scheme = True
-
-    # zim.py instantiates Archive directly (`archive = Archive(path)`) and closes
-    # it in a finally block -- it is NOT used as a context manager. Mocking
-    # __enter__/__exit__ therefore never applied, and auto-generated MagicMocks
-    # leaked through as `item.content`, failing with "a bytes-like object is
-    # required". The mock must return the instance itself.
     fake_archive_class = MagicMock(return_value=archive_instance)
 
     with patch("libzim.reader.Archive", fake_archive_class):
@@ -75,6 +80,33 @@ def test_extract_fulltext_index_writes_xapian_and_metadata(tmp_path):
     metadata = json.loads(meta_file.read_text(encoding="utf-8"))
     assert metadata["book_name"] == "test_wiki"
     assert metadata["new_namespace"] is True
+
+
+def test_extract_fulltext_index_absent_is_graceful(tmp_path):
+    """Modern ZIMs embed no Xapian index; extraction must return False, not crash.
+
+    wikipedia_fr_all_maxi_2026 reports has_fulltext_index == False. The routine
+    must treat that as an expected, non-fatal condition -- no exception, no
+    partial output -- because kiwix-serve still provides search for that archive.
+    """
+    import libzim.reader
+
+    bucket = ZimBucket(str(tmp_path))
+    bucket.initialize()
+    (tmp_path / "modern_wiki.zim").write_bytes(b"dummy zim header")
+
+    archive_instance = MagicMock(spec=libzim.reader.Archive)
+    archive_instance.has_fulltext_index = False
+
+    with patch("libzim.reader.Archive", MagicMock(return_value=archive_instance)):
+        result = bucket.extract_fulltext_index("modern_wiki")
+
+    assert result is False
+    # Nothing partial must be written when there is no index.
+    assert not (tmp_path / ".kb_state" / "wiki_fts" / "modern_wiki" / "xapian").exists()
+    # The real Archive has no get_entry_by_path call in this path and, crucially,
+    # no close(): reaching for either would raise on the spec'd mock.
+    archive_instance.get_entry_by_path.assert_not_called()
 
 
 def test_search_wiki_disabled_without_xapian():
