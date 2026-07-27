@@ -11,6 +11,7 @@ import pytest
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
+from knowledge_base_builder import os_utils
 from knowledge_base_builder.os_utils import (
     get_fs_type,
     open_browser,
@@ -80,41 +81,87 @@ def mock_windows_env():
 
 
 class TestFilesystemDetection:
-    """Test cross-platform filesystem detection."""
+    """Platform dispatch for filesystem detection.
+
+    The pure parsers and the full normalisation table live in
+    tests/test_fs_detection.py; these cover the dispatch and the I/O seams.
+
+    Note what is NOT done here: sys.platform is patched, but nearest_existing is
+    stubbed alongside it. Constructing or resolving a pathlib.Path while
+    sys.platform is a lie makes pathlib pick the wrong flavour and raise
+    (NotImplementedError on 3.11, UnsupportedOperation later) -- a trap that
+    already cost one CI failure. Patching the seam keeps the platform lie away
+    from pathlib entirely.
+    """
+
+    _PROC_MOUNTS = """\
+/dev/sda2 / ext4 rw,relatime 0 0
+/dev/sdb1 /media/operator/STICK vfat rw,nosuid 0 0
+"""
+    _MOUNT_OUTPUT = """\
+/dev/disk1s5s1 on / (apfs, sealed, local)
+/dev/disk4s1 on /Volumes/STICK (msdos, local, nodev)
+"""
 
     def test_get_fs_type_windows_ntfs(self, mock_windows_env):
-        """Test NTFS detection on Windows."""
-        result = get_fs_type(_WIN_PATH)
-        assert result == "NTFS"
+        """NTFS via the wide Win32 API."""
+        assert get_fs_type(_WIN_PATH) == "NTFS"
 
-    def test_get_fs_type_linux_ext4(self, mock_linux_env):
-        """Test ext4 detection on Linux."""
-        result = get_fs_type(_LINUX_PATH)
-        assert result == "EXT4"
+    def test_get_fs_type_linux_ext4(self):
+        """Linux resolves through /proc/mounts, not a df subprocess."""
+        with patch.object(os_utils.sys, "platform", "linux"), patch.object(
+            os_utils, "nearest_existing", side_effect=lambda p: p
+        ), patch.object(os_utils, "_read_proc_mounts", return_value=self._PROC_MOUNTS):
+            assert get_fs_type("/home/operator/library") == "EXT4"
 
-    def test_get_fs_type_macos_apfs(self, mock_darwin_env):
-        """Test APFS detection on macOS."""
-        result = get_fs_type(_DARWIN_PATH)
-        assert result == "APFS"
+    def test_get_fs_type_linux_fat32_is_normalised(self):
+        """Linux reports 'vfat'; the application must see FAT32.
 
-    def test_get_fs_type_linux_fat32(self, mock_linux_env):
-        """Test FAT32 detection on Linux."""
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value.stdout = "Filesystem     Type\n/dev/sdb1      vfat"
-            result = get_fs_type(_LINUX_PATH)
-            assert result == "VFAT"  # df reports vfat for FAT32
+        This assertion previously read `== "VFAT"`, encoding the very bug that
+        stopped >4 GB splitting from ever engaging on Linux.
+        """
+        with patch.object(os_utils.sys, "platform", "linux"), patch.object(
+            os_utils, "nearest_existing", side_effect=lambda p: p
+        ), patch.object(os_utils, "_read_proc_mounts", return_value=self._PROC_MOUNTS):
+            assert get_fs_type("/media/operator/STICK/wiki.zim") == "FAT32"
+
+    def test_get_fs_type_macos_apfs(self):
+        """macOS resolves through `mount`, because df -T means something else."""
+        with patch.object(os_utils.sys, "platform", "darwin"), patch.object(
+            os_utils, "nearest_existing", side_effect=lambda p: p
+        ), patch.object(os_utils, "_run_mount", return_value=self._MOUNT_OUTPUT):
+            assert get_fs_type("/Users/operator") == "APFS"
+
+    def test_get_fs_type_macos_fat32_is_normalised(self):
+        """macOS reports 'msdos' for FAT32."""
+        with patch.object(os_utils.sys, "platform", "darwin"), patch.object(
+            os_utils, "nearest_existing", side_effect=lambda p: p
+        ), patch.object(os_utils, "_run_mount", return_value=self._MOUNT_OUTPUT):
+            assert get_fs_type("/Volumes/STICK/wiki.zim") == "FAT32"
 
     def test_get_fs_type_failure_windows(self, mock_windows_env):
-        """Test graceful failure on Windows when ctypes fails."""
-        with patch("ctypes.windll.kernel32.GetVolumeInformationA", side_effect=Exception):
-            result = get_fs_type(_WIN_PATH)
-            assert result == ""
+        """A failing Win32 call degrades to '' rather than raising."""
+        with patch("ctypes.windll.kernel32.GetVolumeInformationW", side_effect=Exception):
+            assert get_fs_type(_WIN_PATH) == ""
 
-    def test_get_fs_type_failure_posix(self, mock_linux_env):
-        """Test graceful failure on POSIX when df fails."""
-        with patch("subprocess.run", side_effect=Exception):
-            result = get_fs_type(_LINUX_PATH)
-            assert result == ""
+    def test_get_fs_type_failure_posix(self):
+        """With neither /proc/mounts nor `mount`, detection degrades to ''."""
+        with patch.object(os_utils.sys, "platform", "linux"), patch.object(
+            os_utils, "nearest_existing", side_effect=lambda p: p
+        ), patch.object(os_utils, "_read_proc_mounts", return_value=""), patch.object(
+            os_utils, "_run_mount", return_value=""
+        ):
+            assert get_fs_type("/media/operator/STICK") == ""
+
+    def test_detection_never_raises(self):
+        """Detection is advisory: it must never be what aborts a download."""
+        with patch.object(os_utils, "_read_proc_mounts", side_effect=Exception), patch.object(
+            os_utils, "_run_mount", side_effect=Exception
+        ):
+            try:
+                get_fs_type("/nonexistent/path/for/probe")
+            except Exception as exc:  # pragma: no cover
+                pytest.fail(f"get_fs_type raised {exc!r}; it must degrade to ''")
 
 
 class TestBrowserLaunching:

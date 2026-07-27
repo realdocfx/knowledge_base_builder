@@ -586,8 +586,13 @@ class ZimBucket(BaseBucket):
         the per-file chunk limit."""
         from ..os_utils import get_fs_type
 
+        # get_fs_type normalises every platform's spelling to one canonical token
+        # (Linux "vfat" and macOS "msdos" both become "FAT32"), so an exact
+        # comparison is now correct AND safer than a substring test: "EXFAT" must
+        # never match, since exFAT has no 4 GiB per-file limit and slicing it
+        # would fragment the library for no reason.
         fs_type = get_fs_type(target_file)
-        if not fs_type or "FAT32" not in fs_type:
+        if fs_type != "FAT32":
             return False
 
         # Any payload larger than the chunk limit must be split; files right at
