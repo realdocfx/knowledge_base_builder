@@ -1219,7 +1219,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .section-header{margin:18px 0 0;padding:6px 10px;background:var(--panel);border:2px solid;border-color:var(--bevel-out);font-weight:bold;text-transform:uppercase;letter-spacing:.06em;color:var(--ink);font-size:.9rem;}
 
   /* ---- Side navigation ------------------------------------------------- */
-  .menu-h{font-weight:bold;font-size:.75rem;text-transform:uppercase;letter-spacing:.4px;color:var(--ink-soft);margin:12px 0 4px;border-bottom:1px solid var(--mid);padding-bottom:2px;}
+  kbd{font-family:var(--font-mono,monospace);background:var(--field);border:1px solid;border-color:var(--bevel-in);border-radius:2px;padding:0 4px;font-size:.9em;}
+    .menu-h{font-weight:bold;font-size:.75rem;text-transform:uppercase;letter-spacing:.4px;color:var(--ink-soft);margin:12px 0 4px;border-bottom:1px solid var(--mid);padding-bottom:2px;}
   .menu-h:first-child{margin-top:0;}
   .sidemenu ul{list-style:none;margin:0 0 6px;padding:0;}
   .sidemenu li{margin:2px 0;}
@@ -1331,7 +1332,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         </label>
       </div>
       <div class="mono muted" style="margin-top:6px;font-size:.72rem;">Optics: <span id="statusModeLabel">Standard Mosaic</span></div>
-      <div class="mono muted" style="margin-top:4px;font-size:.7rem;">Alt+N toggles stealth.</div>
+      <div class="menu-h">Hotkeys</div>
+      <div class="mono muted" style="font-size:.7rem;line-height:1.7;">
+        <kbd>/</kbd> focus search &middot; <kbd>Esc</kbd> close viewer<br>
+        <kbd>1</kbd>&ndash;<kbd>6</kbd> jump to view &middot; <kbd>Alt</kbd>+<kbd>N</kbd> stealth
+      </div>
     </div>
   </aside>
 
@@ -1435,6 +1440,35 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <script>
 /* Every call is bounded: a hung request must never leave a panel silently
    stuck on "Initializing…" (MIL-STD-1472H 5.17 — no ambiguous dead states). */
+/* ---- Keyboard-only operation (MIL-STD-1472H 5.17) ---------------------- */
+var NAV_IDS = ['overview', 'wiki', 'files', 'search', 'remote', 'provision'];
+function handleHotkey(e) {
+  if (e.altKey || e.ctrlKey || e.metaKey) return;  /* leave Alt+N etc. alone */
+  var t = e.target || {};
+  var typing = /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName || '') || t.isContentEditable;
+  if (e.key === 'Escape') {
+    /* Esc is the only mouse-free way out of the chromeless fullscreen viewport. */
+    var vp = document.getElementById('viewport');
+    if (vp && !vp.hidden) { e.preventDefault(); closeView(); return; }
+    if (typing && t.blur) { t.blur(); }        /* otherwise drop focus */
+    return;
+  }
+  if (typing) return;                          /* never hijack a keystroke while typing */
+  if (e.key === '/') {                         /* focus the local search */
+    var q = document.getElementById('local-query');
+    if (q) { e.preventDefault(); q.focus(); q.select && q.select(); }
+    return;
+  }
+  if (e.key >= '1' && e.key <= '9') {          /* jump to a numbered view */
+    var idx = parseInt(e.key, 10) - 1;
+    if (idx < NAV_IDS.length) {
+      var el = document.getElementById(NAV_IDS[idx]);
+      if (el) { e.preventDefault(); el.scrollIntoView({ behavior: 'smooth', block: 'start' }); }
+    }
+  }
+}
+document.addEventListener('keydown', handleHotkey);
+
 async function api(path, timeoutMs) {
   const ctl = new AbortController();
   const t = setTimeout(function () { ctl.abort(); }, timeoutMs || 15000);
