@@ -275,6 +275,25 @@ class ZimBucket(BaseBucket):
         etc.) of at most ``FAT32_CHUNK_LIMIT`` bytes while preserving one
         continuous MD5 hash across all slices for final verification.
         """
+        # Precondition: the ZIM trailer is a 16-byte MD5 of everything before it,
+        # so a payload must exceed 16 bytes for the hash window to mean anything.
+        # A mirror using chunked transfer encoding sends no Content-Length, and the
+        # caller's `int(headers.get("Content-Length", 0))` then yields 0. That made
+        # checksum_start == -16, so _update_hash skipped EVERY chunk, the digest
+        # was MD5(b"") and a fully downloaded multi-GB archive was rejected and
+        # deleted at 100%. The same zero also suppressed FAT32 split detection,
+        # writing an oversized file onto a filesystem that cannot hold it.
+        # Fail fast and say what to do about it (MIL-STD-1472H 5.17.10.7).
+        if total_size <= 16:
+            raise ValueError(
+                f"Refusing to download {identifier}: declared payload size "
+                f"{total_size} bytes is unusable (a ZIM must exceed its 16-byte "
+                "MD5 trailer). The mirror likely sent no Content-Length header "
+                "(chunked transfer encoding). RECOVERY: retry, or use a mirror "
+                "that reports Content-Length -- e.g. a download.kiwix.org "
+                "release URL rather than a redirector."
+            )
+
         target_file = self.root / f"{identifier}.zim"
         temp_file = self.root / f".{identifier}.zim.part"
         fat32_mode = self._detect_fat32_mode(target_file, total_size)
@@ -455,6 +474,21 @@ class ZimBucket(BaseBucket):
 
     def _verify_and_finalize(self, temp_file: Path, target_file: Path, hasher, total_size: int) -> Dict[str, Any]:
         """Extract embedded checksum and atomically rename a single ZIM file."""
+        # The trailer is located from the END of the file, so a wrong-length file
+        # yields a wrong trailer and mismatches the digest. Reporting that as
+        # "payload corrupted" misdiagnoses the common cause: a mirror that ignores
+        # Range and appends a whole body to a partial file. Check length first so
+        # the operator is pointed at the mirror, not at their disk.
+        actual = temp_file.stat().st_size
+        if actual != total_size:
+            temp_file.unlink(missing_ok=True)
+            raise RuntimeError(
+                f"Transfer size mismatch: expected {total_size} bytes, wrote "
+                f"{actual}. The mirror likely ignored the Range header on resume "
+                "(returning 200 with a full body instead of 206). RECOVERY: delete "
+                "any .part files for this identifier and retry from the start."
+            )
+
         with open(temp_file, 'rb') as f:
             f.seek(-16, os.SEEK_END)
             embedded_checksum = f.read()
@@ -481,6 +515,22 @@ class ZimBucket(BaseBucket):
         self, identifier: str, last_slice: int, hasher, total_size: int
     ) -> Dict[str, Any]:
         """Validate and finalize Kiwix-compatible split ZIM slices."""
+        # Same reasoning as the single-file path: verify the aggregate byte count
+        # before locating the trailer at the end of the final slice.
+        written = sum(
+            self._slice_temp_path(identifier, i).stat().st_size
+            for i in range(last_slice + 1)
+            if self._slice_temp_path(identifier, i).exists()
+        )
+        if written != total_size:
+            self._cleanup_split_temps(identifier, last_slice)
+            raise RuntimeError(
+                f"Transfer size mismatch across {last_slice + 1} slice(s): expected "
+                f"{total_size} bytes, wrote {written}. The mirror likely ignored the "
+                "Range header on resume. RECOVERY: delete the .part slices for this "
+                "identifier and retry from the start."
+            )
+
         first_temp = self._slice_temp_path(identifier, 0)
         with open(first_temp, 'rb') as f:
             magic = int.from_bytes(f.read(4), byteorder='little')
