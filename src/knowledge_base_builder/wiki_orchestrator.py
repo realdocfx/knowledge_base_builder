@@ -446,7 +446,6 @@ def run(config: dict, dry_run: bool = False, retry_failed: bool = False) -> None
     downloader = ZimDownloader()
     for entry in queue:
         identifier = entry["identifier"]
-        final_path = final_dir / f"{identifier}.zim"
         base = _identifier_base(identifier)
 
         if any(final_dir.glob(f"{identifier}.zim*")) or base in existing_bases:

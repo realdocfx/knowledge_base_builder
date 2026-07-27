@@ -13,7 +13,7 @@ import os
 import shutil
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 from datetime import datetime
 
 from ..base import BaseBucket
@@ -57,10 +57,15 @@ class ZimBucket(BaseBucket):
         return True
 
     def check_capacity(self, required_bytes: int = 0) -> bool:
-        """Ensure sufficient space for a massive ZIM payload."""
-        # FAT32 guard
-        filesystem = self.root.stat().st_dev
-        # Best-effort filesystem detection: if path is on a volume with 4GB limit
+        """Ensure sufficient space for a massive ZIM payload.
+
+        NOTE: this checks free space only. It is NOT a FAT32 guard -- a previous
+        comment here claimed to be one while computing an st_dev value that was
+        then discarded, so no per-file size limit was ever enforced. Real FAT32
+        handling lives in _detect_fat32_mode, and this method is not currently
+        called from the ZIM download path at all (capacity is discovered by
+        ENOSPC mid-write). Both are tracked as removable-media work.
+        """
         try:
             _, _, free = shutil.disk_usage(self.root)
             if required_bytes > free:

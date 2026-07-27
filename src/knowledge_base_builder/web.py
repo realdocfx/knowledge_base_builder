@@ -7,7 +7,6 @@ and embeds the native ``kiwix-serve`` ZIM reader directly.
 Install the web extra: ``pip install -e .[web]``.
 """
 
-import asyncio
 import html
 import json
 import logging

@@ -238,7 +238,6 @@ def test_wiki_proxy_closes_upstream_stream_on_disconnect():
 
 def test_start_kiwix_server_retries_on_eaddrinuse(tmp_path):
     """_start_kiwix_server retries when its chosen port is stolen before binding."""
-    from pathlib import Path
     from unittest.mock import patch
 
     primary = Path("test_wiki.zim")

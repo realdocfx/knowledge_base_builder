@@ -24,7 +24,6 @@ import hashlib
 import re
 from pathlib import Path
 
-import pytest
 
 _SRC = Path(__file__).resolve().parents[1] / "src" / "knowledge_base_builder"
 

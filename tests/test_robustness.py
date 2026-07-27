@@ -1,5 +1,4 @@
 import pytest
-import time
 from unittest.mock import patch, MagicMock
 from knowledge_base_builder.engines.archive import ArchiveEngine
 

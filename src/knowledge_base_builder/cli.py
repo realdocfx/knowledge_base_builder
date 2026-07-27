@@ -7,13 +7,9 @@ import os
 from datetime import datetime
 import shutil
 import socket
-import stat
 import subprocess
-import sys
-import tempfile
 import threading
 import time
-import webbrowser
 import zipfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -737,17 +733,50 @@ def _secure_fetch(
                 pass
 
 
+def _assert_member_within(dest: Path, member_name: str) -> None:
+    """Reject an archive member that would be written outside *dest*.
+
+    Guards Zip Slip and CVE-2007-4559. The provisioning assets are SHA-256
+    pinned, but the pin is not this control: ``--local-bundle`` accepts an
+    operator-supplied archive, so extraction must be safe on its own terms.
+    """
+    parts = Path(member_name).parts
+    if Path(member_name).is_absolute() or member_name.startswith(("/", "\\")) or ".." in parts:
+        raise ValueError(
+            f"Refusing to extract unsafe archive member {member_name!r}: "
+            "absolute paths and parent-directory traversal are not permitted."
+        )
+    resolved_dest = Path(dest).resolve()
+    try:
+        (resolved_dest / member_name).resolve().relative_to(resolved_dest)
+    except ValueError:
+        raise ValueError(
+            f"Refusing to extract archive member {member_name!r}: it resolves "
+            f"outside the destination {resolved_dest}."
+        )
+
+
 def _extract_zip(zip_path: Path, dest: Path) -> None:
-    """Extract a ZIP archive into *dest*."""
+    """Extract a ZIP archive into *dest*, refusing members that escape it."""
     with zipfile.ZipFile(zip_path, "r") as z:
+        for name in z.namelist():
+            _assert_member_within(dest, name)
         z.extractall(dest)
 
 
 def _extract_tarball(tarball_path: Path, dest: Path) -> None:
-    """Extract a tar.gz archive into *dest*."""
+    """Extract a tar.gz archive into *dest*, refusing members that escape it."""
     import tarfile
+
     with tarfile.open(tarball_path, "r:gz") as tf:
-        tf.extractall(dest)
+        for member in tf.getmembers():
+            _assert_member_within(dest, member.name)
+        try:
+            # filter="data" also strips setuid bits, device nodes and links.
+            # Default from CPython 3.14; requested explicitly for older versions.
+            tf.extractall(dest, filter="data")
+        except TypeError:  # pragma: no cover - Python without the filter kwarg
+            tf.extractall(dest)
 
 
 def _patch_embedded_pth(python_dir: Path, target_os: str) -> None:
@@ -1265,7 +1294,6 @@ def _provision_rust_launcher(root: Path, target_os: str, local_bundle: Optional[
     
     SECURITY NOTE: Requires hash verification unless --allow-insecure-network is explicitly set.
     """
-    from .os_utils import get_executable_extension
     
     console.print("[cyan]Provisioning military-grade Rust/Tauri launcher...[/cyan]")
     
@@ -1346,7 +1374,6 @@ def _provision_rust_launcher(root: Path, target_os: str, local_bundle: Optional[
 
 def _write_portable_launchers(root: Path, target_os: str, with_launcher: bool = False) -> None:
     """Generate platform-specific launchers at the drive root for zero-install launching."""
-    from .os_utils import get_executable_extension, get_script_extension
 
     # Skip batch/shell launchers if Rust launcher is provisioned
     if with_launcher:
@@ -1461,7 +1488,7 @@ def portable(
     SECURITY NOTE: By default, requires --local-bundle for air-gapped compliance.
     Use --allow-insecure-network only for development/testing with explicit approval.
     """
-    from .os_utils import get_platform_name, get_executable_extension, get_script_extension
+    from .os_utils import get_platform_name, get_script_extension
 
     root = Path(path).resolve()
     root.mkdir(parents=True, exist_ok=True)

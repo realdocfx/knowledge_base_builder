@@ -1,0 +1,150 @@
+name: CI
+
+# The repository had three workflows and none of them ran the tests. That is how a
+# NameError in the primary `pull` command shipped: the only enforcement was a
+# pre-commit hook, which requires opt-in `core.hooksPath` and is bypassed by
+# `--no-verify`. This workflow is the gate.
+#
+# Note the install step: dependencies are installed but the package is NOT. The
+# suite must resolve `knowledge_base_builder` from `src/` via pytest's
+# `pythonpath`, which proves it runs from a clean clone. A `pip install -e .` here
+# would mask exactly the defect this job exists to catch.
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: tests ${{ matrix.os }} / py${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install dependencies only (never the package itself)
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          # Runtime deps. `internetarchive` is installed WITHOUT [speedups]:
+          # gevent needs a compiler on some runners and the tests only require
+          # that the module imports. The `web` extra is deliberately not used --
+          # it pulls xapian-bindings, which publishes no wheels.
+          python -m pip install \
+            "internetarchive>=3.0.0" "typer>=0.9.0" "rich>=13.0.0" \
+            "requests>=2.28.0" "libzim>=3.0.0" "pypdf>=4.0.0" \
+            "fastapi>=0.100.0" "httpx>=0.24.0"
+          python -m pip install pytest
+
+      - name: Verify the package is not installed (clean-clone precondition)
+        shell: bash
+        run: |
+          if python -c "import knowledge_base_builder" 2>/dev/null; then
+            echo "::error::knowledge_base_builder is importable without src/ on sys.path;"
+            echo "::error::this job must prove the suite runs from a clean clone."
+            exit 1
+          fi
+          echo "confirmed: package resolves only via pytest pythonpath=src"
+
+      - name: Run tests
+        run: python -m pytest -q
+
+  lint:
+    name: lint (ruff + pyflakes)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: python -m pip install --upgrade pip ruff pyflakes
+      # Scope: E9 (syntax/IO errors) and F (pyflakes) -- the rules that catch real
+      # defects such as the undefined `datetime` that broke `pull`. Style rules are
+      # deliberately not enabled yet so this gate is meaningful rather than noisy.
+      # tests/ is included: a missing `import re` in a test file slipped through
+      # while writing these very fixes.
+      - name: ruff (bug-class rules)
+        run: python -m ruff check --select E9,F src tests
+      - name: pyflakes
+        run: python -m pyflakes src tests
+
+  typecheck:
+    name: mypy (advisory)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: python -m pip install --upgrade pip mypy types-requests
+      # mypy is configured with disallow_untyped_defs but has never been run, so
+      # it reports a large backlog. Advisory for now so the signal is visible
+      # without blocking; to be made blocking module-by-module as it is paid down.
+      - name: mypy
+        run: python -m mypy src/knowledge_base_builder || true
+
+  audit:
+    name: dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: python -m pip install --upgrade pip pip-audit
+      - name: pip-audit (advisory)
+        run: python -m pip_audit -r requirements.txt --strict || true
+
+  cli-smoke:
+    name: CLI smoke
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      # Here the package IS installed, to exercise the real entry point and catch
+      # packaging faults (missing package-data, broken console script) that a
+      # src-path test run cannot see.
+      - name: Install package
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install .
+      - name: Entry point responds
+        run: |
+          kb-builder --help
+          python -c "import knowledge_base_builder as k; print(k.__version__)"
+      - name: Vendored assets are packaged
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import knowledge_base_builder as k
+          root = Path(k.__file__).parent
+          for rel in ("assets/swagger-ui.css", "assets/swagger-ui-bundle.js", "docs/MANUAL.md"):
+              p = root / rel
+              assert p.is_file() and p.stat().st_size > 0, f"missing packaged asset: {rel}"
+              print("ok", rel, p.stat().st_size, "bytes")
+          PY

@@ -46,7 +46,15 @@ def mock_darwin_env():
 
 @pytest.fixture
 def mock_windows_env():
-    """Simulates a Windows environment (for consistency testing)."""
+    """Simulates a Windows environment (for consistency testing).
+
+    Skipped off Windows: this fixture patches ``ctypes.windll``, which only
+    exists on Windows, so on Linux/macOS the patch target itself raises and the
+    whole module errored during collection -- an OS-independence suite that was
+    not OS-independent. The Windows API path is covered on the Windows CI leg.
+    """
+    if sys.platform != "win32":
+        pytest.skip("ctypes.windll is Windows-only; covered by the Windows CI leg")
     with patch("sys.platform", "win32"):
         with patch("os.name", "nt"):
             # Mock ctypes.windll.kernel32.GetVolumeInformationA
