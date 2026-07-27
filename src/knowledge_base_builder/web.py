@@ -1660,11 +1660,20 @@ async function pollClone() {
                    s.done_files + '/' + s.total_files + ' files  —  ' + (s.current || ''));
     setTimeout(pollClone, 500);
   } else if (s.state === 'done') {
-    var skip = (s.skipped && s.skipped.length) ? ' (' + s.skipped.length + ' file(s) skipped)' : '';
-    finishProgress('Duplicate complete' + skip, fmtGB(s.done_bytes) + ' copied to ' + s.dst);
-    document.getElementById('clone-msg').textContent = 'Done: ' + fmtGB(s.done_bytes) + ' to ' + s.dst + skip;
+    /* A skipped file now yields state==='error', so 'done' means complete --
+       no more "Duplicate complete (1 file(s) skipped)" for a copy that dropped
+       the 90GB archive. */
+    finishProgress('Duplicate complete', fmtGB(s.done_bytes) + ' copied to ' + s.dst +
+                   ' — digests recorded in .kb_state/clone_manifest.json');
+    document.getElementById('clone-msg').textContent =
+      'Done: ' + fmtGB(s.done_bytes) + ' to ' + s.dst;
   } else if (s.state === 'error') {
-    finishProgress('Duplicate failed', s.error || 'unknown error');
+    var n = (s.skipped && s.skipped.length) ? s.skipped.length : 0;
+    finishProgress('DUPLICATE INCOMPLETE — do not ship this drive',
+                   (s.error || 'unknown error') +
+                   (n ? '  (' + n + ' file(s) failed)' : ''));
+    document.getElementById('clone-msg').innerHTML =
+      '<span class="danger-text">FAILED: ' + escHtml(s.error || 'unknown error') + '</span>';
   } else {
     hideProgress();
   }

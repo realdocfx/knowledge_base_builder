@@ -13,8 +13,11 @@ Runs in a background thread with byte-level progress so the UI can show a
 determinate bar.
 """
 
+import hashlib
+import json
 import os
 import shutil
+import sqlite3
 import threading
 import time
 from pathlib import Path
@@ -31,12 +34,20 @@ _RUNTIME_ITEMS = (
     "Portable-Rust-Shell.bat",
 )
 # Never copied (live-locked on the source and regenerated on the target).
+# Never copied: SQLite's WAL sidecars are live-locked by the running portal and
+# meaningless without the exact database they belong to. The database itself IS
+# copied, after _checkpoint_sqlite_wal folds the WAL back into it -- otherwise the
+# destination would inherit an index missing its most recent commits. Copying a
+# checkpointed .db also spares the target a full re-index, which on a large
+# library means re-extracting text from every PDF and EPUB.
 _ALWAYS_SKIP_REL = (
-    os.path.join(".kb_state", "archive_index.db"),
     os.path.join(".kb_state", "archive_index.db-wal"),
     os.path.join(".kb_state", "archive_index.db-shm"),
     os.path.join(".kb_state", "archive_index.db-journal"),
 )
+
+# Refuse to start a clone that cannot fit, with headroom for filesystem overhead.
+_CAPACITY_MARGIN = 8 * 1024 * 1024
 
 _CHUNK = 4 * 1024 * 1024
 _STATUS_LOCK = threading.Lock()
@@ -141,18 +152,92 @@ def _iter_files(src: Path, mode: str) -> Iterator[Tuple[Path, Path]]:
                     yield f, rel
 
 
-def _copy_stream(src_f: Path, dst_f: Path, on_chunk: Callable[[int], None]) -> None:
+def _copy_stream(src_f: Path, dst_f: Path, on_chunk: Callable[[int], None]) -> str:
+    """Copy *src_f* to *dst_f*, returning the SHA-256 of the bytes transferred.
+
+    The digest is computed from the same buffers being written, so a verifiable
+    manifest costs no extra read pass over a multi-GB payload. The explicit fsync
+    matters on removable media: without it "copy complete" only means the bytes
+    reached the OS cache, and an operator who ejects immediately loses them.
+    """
+    digest = hashlib.sha256()
     with open(src_f, "rb") as r, open(dst_f, "wb") as w:
         while True:
             block = r.read(_CHUNK)
             if not block:
                 break
             w.write(block)
+            digest.update(block)
             on_chunk(len(block))
+        w.flush()
+        try:
+            os.fsync(w.fileno())
+        except OSError:
+            pass  # some filesystems/handles refuse fsync; the copy still stands
     try:
         shutil.copystat(src_f, dst_f)
     except OSError:
         pass
+    return digest.hexdigest()
+
+
+def _checkpoint_sqlite_wal(state_dir: Path) -> None:
+    """Fold WAL contents back into the main database files before copying.
+
+    SQLite in WAL mode keeps committed-but-uncheckpointed transactions in a
+    separate ``-wal`` file. The clone deliberately skips ``-wal``/``-shm`` because
+    they are live-locked by the running portal -- but that meant the copied
+    ``.db`` silently lacked the most recent commits. Checkpointing is the correct
+    fix: it makes the ``.db`` self-contained, so skipping the sidecars becomes
+    safe rather than lossy.
+    """
+    if not state_dir.is_dir():
+        return
+    for db in sorted(state_dir.glob("*.db")):
+        try:
+            con = sqlite3.connect(db, timeout=10.0)
+            try:
+                con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            finally:
+                con.close()
+        except sqlite3.Error:
+            # A busy or corrupt index must not abort the clone; the copy proceeds
+            # and the destination rebuilds its index on first launch.
+            pass
+
+
+def _human(n: int) -> str:
+    """Human-readable byte count for operator-facing messages."""
+    size = float(n)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024 or unit == "TB":
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TB"
+
+
+def _write_manifest(dst: Path, src: Path, mode: str, files: Dict[str, Dict[str, Any]]) -> None:
+    """Record what was copied and its digests, on the target itself.
+
+    A byte count is not verification. The manifest travels with the stick so the
+    copy can be checked later, independently of the process that made it.
+    """
+    try:
+        state_dir = dst / ".kb_state"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "source": str(src),
+            "mode": mode,
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "file_count": len(files),
+            "total_bytes": sum(e["size"] for e in files.values()),
+            "files": files,
+        }
+        (state_dir / "clone_manifest.json").write_text(
+            json.dumps(payload, indent=2), encoding="utf-8"
+        )
+    except OSError:
+        pass  # the clone itself succeeded; an unwritable manifest must not undo it
 
 
 def clone(
@@ -179,6 +264,11 @@ def clone(
         if not (dst.exists() and dst.is_dir()):
             raise ValueError(f"Destination {dst} is not an accessible directory.")
 
+        # Make the index self-contained before it is enumerated, so the copy
+        # carries every committed transaction rather than only those already
+        # folded out of the WAL.
+        _checkpoint_sqlite_wal(src / ".kb_state")
+
         files = list(_iter_files(src, mode))
         total_bytes = 0
         for f, _ in files:
@@ -187,6 +277,21 @@ def clone(
             except OSError:
                 pass
         _set(total_files=len(files), total_bytes=total_bytes)
+
+        # Capacity is checked up front. Previously it was discovered by ENOSPC
+        # part-way through, leaving a half-populated stick that still reported
+        # progress.
+        try:
+            free = shutil.disk_usage(str(dst))[2]
+        except OSError:
+            free = None
+        if free is not None and total_bytes + _CAPACITY_MARGIN > free:
+            raise ValueError(
+                f"Insufficient space on {dst}: need "
+                f"{_human(total_bytes + _CAPACITY_MARGIN)}, only {_human(free)} free. "
+                "RECOVERY: use a larger target, or choose the Virgin (runtime only) "
+                "mode which omits downloaded content."
+            )
 
         state = {"done": 0, "last": 0.0}
 
@@ -198,15 +303,20 @@ def clone(
                 _set(done_bytes=state["done"])
 
         done_files = 0
+        manifest: Dict[str, Dict[str, Any]] = {}
         for f, rel in files:
             target = dst / rel
             _set(current=str(rel))
             try:
                 target.parent.mkdir(parents=True, exist_ok=True)
-                _copy_stream(f, target, bump)
+                digest = _copy_stream(f, target, bump)
+                manifest[rel.as_posix()] = {
+                    "size": target.stat().st_size,
+                    "sha256": digest,
+                }
             except (PermissionError, OSError) as exc:
                 with _STATUS_LOCK:
-                    _STATUS["skipped"].append(f"{rel}: {exc.__class__.__name__}")
+                    _STATUS["skipped"].append(f"{rel}: {exc.__class__.__name__}: {exc}")
             done_files += 1
             _set(done_bytes=state["done"], done_files=done_files)
             if progress:
@@ -221,7 +331,27 @@ def clone(
             except Exception:
                 pass
 
-        _set(state="done", done_bytes=state["done"], current="", finished=time.time())
+        _write_manifest(dst, src, mode, manifest)
+
+        # A clone that dropped a file is a FAILURE, not a footnote. Reporting
+        # "Duplicate complete (1 file(s) skipped)" for a copy that lost the 90 GB
+        # Wikipedia archive is a mis-annunciation: the operator would ship an
+        # incomplete stick believing it verified.
+        with _STATUS_LOCK:
+            failures = list(_STATUS.get("skipped") or [])
+        if failures:
+            _set(
+                state="error",
+                done_bytes=state["done"],
+                current="",
+                finished=time.time(),
+                error=(
+                    f"{len(failures)} file(s) could not be copied; the duplicate is "
+                    f"INCOMPLETE. First failure: {failures[0]}"
+                ),
+            )
+        else:
+            _set(state="done", done_bytes=state["done"], current="", finished=time.time())
     except Exception as exc:  # noqa: BLE001 - report to the UI, never crash the thread
         _set(state="error", error=str(exc))
     return get_status()
