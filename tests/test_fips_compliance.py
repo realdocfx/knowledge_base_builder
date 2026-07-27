@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import re
 from pathlib import Path
 
 import pytest
@@ -76,6 +77,32 @@ def test_guarded_md5_is_constructible_and_correct():
     reference = hashlib.md5(b"knowledge-base-builder")  # noqa: S324 - test oracle
     assert guarded.hexdigest() == reference.hexdigest()
     assert guarded.digest_size == 16, "ZIM trailer comparison depends on 16 bytes"
+
+
+def test_declared_python_floor_supports_the_fips_guard():
+    """The declared support matrix must not include interpreters that crash.
+
+    ``hashlib.md5(usedforsecurity=False)`` is CPython 3.9+. While pyproject
+    declared ``requires-python = ">=3.8"`` (and advertised a 3.8 classifier),
+    every ZIM download raised TypeError on 3.8 -- the FIPS remedy silently
+    invalidated the published matrix. A support claim the code cannot honour is
+    worse than a narrower one.
+    """
+    root = Path(__file__).resolve().parents[1]
+    text = (root / "pyproject.toml").read_text(encoding="utf-8")
+
+    m = re.search(r'^requires-python\s*=\s*"([^"]+)"', text, re.M)
+    assert m, "requires-python not declared"
+    floor = re.search(r">=\s*(\d+)\.(\d+)", m.group(1))
+    assert floor, f"cannot parse a lower bound from {m.group(1)!r}"
+    major, minor = int(floor.group(1)), int(floor.group(2))
+
+    assert (major, minor) >= (3, 9), (
+        f"requires-python declares >={major}.{minor}, but "
+        "hashlib.md5(usedforsecurity=False) needs 3.9+ and is on the ZIM download "
+        "path -- every download would raise TypeError on the declared floor"
+    )
+    assert 'Python :: 3.8"' not in text, "3.8 classifier still advertised"
 
 
 def test_zim_checksum_digest_matches_trailer_width():

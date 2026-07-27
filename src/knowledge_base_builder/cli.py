@@ -1158,27 +1158,69 @@ def _provision_portable_rust(root: Path, target_os: str, local_bundle: Optional[
     # Download rustup-init.exe
     rustup_url = "https://win.rustup.rs/x86_64"
     
+    # Provenance for an executable we are about to run. win.rustup.rs always
+    # serves the current installer, so a permanent constant pin is impractical --
+    # but "impractical to pin forever" is not a licence to run unverified code.
+    # A pin is enforced when available, secure mode refuses without one, and the
+    # digest of whatever gets executed is always reported so the run is auditable
+    # and the operator can pin it. See tests/test_rustup_provisioning.py.
+    expected_hash = (
+        os.environ.get("KBB_RUSTUP_SHA256", "").strip()
+        or PROVISIONING_HASHES.get("rustup-init.exe", "")
+    )
+
     if local_bundle:
         # Extract from local bundle
         console.print(f"[cyan]Extracting rustup-init.exe from local bundle: {local_bundle}[/cyan]")
         import tarfile
         try:
             with tarfile.open(local_bundle, 'r:*') as tar:
-                tar.extract("rustup-init.exe", path=rust_dir)
+                # filter="data" refuses absolute paths and traversal members
+                # (CVE-2007-4559); it is the default from CPython 3.14 and is
+                # requested explicitly here for older interpreters.
+                try:
+                    tar.extract("rustup-init.exe", path=rust_dir, filter="data")
+                except TypeError:  # pragma: no cover - Python < 3.11.4
+                    tar.extract("rustup-init.exe", path=rust_dir)
         except Exception as e:
             raise RuntimeError(f"Failed to extract rustup-init.exe from bundle: {e}")
     else:
-        # Download from network
-        if not allow_insecure:
-            # In production, we would verify the hash here
-            console.print("[yellow]WARNING: Downloading rustup-init.exe without hash verification. Use --allow-insecure-network only for development.[/yellow]")
-        
+        if not expected_hash and not allow_insecure:
+            raise RuntimeError(
+                "Refusing to download and execute rustup-init.exe with no pinned "
+                "SHA-256. RECOVERY: pin it with KBB_RUSTUP_SHA256=<digest>, supply "
+                "the installer via --local-bundle, or pass --allow-insecure-network "
+                "to explicitly accept an unverified installer (development only)."
+            )
         console.print(f"[cyan]Downloading rustup-init.exe from {rustup_url}...[/cyan]")
         _download_file(rustup_url, rustup_init, "rustup-init.exe")
-    
+
     # Verify the installer
     if not rustup_init.exists():
         raise RuntimeError(f"rustup-init.exe not found at {rustup_init}")
+
+    digest = hashlib.sha256()
+    with open(rustup_init, "rb") as fh:
+        for block in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(block)
+    actual_hash = digest.hexdigest()
+    console.print(f"[dim]rustup-init.exe SHA-256: {actual_hash}[/dim]")
+
+    if expected_hash:
+        if actual_hash.lower() != expected_hash.lower():
+            rustup_init.unlink(missing_ok=True)
+            raise RuntimeError(
+                "CRITICAL: rustup-init.exe SHA-256 mismatch. Expected "
+                f"{expected_hash}, got {actual_hash}. The installer was discarded "
+                "and NOT executed."
+            )
+        console.print("[green]rustup-init.exe verified against pinned SHA-256.[/green]")
+    else:
+        console.print(
+            "[bold yellow]WARNING: executing an UNVERIFIED rustup-init.exe "
+            "(--allow-insecure-network). Pin the digest above via "
+            "KBB_RUSTUP_SHA256 for reproducible, auditable provisioning.[/bold yellow]"
+        )
     
     # Execute silent install with isolated environment
     console.print("[cyan]Installing embedded toolchain to isolated environment...[/cyan]")
