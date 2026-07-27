@@ -100,6 +100,41 @@ PROVISIONING_HASHES: Dict[str, str] = {
 }
 
 
+def _write_token_file(path: "Path", token: str) -> None:
+    """Publish the control-plane token for the launcher, owner-readable only.
+
+    The Rust launcher cannot mint a CSPRNG token, so the backend writes one here
+    and the launcher reads it back. The file lands in the system temp directory,
+    which on POSIX is world-readable -- at default permissions any local user
+    could read the token and obtain full /api/* authority, defeating the gate.
+
+    The staging file is therefore created with mode 0600 *before* any bytes are
+    written (O_CREAT with an explicit mode, not a chmod afterwards, which would
+    leave a readable window), then atomically renamed so the launcher never
+    observes a partial token. Failure is non-fatal: the launcher has its own
+    timeout messaging and the operator can always open the printed URL manually.
+    """
+    tmp = path.with_suffix(path.suffix + ".part")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+        fd = os.open(tmp, flags, 0o600)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(token)
+                fh.flush()
+                os.fsync(fh.fileno())
+        except BaseException:
+            os.close(fd)
+            raise
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def _open_browser(url: str) -> None:
     """Open *url* in Chrome when available, otherwise the system default browser."""
     from .os_utils import open_browser
@@ -564,13 +599,7 @@ def portal(
     # and atomically renamed, so the launcher never reads a half-written token.
     _token_file = os.environ.get("KBB_TOKEN_FILE")
     if _token_file:
-        try:
-            _tp = Path(_token_file)
-            _tmp = _tp.with_suffix(_tp.suffix + ".part")
-            _tmp.write_text(get_auth_token(), encoding="utf-8")
-            os.replace(_tmp, _tp)
-        except OSError:
-            pass  # launcher falls back to its own timeout messaging
+        _write_token_file(Path(_token_file), get_auth_token())
 
     url = f"http://{display_host}:{port}/?t={get_auth_token()}"
     console.print(f"[cyan]Starting C2 Knowledge Portal at {url} ...[/cyan]")

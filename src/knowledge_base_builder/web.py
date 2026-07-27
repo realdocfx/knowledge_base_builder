@@ -66,6 +66,29 @@ SWAGGER_ASSETS = Path(__file__).resolve().parent / "assets"
 # pointed at operator storage. Every /api/* call therefore requires an ephemeral
 # token minted per process. The launcher supplies one via KBB_AUTH_TOKEN so it
 # can hand the operator a pre-authorised URL.
+# Headers that must never be relayed to the proxied kiwix-serve binary.
+#
+# Credentials first: kiwix-serve performs no authorisation and needs no ambient
+# credential, so forwarding the control-plane token (as the kbb_session cookie or
+# a bearer header) buys nothing and widens the blast radius of any logging or
+# request-handling weakness in a third-party C++ binary.
+#
+# Then hop-by-hop headers (RFC 9110 7.6.1): they are scoped to a single
+# connection and must not be reused on the new one opened upstream.
+_PROXY_STRIPPED_HEADERS = frozenset({
+    "host",
+    "cookie",
+    "authorization",
+    "proxy-authorization",
+    "connection",
+    "keep-alive",
+    "proxy-connection",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+})
+
 AUTH_COOKIE = "kbb_session"
 _AUTH_TOKEN: Optional[str] = None
 
@@ -840,7 +863,10 @@ async def wiki_proxy(request: Request, path: str) -> Response:
         raise HTTPException(status_code=503, detail="Kiwix server not available")
 
     params = [(str(k), str(v)) for k, v in request.query_params.multi_items()]
-    headers = {k: v for k, v in request.headers.items() if k.lower() != "host"}
+    headers = {
+        k: v for k, v in request.headers.items()
+        if k.lower() not in _PROXY_STRIPPED_HEADERS
+    }
 
     try:
         httpx_request = client.build_request(
