@@ -71,7 +71,13 @@ def test_no_blank_targets_anywhere_in_the_console():
 @pytest.mark.parametrize("surface", ["/files/", "/documentation", "/docs"])
 def test_secondary_surfaces_are_opened_through_the_viewport(surface):
     """Files, manual and API console must all route through openView."""
-    pattern = re.compile(r"openView\(\s*['\"]" + re.escape(surface))
+    # The path may be wrapped in contentUrl() -- untrusted material is served from
+    # a separate origin, so its links are built rather than written literally. What
+    # must hold is that the surface is opened via openView (in-window), not how the
+    # URL is composed.
+    pattern = re.compile(
+        r"openView\(\s*(?:contentUrl\(\s*)?['\"]" + re.escape(surface)
+    )
     assert pattern.search(_HTML), (
         f"{surface} must be opened via openView() so it renders in-window"
     )

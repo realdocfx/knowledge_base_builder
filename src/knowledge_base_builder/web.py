@@ -56,6 +56,79 @@ app = FastAPI(
     redoc_url=None,
 )
 
+# ==========================================================================
+# Content plane -- a SEPARATE ORIGIN for untrusted downloaded material.
+#
+# /files, /read, /epubres and /wiki serve bytes that came from Archive.org and
+# Kiwix. Served same-origin with the console, any downloaded .html or .svg was
+# stored XSS against the control plane with a token-bearing session in scope, and
+# the whole drive was readable without credentials.
+#
+# The boundary is a different HOST, not merely a different port: cookies are not
+# port-scoped (RFC 6265), so 127.0.0.1:A and 127.0.0.1:B share one jar and a
+# second port would leave the session cookie in scope. 127.0.0.1 and localhost are
+# distinct hosts for cookie purposes while both remain loopback, so binding the
+# content plane to localhost yields BOTH same-origin-policy isolation (content
+# script cannot read the console DOM or read API responses) AND cookie isolation
+# (the session cookie is never transmitted here at all).
+#
+# This application is deliberately unauthenticated. Gating it would be theatre:
+# it holds no authority to protect. Its protections are the origin boundary, a
+# sandbox CSP, and forcing active content types to download rather than render.
+# ==========================================================================
+content_app = FastAPI(
+    title="Knowledge-Base-Builder Content Plane",
+    description="Read-only delivery of downloaded material, isolated from the C2 console.",
+    version="0.5.0",
+    docs_url=None,
+    redoc_url=None,
+)
+
+# Extensions the inline reader is *for*. Anything else is forced to download, so a
+# payload cannot be interpreted as a document even if it reaches a browser.
+_INLINE_SAFE_EXT = {
+    ".pdf", ".epub", ".txt", ".md", ".markdown", ".rst", ".log", ".csv", ".tsv",
+    ".json", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".ico",
+    ".mp3", ".wav", ".ogg", ".flac", ".mp4", ".webm", ".mkv", ".zim",
+}
+
+
+def build_content_origin(port: int) -> str:
+    """Origin for the content plane. Uses localhost, NOT 127.0.0.1 -- see above."""
+    return f"http://localhost:{port}"
+
+
+def content_disposition_for(name: str) -> str:
+    """"inline" for formats the reader displays, "attachment" for everything else.
+
+    Markup (.html/.svg/.xhtml) is the case that matters: it is active content, and
+    rendering downloaded markup is what made stored XSS possible.
+    """
+    suffix = Path(str(name)).suffix.lower()
+    return "inline" if suffix in _INLINE_SAFE_EXT else "attachment"
+
+
+@content_app.middleware("http")
+async def harden_content_responses(request: Request, call_next):
+    """Sandbox everything the content plane emits."""
+    response: Response = await call_next(request)
+    # `sandbox` without allow-scripts/allow-same-origin denies script execution,
+    # form submission and same-origin privileges even for HTML that reaches a
+    # browser directly. This is the load-bearing control, not the escaping.
+    response.headers["Content-Security-Policy"] = (
+        "sandbox; default-src 'none'; img-src 'self' data: blob:; "
+        "media-src 'self' blob:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; "
+        "frame-ancestors http://127.0.0.1:* http://localhost:*"
+    )
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Cache-Control"] = "no-store"
+    # Belt and braces: this plane must never participate in the session.
+    if "set-cookie" in response.headers:
+        del response.headers["set-cookie"]
+    return response
+
+
 # Swagger UI shipped with the package so the API console works with no network.
 SWAGGER_ASSETS = Path(__file__).resolve().parent / "assets"
 
@@ -466,6 +539,29 @@ async def lifespan(_app: FastAPI):
     BUCKET = UsbBucket(str(root))
     BUCKET.initialize()
 
+    # Bring up the content plane on its own origin before anything links to it.
+    # It runs in-process on a daemon thread: a separate uvicorn bound to localhost
+    # (NOT 127.0.0.1) so the console's session cookie is never sent to it.
+    content_port = _find_free_port(start=18500)
+    _app.state.content_origin = build_content_origin(content_port)
+    _app.state.content_port = content_port
+
+    def _serve_content() -> None:
+        import uvicorn
+
+        uvicorn.Server(
+            uvicorn.Config(
+                content_app,
+                host="localhost",
+                port=content_port,
+                log_level="warning",
+                access_log=False,
+            )
+        ).run()
+
+    threading.Thread(target=_serve_content, daemon=True).start()
+    logger.info("Content plane listening on %s", _app.state.content_origin)
+
     _app.state.bucket_root = root
     _app.state.kiwix_url = None
     _app.state.kiwix_book_name = None
@@ -560,8 +656,16 @@ async def dashboard(t: str = "") -> Any:
     console is therefore never held hostage by the ZIM engine.
     """
     kiwix_url = getattr(app.state, "kiwix_url", None) or ""
-    kiwix_reader = getattr(app.state, "kiwix_reader_url", None) or "about:blank"
+    content_origin = getattr(app.state, "content_origin", "") or ""
+    # The ZIM reader is proxied by the CONTENT plane, so its iframe must address
+    # the content origin. A bare "/wiki/..." would resolve back to the console's
+    # credentialed origin, which is the boundary this exists to maintain.
+    # Left blank deliberately: pollKiwix() attaches the reader through
+    # contentUrl() so the optic travels with it. Substituting an absolute URL here
+    # too would create a second, optic-less code path for the same iframe.
+    kiwix_reader = "about:blank"
     html = DASHBOARD_HTML.replace("{{KIWIX_URL}}", kiwix_url)
+    html = html.replace("{{CONTENT_ORIGIN}}", content_origin)
     response = HTMLResponse(html.replace("{{WIKI_ENTRY_URL}}", kiwix_reader))
     # Exchange a one-shot ?t= for an HttpOnly session cookie. Keeping the token
     # out of page script means a hostile script on the host cannot read it back
@@ -847,7 +951,7 @@ async def api_search_wiki(
         raise HTTPException(status_code=500, detail=f"FTS query failed: {exc}") from exc
 
 
-@app.api_route(
+@content_app.api_route(
     "/wiki/{path:path}",
     methods=["GET", "HEAD"],
     responses={
@@ -964,7 +1068,7 @@ async def wiki_proxy(request: Request, path: str) -> Response:
     )
 
 
-@app.get(
+@content_app.get(
     "/files/{path:path}",
     responses={
         200: {"description": "Static file or directory listing"},
@@ -986,7 +1090,13 @@ async def static_files(path: str) -> Any:
         raise HTTPException(status_code=404, detail="File not found")
     if target.is_dir():
         return HTMLResponse(_render_library_listing(path, target, root))
-    return FileResponse(target)
+    # Active content (.html/.svg/...) must never render as a document, even on the
+    # sandboxed content origin: forcing a download removes the question entirely.
+    disposition = content_disposition_for(target.name)
+    return FileResponse(
+        target,
+        headers={"Content-Disposition": f'{disposition}; filename="{target.name}"'},
+    )
 
 
 FTS_OVERLAY = """
@@ -1147,7 +1257,16 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <script>
   /* Pre-paint: apply the saved optics BEFORE first paint so Stealth Night never
      flashes a bright frame (critical for night light-discipline). */
-  (function(){try{var m=localStorage.getItem('kbb-view-mode');
+  (function(){try{
+    /* The content plane is a different ORIGIN, so it has its own localStorage and
+       cannot read the console's optic. The console passes it as ?optic=/&bright=;
+       adopt and persist those, then fall back to whatever is stored locally. */
+    var q=new URLSearchParams(location.search);
+    var u=q.get('optic');
+    if(u==='stealth-night'||u==='standard'){localStorage.setItem('kbb-view-mode',u);}
+    var ub=q.get('bright');
+    if(ub){localStorage.setItem('kbb-stealth-bright',ub);}
+    var m=localStorage.getItem('kbb-view-mode');
     if(m!=='stealth-night'&&m!=='standard'){m='stealth-night';}
     document.documentElement.setAttribute('data-view-mode',m);
     var b=localStorage.getItem('kbb-stealth-bright');
@@ -1360,7 +1479,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       </ul>
       <div class="menu-h">Actions</div>
       <button class="btn small" type="button" onclick="loadStats()">Refresh Telemetry</button>
-      <button class="btn small" type="button" onclick="openView('/files/', 'Local File System')">Open File System</button>
+      <button class="btn small" type="button" onclick="openView(contentUrl('/files/'), 'Local File System')">Open File System</button>
       <button class="btn small" type="button" onclick="toggleWikiFullscreen()">Fullscreen Wiki</button>
       <button class="btn small" type="button" onclick="openClone()">Duplicate Drive</button>
       <button class="btn small" type="button" onclick="openView('/documentation', 'Documentation &amp; Manual')">Documentation</button>
@@ -1409,7 +1528,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="card" id="files">
       <h2>Local File Index (Archive.org)</h2>
       <p class="mono muted">Browse downloaded raw PDFs, media, and manuals secured by the ArchiveEngine.</p>
-      <button class="btn" type="button" onclick="openView('/files/', 'Local File System')">Open Local File System</button>
+      <button class="btn" type="button" onclick="openView(contentUrl('/files/'), 'Local File System')">Open Local File System</button>
     </div>
 
     <div class="card" id="search">
@@ -1520,6 +1639,25 @@ async function api(path, timeoutMs) {
   } finally { clearTimeout(t); }
 }
 
+var CONTENT_ORIGIN = '{{CONTENT_ORIGIN}}';
+
+/* Content lives on a different ORIGIN, so localStorage there is a different
+   store: the operator's optic choice cannot be read across the boundary and
+   "stealth follows everywhere" would break at exactly the moment they open a
+   document. Carry it in the URL instead; the target page persists it locally. */
+function contentUrl(path) {
+  if (!CONTENT_ORIGIN) return path;  /* degrade to same-origin if unset */
+  var mode = document.documentElement.getAttribute('data-view-mode') || 'stealth-night';
+  var bright = '';
+  try { bright = localStorage.getItem('kbb-stealth-bright') || ''; } catch (e) {}
+  var hash = '';
+  var h = path.indexOf('#');
+  if (h >= 0) { hash = path.slice(h); path = path.slice(0, h); }
+  var sep = path.indexOf('?') >= 0 ? '&' : '?';
+  return CONTENT_ORIGIN + path + sep + 'optic=' + encodeURIComponent(mode) +
+         (bright ? '&bright=' + encodeURIComponent(bright) : '') + hash;
+}
+
 /* ---- Navigation that works in a browser tab AND the single-window -------
    launcher webview. window.open('_blank') opens a real tab in a browser, but
    the Tauri/WebView2 launcher has no tabs and silently ignores it, so we fall
@@ -1598,9 +1736,9 @@ async function pollKiwix() {
       _kiwixAttached = true;
       if (label) label.textContent = 'Loading ZIM reader…';
       var f = document.getElementById('wiki-frame');
-      if (f) f.src = st.reader_url;
+      if (f) f.src = contentUrl(st.reader_url);
       var a = document.getElementById('wikiFsToggle');
-      if (a) a.href = st.reader_url;
+      if (a) a.href = contentUrl(st.reader_url);
       if (status) status.textContent = 'Status: ZIM Engine Active | Mode: 1:1 Interactivity';
     }
     return;
@@ -1862,7 +2000,7 @@ async function searchLocal() {
       var read = '/read?path=' + encodeURIComponent(r.rel_path || '');
       var snip = r.snippet ? '<div class="mono muted" style="font-size:.72rem;margin-top:2px;">' + escHtml(r.snippet) + '</div>' : '';
       return '<div style="padding:7px 0;border-bottom:1px solid var(--mid);">' +
-        '<a href="' + escAttr(read) + '" onclick="openView(this.href);return false;"><strong>' +
+        '<a href="' + escAttr(contentUrl(read)) + '" onclick="openView(this.href);return false;"><strong>' +
         escHtml(r.title || r.file_name) + '</strong></a> ' +
         '<span class="mono muted" style="font-size:.72rem;">' + escHtml(r.file_name) +
         (r.format ? ' · ' + escHtml(r.format) : '') + '</span>' + snip + '</div>';
@@ -1971,7 +2109,16 @@ BRAND_SVG = (
 
 PREPAINT_SCRIPT = """<script>
   /* Pre-paint: apply saved optics BEFORE first paint (night light-discipline). */
-  (function(){try{var m=localStorage.getItem('kbb-view-mode');
+  (function(){try{
+    /* The content plane is a different ORIGIN, so it has its own localStorage and
+       cannot read the console's optic. The console passes it as ?optic=/&bright=;
+       adopt and persist those, then fall back to whatever is stored locally. */
+    var q=new URLSearchParams(location.search);
+    var u=q.get('optic');
+    if(u==='stealth-night'||u==='standard'){localStorage.setItem('kbb-view-mode',u);}
+    var ub=q.get('bright');
+    if(ub){localStorage.setItem('kbb-stealth-bright',ub);}
+    var m=localStorage.getItem('kbb-view-mode');
     if(m!=='stealth-night'&&m!=='standard'){m='stealth-night';}
     document.documentElement.setAttribute('data-view-mode',m);
     var b=localStorage.getItem('kbb-stealth-bright');
@@ -2478,13 +2625,14 @@ def _epub_spine(epub_path: Path) -> Tuple[str, List[Tuple[str, str]]]:
     return title, chapters
 
 
+@content_app.get("/portal.css")  # themed content pages load it same-origin
 @app.get("/portal.css")
 async def portal_css() -> Response:
     """Standalone dual-optic stylesheet for the secondary themed pages."""
     return Response(PORTAL_CSS, media_type="text/css")
 
 
-@app.get(
+@content_app.get(
     "/read",
     response_class=HTMLResponse,
     responses={
@@ -2606,7 +2754,7 @@ async def read_document(
     return HTMLResponse(_themed_page(name, body, back_href, back_label))
 
 
-@app.get(
+@content_app.get(
     "/epubres/{path:path}",
     responses={
         200: {"description": "A resource served from inside an EPUB zip"},
