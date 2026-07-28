@@ -10,9 +10,20 @@ from rich.logging import RichHandler
 
 from ..archive_index import ArchiveIndex
 from ..base import BaseEngine
-# Re-exported: filesystem-name hygiene lives in os_utils so the indexer can
-# share it without importing this module (and with it, internetarchive).
-from ..os_utils import local_path_for, sanitise_filename  # noqa: F401
+# Re-exported: filesystem-name hygiene lives in os_utils so the indexer can share
+# it without importing this module (and with it, internetarchive). Declared in
+# __all__ below rather than marked "# noqa: F401" -- ruff honours noqa but
+# pyflakes does not, and CI runs both, so the suppression passed locally and
+# failed there.
+from ..os_utils import local_path_for, sanitise_filename
+
+__all__ = [
+    "ArchiveEngine",
+    "FORMAT_MAP",
+    # Re-exported from os_utils for callers that historically imported them here.
+    "local_path_for",
+    "sanitise_filename",
+]
 
 # Format mapping for macros that expand to multiple IA format strings
 # Ordered from best to worst quality for prioritization
