@@ -190,9 +190,22 @@ def get_fs_type(path: Path) -> str:
     Resolves against the nearest existing ancestor so a not-yet-created target
     still reports correctly, and normalises every platform's spelling so callers
     can compare against one value (see normalise_fs_type).
-    """
-    probe = nearest_existing(path)
 
+    Never raises. Detection is advisory -- it selects a write strategy -- so a
+    probe failure must degrade to "" and let the caller proceed, not abort a
+    multi-hour download. The per-seam handlers below catch the errors they expect;
+    this outer guard covers the ones they do not (a decode error on a malformed
+    /proc/mounts, an unexpected ctypes failure) and is verified by
+    test_detection_never_raises.
+    """
+    try:
+        return _detect_fs_type(nearest_existing(path))
+    except Exception:
+        return ""
+
+
+def _detect_fs_type(probe: Path) -> str:
+    """Platform dispatch for get_fs_type (see its contract)."""
     if sys.platform == "win32":
         return _win_fs_type(probe)
 

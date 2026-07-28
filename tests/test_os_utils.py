@@ -153,15 +153,29 @@ class TestFilesystemDetection:
         ):
             assert get_fs_type("/media/operator/STICK") == ""
 
-    def test_detection_never_raises(self):
-        """Detection is advisory: it must never be what aborts a download."""
-        with patch.object(os_utils, "_read_proc_mounts", side_effect=Exception), patch.object(
-            os_utils, "_run_mount", side_effect=Exception
+    @pytest.mark.parametrize("platform", ["linux", "darwin", "win32"])
+    def test_detection_never_raises(self, platform):
+        """Detection is advisory: it must never be what aborts a download.
+
+        Parametrised over all three platforms deliberately. The original version
+        exercised only the host's branch, so it passed on Windows -- which never
+        touches these seams -- while every Linux and macOS job failed. Asserting a
+        cross-platform contract from one platform's code path is not a test of the
+        contract.
+        """
+        with patch.object(os_utils.sys, "platform", platform), patch.object(
+            os_utils, "nearest_existing", side_effect=lambda p: p
+        ), patch.object(
+            os_utils, "_read_proc_mounts", side_effect=Exception("probe exploded")
+        ), patch.object(
+            os_utils, "_run_mount", side_effect=Exception("probe exploded")
+        ), patch.object(
+            os_utils, "_win_fs_type", side_effect=Exception("probe exploded")
         ):
             try:
-                get_fs_type("/nonexistent/path/for/probe")
-            except Exception as exc:  # pragma: no cover
-                pytest.fail(f"get_fs_type raised {exc!r}; it must degrade to ''")
+                assert get_fs_type("/media/operator/STICK/x.zim") == ""
+            except Exception as exc:  # pragma: no cover - the defect being guarded
+                pytest.fail(f"get_fs_type raised {exc!r} on {platform}; must return ''")
 
 
 class TestBrowserLaunching:
