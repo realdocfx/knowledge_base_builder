@@ -98,9 +98,18 @@ items, ZIM slices, search state).
 **Notes**
 - Copying tens of GB of ZIMs takes time — the progress bar shows GB copied and the
   current file. The window can be minimised; do not eject the drive until it finishes.
-- The **live search index** (`.kb_state/archive_index.db`) is skipped (it is locked by
-  the running portal) and is rebuilt automatically the first time the new stick's portal
-  starts.
+- **Capacity is checked before any bytes move.** If the target is too small the
+  duplicate is refused up front rather than filling the drive and failing part-way.
+- **A skipped file fails the whole duplicate.** If any file cannot be copied the
+  result is reported as `DUPLICATE INCOMPLETE — do not ship this drive`, never as
+  "complete with N skipped". Treat it as a failed duplicate.
+- **Every copy is verifiable.** `.kb_state/clone_manifest.json` on the target lists
+  each file with its size and SHA-256, so the duplicate can be checked later
+  independently of the run that produced it.
+- The **search index** is carried over. Its write-ahead log is checkpointed first so
+  the copy contains every committed entry, which means the new stick has a working
+  search immediately instead of re-extracting text from every PDF and EPUB on first
+  launch.
 - FAT32 targets are fine because ZIMs are already stored as `≤4 GB` split slices.
 
 ---
@@ -173,7 +182,8 @@ wait), and the embedded ZIM reader shows a spinner until the first page loads.
 - *No target drive listed* — insert the drive, then click **Refresh Drives**. Network
   and CD-ROM drives are excluded.
 - *"Destination must differ from the source drive"* — you selected the running stick.
-- *Some files skipped* — a file was locked (e.g. the live index DB); this is expected
-  and rebuilt on the target's first run.
+- *Some files failed* — the duplicate is incomplete and must not be shipped. The
+  most common cause is a file larger than 4 GB written to a FAT32 target. Re-run the
+  duplicate, or format the target as exFAT (no 4 GB per-file limit).
 - *Launcher shows the loading screen too long, then an error* — the embedded backend
   failed to start; re-provision the drive (Scenario 1) or check available space.
