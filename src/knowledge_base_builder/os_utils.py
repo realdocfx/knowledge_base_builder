@@ -288,3 +288,83 @@ def get_script_extension() -> str:
         '.bat' on Windows, '.sh' on POSIX systems
     """
     return ".bat" if is_windows() else ".sh"
+
+
+# --------------------------------------------------------------------------
+# Remote filename hygiene
+# --------------------------------------------------------------------------
+# Archive.org item filenames are remote input written straight to the operator's
+# drive. FAT32 and NTFS both reject < > : " | ? *, neither tolerates a trailing
+# dot or space, and Windows reserves the legacy device names at every path level.
+# Unsanitised, a non-trivial fraction of real items simply cannot be written to a
+# Windows stick -- and a name containing a separator is a path-traversal
+# primitive, since the same string is later indexed and served.
+_ILLEGAL_FS_CHARS = '<>:"|?*'
+_WINDOWS_RESERVED = frozenset(
+    ["CON", "PRN", "AUX", "NUL"]
+    + [f"COM{i}" for i in range(1, 10)]
+    + [f"LPT{i}" for i in range(1, 10)]
+)
+_MAX_FILENAME_BYTES = 255  # FAT32/NTFS component limit
+
+
+def sanitise_filename(name: str, fallback: str = "unnamed") -> str:
+    """Return *name* made safe to use as a single filesystem component.
+
+    Illegal characters are percent-encoded rather than collapsed to "_" because
+    distinct remote names must remain distinct on disk: mapping ':', '?' and '*'
+    all onto '_' would make "report:2024.pdf" and "report?2024.pdf" overwrite each
+    other, and silently losing one of two downloads is worse than an ugly name.
+
+    ``%`` is deliberately NOT escaped, which keeps the function idempotent -- a
+    stored name can be re-sanitised without drifting. The cost is that a remote
+    name containing a literal "%3A" collides with one containing ":"; that is a
+    far narrower failure than non-idempotence, which would corrupt resume logic.
+    """
+    if not isinstance(name, str):
+        name = str(name or "")
+
+    # Strip any path structure first: only the final component may survive, so a
+    # traversal sequence cannot escape the item directory.
+    base = re.split(r"[\\/]", name)[-1]
+
+    out = []
+    for ch in base:
+        if ch in _ILLEGAL_FS_CHARS or ord(ch) < 32:
+            out.append(f"%{ord(ch):02X}")
+        else:
+            out.append(ch)
+    safe = "".join(out)
+
+    # Windows silently discards trailing dots and spaces, which would let two
+    # different names resolve to one file.
+    safe = safe.rstrip(" .")
+
+    if not safe or safe in {".", ".."}:
+        return fallback
+
+    stem, dot, ext = safe.partition(".")
+    if stem.upper() in _WINDOWS_RESERVED:
+        safe = f"_{safe}"
+        stem = f"_{stem}"
+
+    # Cap length in BYTES (the filesystem limit is bytes, not characters) while
+    # preserving the extension, which determines how the file is later read.
+    if len(safe.encode("utf-8")) > _MAX_FILENAME_BYTES:
+        suffix = f"{dot}{ext}" if dot else ""
+        budget = _MAX_FILENAME_BYTES - len(suffix.encode("utf-8"))
+        trimmed = stem.encode("utf-8")[: max(budget, 1)].decode("utf-8", "ignore")
+        safe = (trimmed.rstrip(" .") or fallback) + suffix
+
+    return safe or fallback
+
+
+def local_path_for(destdir, identifier: str, file_name: str):
+    """Resolve where a remote item file lands on disk.
+
+    Both components come from the remote catalogue -- the identifier becomes a
+    directory, the file name a leaf -- so both are sanitised here. Routing every
+    write through one function is what makes the guarantee hold: a sanitiser that
+    some call sites bypass protects nothing.
+    """
+    return Path(destdir) / sanitise_filename(identifier) / sanitise_filename(file_name)

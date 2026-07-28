@@ -10,6 +10,9 @@ from rich.logging import RichHandler
 
 from ..archive_index import ArchiveIndex
 from ..base import BaseEngine
+# Re-exported: filesystem-name hygiene lives in os_utils so the indexer can
+# share it without importing this module (and with it, internetarchive).
+from ..os_utils import local_path_for, sanitise_filename  # noqa: F401
 
 # Format mapping for macros that expand to multiple IA format strings
 # Ordered from best to worst quality for prioritization
@@ -230,7 +233,7 @@ class ArchiveEngine(BaseEngine):
                 existing_bytes = 0
                 if ignore_existing:
                     for f in target_files:
-                        target_path = Path(destdir) / identifier / f.get('name', '')
+                        target_path = local_path_for(destdir, identifier, f.get('name', ''))
                         if target_path.exists():
                             existing_bytes += target_path.stat().st_size
 
@@ -262,7 +265,7 @@ class ArchiveEngine(BaseEngine):
 
                     if file_info.get('status') == 'checksum_failed':
                         self.logger.error(f"[{identifier}] CORRUPTION DETECTED: Checksum mismatch on {file_name}. Purging block.")
-                        corrupted_path = Path(destdir) / identifier / file_name
+                        corrupted_path = local_path_for(destdir, identifier, file_name)
                         if corrupted_path.exists():
                             corrupted_path.unlink()
                         raise ProtocolError(f"Checksum validation failed for {file_name}")

@@ -34,6 +34,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 
+from .os_utils import local_path_for
+
 try:  # optional; PDF body extraction degrades gracefully without it
     from pypdf import PdfReader
 except Exception:  # pragma: no cover - optional dependency
@@ -404,7 +406,11 @@ class ArchiveIndex:
                     file_name = _scalar(file_info.get("name"))
                     if not file_name:
                         continue
-                    local = dest / identifier / file_name
+                    # Same path builder the downloader uses. Constructing this
+                    # independently meant any sanitised name was indexed at a
+                    # path that did not exist, so the search result's /read
+                    # link 404'd.
+                    local = local_path_for(dest, identifier, file_name)
                     try:
                         rel_path = local.resolve().relative_to(self.root.resolve()).as_posix()
                     except Exception:
