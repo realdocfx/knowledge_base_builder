@@ -1025,19 +1025,35 @@ FTS_OVERLAY = """
         panel.style.cssText = 'position:fixed; top:' + rect.bottom + 'px; left:' + rect.left + 'px; min-width:' + rect.width + 'px; max-width:600px; background:#ffffff; color:#000000; border:1px solid #cbd5e1; border-radius:0.5rem; box-shadow:0 10px 15px -3px rgba(0,0,0,0.3); z-index:100000; overflow:hidden;';
 
         var html = '';
+        function ftsEsc(v) {
+            /* ZIM-controlled paths and titles land in BOTH attribute and text
+               context here, so quotes must be neutralised as well as angle
+               brackets: the previous code escaped '<' only, leaving a quote free
+               to close the href and attach its own event handler. Quote
+               characters are produced via fromCharCode so no literal quote
+               appears in this JS -- it is embedded in a Python string, where a
+               stray quote is precisely what gets mangled. */
+            var out = String(v == null ? '' : v);
+            out = out.split('&').join('&amp;');
+            out = out.split(String.fromCharCode(34)).join('&quot;');
+            out = out.split(String.fromCharCode(39)).join('&#39;');
+            out = out.split('<').join('&lt;');
+            out = out.split('>').join('&gt;');
+            return out;
+        }
         if (message) {
-            html = '<div style="padding:0.75rem 1rem;">' + message.split('<').join('&lt;') + '</div>';
+            html = '<div style="padding:0.75rem 1rem;">' + ftsEsc(message) + '</div>';
         } else if (!results || results.length === 0) {
             html = '<div style="padding:0.75rem 1rem;">No results found.</div>';
         } else {
             html = '<ul style="list-style:none; margin:0; padding:0; max-height:60vh; overflow:auto;">';
             for (var i = 0; i < results.length; i++) {
                 var r = results[i];
-                var title = (r.title || r.url || 'Untitled').split('<').join('&lt;');
+                var title = ftsEsc(r.title || r.url || 'Untitled');
                 var href = buildViewerUrl(r.url);
-                html += '<li><a href="' + href + '" style="display:block; padding:0.5rem 0.75rem; text-decoration:none; color:#2563eb; border-bottom:1px solid #e2e8f0;" onmouseover=\'this.style.background="#f1f5f9"\' onmouseout=\'this.style.background="transparent"\'>' +
+                html += '<li><a href="' + ftsEsc(href) + '" style="display:block; padding:0.5rem 0.75rem; text-decoration:none; color:#2563eb; border-bottom:1px solid #e2e8f0;" onmouseover=\'this.style.background="#f1f5f9"\' onmouseout=\'this.style.background="transparent"\'>' +
                         '<div style="font-weight:bold; color:#0f172a;">' + title + '</div>' +
-                        (r.score !== undefined ? '<div style="font-size:0.75rem; color:#64748b;">score: ' + r.score + '</div>' : '') +
+                        (r.score !== undefined ? '<div style="font-size:0.75rem; color:#64748b;">score: ' + ftsEsc(r.score) + '</div>' : '') +
                         '</a></li>';
             }
             html += '</ul>';
@@ -1785,7 +1801,7 @@ async function search() {
         <td class="mono">${escHtml(r.identifier)}</td>
         <td>${escHtml(r.title || '')}</td>
         <td class="mono">${escHtml(r.size_formatted || r.size || '')}</td>
-        <td><button onclick="download('${source}', '${r.identifier}')">PULL</button></td>
+        <td><button class="btn small pull-btn" type="button" data-source="${escAttr(source)}" data-identifier="${escAttr(r.identifier)}">PULL</button></td>
       </tr>`;
     }
     out.innerHTML = html + '</table>';
@@ -1813,6 +1829,21 @@ async function estimate() {
 }
 
 function escHtml(s) { var d = document.createElement('div'); d.textContent = s == null ? '' : s; return d.innerHTML; }
+/* Attribute-context escaping. escHtml() is for TEXT nodes; a value going into an
+   attribute needs quotes neutralised too, or it simply closes the attribute. */
+function escAttr(s) {
+  /* Quote characters are written as "/' rather than appearing literally.
+     This JS lives inside a Python string, where a stray quote is exactly what
+     Python's escape processing mangles -- twice already this session. split/join
+     also avoids regex literals containing quotes. */
+  var out = String(s == null ? '' : s);
+  out = out.split('&').join('&amp;');
+  out = out.split(String.fromCharCode(34)).join('&quot;');
+  out = out.split(String.fromCharCode(39)).join('&#39;');
+  out = out.split('<').join('&lt;');
+  out = out.split('>').join('&gt;');
+  return out;
+}
 async function searchLocal() {
   var q = document.getElementById('local-query').value.trim();
   var limit = document.getElementById('local-limit').value;
@@ -1831,7 +1862,7 @@ async function searchLocal() {
       var read = '/read?path=' + encodeURIComponent(r.rel_path || '');
       var snip = r.snippet ? '<div class="mono muted" style="font-size:.72rem;margin-top:2px;">' + escHtml(r.snippet) + '</div>' : '';
       return '<div style="padding:7px 0;border-bottom:1px solid var(--mid);">' +
-        '<a href="' + read + '" onclick="openView(this.href);return false;"><strong>' +
+        '<a href="' + escAttr(read) + '" onclick="openView(this.href);return false;"><strong>' +
         escHtml(r.title || r.file_name) + '</strong></a> ' +
         '<span class="mono muted" style="font-size:.72rem;">' + escHtml(r.file_name) +
         (r.format ? ' · ' + escHtml(r.format) : '') + '</span>' + snip + '</div>';
@@ -1871,6 +1902,16 @@ async function rebuildIndex() {
   try { await fetch('/api/index/rebuild', { method: 'POST' }); } catch (e) {}
   setTimeout(refreshIndexStatus, 400);
 }
+
+/* Delegated: the identifier reaches download() as DATA via dataset, never as
+   part of a generated script string. This is what closes D5 structurally -- more
+   escaping would still leave a value inside executable text. */
+document.addEventListener('click', function (e) {
+  var btn = e.target && e.target.closest ? e.target.closest('.pull-btn') : null;
+  if (!btn) return;
+  e.preventDefault();
+  download(btn.dataset.source, btn.dataset.identifier);
+});
 
 async function download(source, identifier) {
   const res = await fetch('/api/download', {

@@ -95,10 +95,17 @@ def test_no_literal_newline_inside_js_string_literal():
     """
     offenders = []
     for attr, idx, source in _script_blocks():
-        for lineno, line in enumerate(source.splitlines(), 1):
+        # Strip comments FIRST. Prose legitimately contains apostrophes ("Python's")
+        # and a /* */ block's continuation lines need not start with '*', so scanning
+        # raw lines reports the comment rather than the code. Same lesson as the
+        # other guards in this suite: judge code, not the prose describing it.
+        code = re.sub(r"/\*.*?\*/", "", source, flags=re.S)
+        code = re.sub(r"//[^\n]*", "", code)
+        for lineno, line in enumerate(code.splitlines(), 1):
             # An odd number of unescaped single quotes means a string literal is
-            # still open when the line ends.
+            # still open when the line ends. Character-code helpers are used in the
+            # source precisely so a quote never appears as data.
             unescaped = re.sub(r"\\'", "", line)
-            if unescaped.count("'") % 2 == 1 and not unescaped.lstrip().startswith(("//", "*", "/*")):
+            if unescaped.count("'") % 2 == 1:
                 offenders.append(f"{attr}[{idx}] line {lineno}: {line.strip()[:90]}")
     assert not offenders, "unterminated JS string literal(s):\n" + "\n".join(offenders)
