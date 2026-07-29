@@ -372,12 +372,21 @@ jobs:
           # virtio-vga gives the guest a DRM node. cage is a DRM compositor, so
           # without one it exits instantly -- the runner has no GPU, but virtio-gpu
           # is a real DRM device to the guest regardless of the host display.
+          #
+          # The input devices are just as necessary, which is not obvious: wlroots
+          # aborts with "libinput initialization failed, no input devices" and cage
+          # exits, even though nothing types during the test. DRM was present and
+          # working when this first failed, so the symptom is indistinguishable
+          # from a GPU problem. This invocation has to stay in step with the
+          # generated launchers -- a CI boot that differs from the field boot
+          # proves nothing about the field.
           timeout 420 qemu-system-x86_64 \
             -M q35 -m 3072 -smp 2 -no-reboot \
             -kernel vmlinuz-kbb -initrd initramfs-kbb \
             -drive file=kbb_guest.img,format=raw,if=virtio \
             -append "root=/dev/vda rootfstype=ext4 rw console=ttyS0 kbb_mode=qemu" \
             -device virtio-vga \
+            -device virtio-keyboard-pci -device virtio-tablet-pci \
             -display none -serial stdio \
             2>&1 | tee boot.log || true
           echo "--- tail ---"; tail -60 boot.log

@@ -152,3 +152,20 @@ def test_the_ui_is_told_where_the_portal_is(overlay):
         "the kiosk never exports KBB_PORTAL_URL, so the Tauri window has no "
         "address to load"
     )
+
+
+def test_guest_has_input_devices(launchers):
+    """wlroots refuses to start with no input devices, so cage never comes up.
+
+    This is not defensive: the CI boot failed on exactly this with a DRM node
+    present and working. The compositor aborts with "libinput initialization
+    failed, no input devices" and exits, which looks identical to a GPU problem
+    from the outside.
+    """
+    for name, body in launchers.items():
+        assert "keyboard" in body, (
+            f"{name} attaches no keyboard device; wlroots aborts and cage exits"
+        )
+        assert "tablet" in body or "mouse" in body, (
+            f"{name} attaches no pointer device"
+        )
