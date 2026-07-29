@@ -21,6 +21,8 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
+
+from . import audit
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
 
 # Top-level entries that make up the bootable runtime (no downloaded content).
@@ -269,6 +271,13 @@ def clone(
         # folded out of the WAL.
         _checkpoint_sqlite_wal(src / ".kb_state")
 
+        audit.record(
+            src,
+            audit.Event.CLONE_START,
+            target=str(dst),
+            detail={"mode": mode},
+        )
+
         files = list(_iter_files(src, mode))
         total_bytes = 0
         for f, _ in files:
@@ -340,6 +349,19 @@ def clone(
         with _STATUS_LOCK:
             failures = list(_STATUS.get("skipped") or [])
         if failures:
+            audit.record(
+                src,
+                audit.Event.CLONE_COMPLETE,
+                target=str(dst),
+                outcome="failure",
+                detail={
+                    "mode": mode,
+                    "bytes": state["done"],
+                    "files": done_files,
+                    "skipped": len(failures),
+                    "first_failure": failures[0],
+                },
+            )
             _set(
                 state="error",
                 done_bytes=state["done"],
@@ -351,6 +373,12 @@ def clone(
                 ),
             )
         else:
+            audit.record(
+                src,
+                audit.Event.CLONE_COMPLETE,
+                target=str(dst),
+                detail={"mode": mode, "bytes": state["done"], "files": done_files},
+            )
             _set(state="done", done_bytes=state["done"], current="", finished=time.time())
     except Exception as exc:  # noqa: BLE001 - report to the UI, never crash the thread
         _set(state="error", error=str(exc))

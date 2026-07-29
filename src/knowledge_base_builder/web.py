@@ -40,7 +40,7 @@ except ImportError:  # pragma: no cover - optional FTS dependency
     xapian = None  # type: ignore
 
 from .archive_index import ArchiveIndex
-from . import cloning
+from . import audit, cloning
 from .buckets.usb import UsbBucket
 from .presentation import _physical_zim_path, discover_archives
 
@@ -786,6 +786,30 @@ def api_docs() -> str:
     return render_offline_swagger()
 
 
+@app.get("/api/audit/verify")
+def api_audit_verify(expected_head: str = Query("")) -> Dict[str, Any]:
+    """Re-derive the audit chain and report whether it is intact.
+
+    Exposed so an evaluator can check provenance without shell access. Pass
+    ``expected_head`` -- a value previously read from ``head`` and stored
+    elsewhere -- to also detect removal of the newest records, which a
+    self-contained chain cannot see.
+    """
+    if BUCKET is None:
+        raise HTTPException(status_code=503, detail="Bucket not initialized")
+    log = audit.for_root(BUCKET.root)
+    ok, problem = log.verify(expected_head or None)
+    entries = log.read_all()
+    return {
+        "intact": ok,
+        "problem": problem,
+        "records": len(entries),
+        "head": log.head(),
+        "first_ts": entries[0]["ts"] if entries else None,
+        "last_ts": entries[-1]["ts"] if entries else None,
+    }
+
+
 @app.get("/api/kiwix/status")
 async def api_kiwix_status() -> Dict[str, Any]:
     """ZIM engine boot state, so the reader attaches as soon as kiwix is ready."""
@@ -848,14 +872,33 @@ async def api_download(
     def run_job() -> None:
         JOBS[job_id]["status"] = "running"
         try:
+            audit.record(
+                target_path,
+                audit.Event.ACQUIRE_START,
+                target=str(target_path),
+                detail={"source": source, "identifier": identifier, "formats": formats},
+            )
             engine = _make_engine(source)
             if source == "ia":
                 result = engine.pull(identifier, str(target_path), formats=formats)
             else:
                 result = engine.pull(identifier, str(target_path))
+            audit.record(
+                target_path,
+                audit.Event.ACQUIRE_COMPLETE,
+                target=str(target_path),
+                detail={"source": source, "identifier": identifier},
+            )
             JOBS[job_id]["status"] = "completed"
             JOBS[job_id]["result"] = result
         except Exception as exc:
+            audit.record(
+                target_path,
+                audit.Event.ACQUIRE_COMPLETE,
+                target=str(target_path),
+                outcome="failure",
+                detail={"source": source, "identifier": identifier, "error": str(exc)},
+            )
             JOBS[job_id]["status"] = "failed"
             JOBS[job_id]["error"] = str(exc)
 
@@ -2661,6 +2704,16 @@ async def read_document(
         raise HTTPException(status_code=403, detail="Forbidden")
     if not target.exists() or not target.is_file():
         raise HTTPException(status_code=404, detail="File not found")
+
+    # AU-2: reading collected material is an auditable event. Recorded on the
+    # content plane even though it carries no credential -- the question an
+    # investigator asks is "what was opened", not "who authenticated".
+    audit.record(
+        root,
+        audit.Event.READ,
+        target=str(target.relative_to(root)),
+        detail={"bytes": target.stat().st_size},
+    )
 
     rel = target.relative_to(root).as_posix()
     ext = target.suffix.lower()
