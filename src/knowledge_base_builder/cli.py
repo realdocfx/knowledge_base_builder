@@ -89,7 +89,15 @@ GRUB_EFI_APK_VERSION = f"{ALPINE_ARCH}-2.12-r5"
 # Where the guest resolves packages from. The stick is mounted read-only at
 # /media/kbb inside the guest, so this is a path, never a URL: once provisioned,
 # the sandbox boots with no network at all.
-OFFLINE_APK_DIR = "/media/kbb/boot/apks"
+#
+# The location is Alpine's own convention (`<media>/apks/<arch>` beside a
+# `.boot_repository` marker), not a KBB invention. That matters for more than
+# tidiness: Alpine's initramfs identifies boot media by *finding that marker*.
+# An earlier layout put the cache at /boot/apks, and the medium was rejected --
+# "Mounting boot media: failed", then an emergency shell. Following the
+# convention makes the same directory serve both purposes.
+OFFLINE_APK_DIR = "/media/kbb/apks"
+BOOT_REPOSITORY_MARKER = ".boot_repository"
 
 # The dependency closure `apk fetch --recursive` must mirror for the guest to
 # install its head offline. Anything absent here means a boot that stalls without
