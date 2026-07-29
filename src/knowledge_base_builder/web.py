@@ -93,6 +93,71 @@ _INLINE_SAFE_EXT = {
 }
 
 
+# The content plane serves two populations, and which one a route belongs to must
+# be decided by the ROUTE, with the safe answer as the default. N2 existed because
+# the permissive policy was the default and safety was opt-in: /epubres was added
+# without a policy of its own and silently inherited script execution for
+# untrusted book markup. Fail-safe defaults, in the Saltzer & Schroeder sense.
+#
+# Default -- untrusted bytes. `sandbox` without allow-scripts blocks execution AND
+# makes the origin opaque, so a payload cannot read the drive through same-origin
+# frames even though frame-src permits them.
+CONTENT_DEFAULT_CSP = (
+    "sandbox; default-src 'none'; img-src 'self' data: blob:; "
+    "media-src 'self' blob:; style-src 'unsafe-inline'; font-src 'self' data:; "
+    "frame-ancestors http://127.0.0.1:* http://localhost:*"
+)
+
+# Opt-out -- KBB's OWN generated pages (the /files listing, the /read shell). These
+# are our markup and need their stylesheet, their theming script and one inner
+# frame for the document being read. Routes must request this explicitly.
+CONTENT_TRUSTED_CSP = (
+    "default-src 'none'; "
+    "script-src 'self' 'unsafe-inline'; "
+    "style-src 'self' 'unsafe-inline'; "
+    "img-src 'self' data: blob:; "
+    "media-src 'self' blob:; "
+    "font-src 'self' data:; "
+    "frame-src 'self'; "
+    "object-src 'none'; "
+    "base-uri 'none'; "
+    "form-action 'none'; "
+    "frame-ancestors http://127.0.0.1:* http://localhost:*"
+)
+
+
+# Opt-out -- proxied KIWIX content (the /wiki/* reverse proxy). This is a THIRD
+# population: not raw bytes (sandbox kills it), not KBB-generated (it needs
+# connect-src for search XHR and form-action for the search form). Kiwix is a
+# known web application serving curated ZIM content through the origin-isolated
+# content plane -- no session cookies reach here, connect-src 'self' prevents
+# exfiltration, and frame-ancestors locks embedding to the console.
+CONTENT_WIKI_CSP = (
+    "default-src 'none'; "
+    "script-src 'self' 'unsafe-inline'; "
+    "style-src 'self' 'unsafe-inline'; "
+    "img-src 'self' data: blob:; "
+    "media-src 'self' blob:; "
+    "font-src 'self' data:; "
+    "connect-src 'self'; "
+    "form-action 'self'; "
+    "frame-src 'self'; "
+    "object-src 'none'; "
+    "base-uri 'none'; "
+    "frame-ancestors http://127.0.0.1:* http://localhost:*"
+)
+
+
+def trusted_page_headers() -> dict:
+    """Headers for a KBB-generated page on the content plane (explicit opt-out)."""
+    return {"Content-Security-Policy": CONTENT_TRUSTED_CSP}
+
+
+def wiki_page_headers() -> dict:
+    """Headers for proxied kiwix content on the content plane (explicit opt-out)."""
+    return {"Content-Security-Policy": CONTENT_WIKI_CSP}
+
+
 def build_content_origin(port: int) -> str:
     """Origin for the content plane. Uses localhost, NOT 127.0.0.1 -- see above."""
     return f"http://localhost:{port}"
@@ -127,20 +192,10 @@ async def harden_content_responses(request: Request, call_next):
     # sandbox. Handlers that need the stricter policy set it themselves, and this
     # default is not allowed to overwrite it.
     if "content-security-policy" not in response.headers:
-        response.headers["Content-Security-Policy"] = (
-            "default-src 'none'; "
-            "script-src 'self' 'unsafe-inline'; "
-            "style-src 'self' 'unsafe-inline'; "
-            "img-src 'self' data: blob:; "
-            "media-src 'self' blob:; "
-            "font-src 'self' data:; "
-            "frame-src 'self'; "
-            "object-src 'none'; "
-            "base-uri 'none'; "
-            "form-action 'none'; "
-            # Only the console may frame this plane.
-            "frame-ancestors http://127.0.0.1:* http://localhost:*"
-        )
+        # Safe by default. A route that needs script must ask for
+        # CONTENT_TRUSTED_CSP by name, which makes the decision visible at the
+        # route rather than implicit in the middleware.
+        response.headers["Content-Security-Policy"] = CONTENT_DEFAULT_CSP
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["Referrer-Policy"] = "no-referrer"
     response.headers["Cache-Control"] = "no-store"
@@ -1125,6 +1180,7 @@ async def wiki_proxy(request: Request, path: str) -> Response:
                 for k, v in forward_headers.items()
                 if k.lower() not in ("content-length", "content-encoding")
             }
+            html_headers.update(wiki_page_headers())
                 
             return Response(
                 text, 
@@ -1142,6 +1198,7 @@ async def wiki_proxy(request: Request, path: str) -> Response:
         finally:
             await response.aclose()
 
+    forward_headers.update(wiki_page_headers())
     return StreamingResponse(
         iter_body(),
         status_code=response.status_code,
@@ -1171,7 +1228,7 @@ async def static_files(path: str) -> Any:
     if not target.exists():
         raise HTTPException(status_code=404, detail="File not found")
     if target.is_dir():
-        return HTMLResponse(_render_library_listing(path, target, root))
+        return HTMLResponse(_render_library_listing(path, target, root), headers=trusted_page_headers())
     # Active content (.html/.svg/...) must never render as a document, even on the
     # sandboxed content origin: forcing a download removes the question entirely.
     disposition = content_disposition_for(target.name)
@@ -1613,7 +1670,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <span class="mono ok-text" id="engineStatus">Status: ZIM Engine Active | Mode: 1:1 Interactivity</span>
         <a href="{{WIKI_ENTRY_URL}}" id="wikiFsToggle" onclick="toggleWikiFullscreen();return false;">[ Expand to Fullscreen ]</a>
       </div>
-      <iframe id="wiki-frame" src="{{WIKI_ENTRY_URL}}" title="ZIM Reader" onload="wikiLoaded()"></iframe>
+      <iframe id="wiki-frame" src="{{WIKI_ENTRY_URL}}" title="ZIM Reader" onload="if(typeof wikiLoaded==='function')wikiLoaded()"></iframe>
       <div class="frame-loader" id="wikiLoader"><div class="spinner"></div><span class="mono">Loading ZIM reader&hellip;</span></div>
     </div>
 
@@ -1864,8 +1921,15 @@ async function loadDrives() {
       return;
     }
     sel.innerHTML = drives.map(function (d) {
-      return '<option value="' + d.path + '">' + d.path + ' — ' + d.type +
-             ', ' + fmtGB(d.free) + ' free / ' + fmtGB(d.total) + '</option>';
+      /* Drive paths are FILESYSTEM-derived, not ours: on POSIX /api/drives
+         enumerates directory names under /media, /run/media, /mnt and /Volumes,
+         which an unprivileged local process can create. A volume named
+         '"><svg onload=...>' would otherwise become script on the credentialed
+         origin, with the session cookie in scope. Same class as the D5 fix; this
+         sink was simply not swept by it. */
+      return '<option value="' + escAttr(d.path) + '">' + escHtml(d.path) +
+             ' — ' + escHtml(d.type) + ', ' + fmtGB(d.free) + ' free / ' +
+             fmtGB(d.total) + '</option>';
     }).join('');
   } catch (e) {
     sel.innerHTML = '<option value="">Error listing drives</option>';
@@ -1983,7 +2047,11 @@ async function loadStats() {
     let html = '';
     for (const t of tiles) {
       const v = (t[1] === undefined || t[1] === null) ? '—' : t[1];
-      html += '<div class="metric"><div class="metric-k">' + t[0] + '</div><div class="metric-n">' + v + '</div></div>';
+      /* stats.bucket_path is a filesystem path chosen at launch, so it is not
+         under this page's control either. Escaped for the same reason as the drive
+         list: telemetry is data, and data must never reach markup unescaped. */
+      html += '<div class="metric"><div class="metric-k">' + escHtml(t[0]) +
+              '</div><div class="metric-n">' + escHtml(v) + '</div></div>';
     }
     document.getElementById('stats').innerHTML = html;
   } catch (e) {
@@ -2004,13 +2072,13 @@ var _statsRetries = 0;
    "Executing search algorithm...". */
 function _remoteBusy(out, verb, t0) {
   return setInterval(function () {
-    out.innerHTML = '<span class="mono">' + verb + ' remote catalog&hellip; ' +
-      Math.round((Date.now() - t0) / 1000) + 's elapsed (typically 20-30s)</span>';
+    out.innerHTML = '<span class="mono">' + escHtml(verb) + ' remote catalog&hellip; ' +
+      escHtml(String(Math.round((Date.now() - t0) / 1000))) + 's elapsed (typically 20-30s)</span>';
   }, 1000);
 }
 function _remoteFailed(out, t0, e) {
   out.innerHTML = '<span class="mono danger-text">QUERY FAILED after ' +
-    Math.round((Date.now() - t0) / 1000) + 's: ' + escHtml(e && e.message ? e.message : String(e)) +
+    escHtml(String(Math.round((Date.now() - t0) / 1000))) + 's: ' + escHtml(e && e.message ? e.message : String(e)) +
     '. RECOVERY: check the query syntax and network reachability, then retry.</span>';
 }
 
@@ -2782,7 +2850,7 @@ async def read_document(
             "<h1>" + esc_name + "</h1>" + toolbar()
             + '<iframe class="doc-frame" src="' + file_url + '#view=FitH" title="' + esc_name + '"></iframe>'
         )
-        return HTMLResponse(_themed_page(name, body, back_href, back_label))
+        return HTMLResponse(_themed_page(name, body, back_href, back_label), headers=trusted_page_headers())
 
     if ext in _IMAGE_EXT:
         body = (
@@ -2790,14 +2858,14 @@ async def read_document(
             + '<div class="card panel-inset"><img class="doc-media" src="' + file_url
             + '" alt="' + esc_name + '"></div>'
         )
-        return HTMLResponse(_themed_page(name, body, back_href, back_label))
+        return HTMLResponse(_themed_page(name, body, back_href, back_label), headers=trusted_page_headers())
 
     if ext in _HTML_EXT:
         body = (
             "<h1>" + esc_name + "</h1>" + toolbar()
             + '<iframe class="doc-frame" src="' + file_url + '" title="' + esc_name + '"></iframe>'
         )
-        return HTMLResponse(_themed_page(name, body, back_href, back_label))
+        return HTMLResponse(_themed_page(name, body, back_href, back_label), headers=trusted_page_headers())
 
     if ext in _TEXT_EXT:
         try:
@@ -2810,7 +2878,7 @@ async def read_document(
             "<h1>" + esc_name + "</h1>" + toolbar()
             + '<pre class="doc-text">' + html.escape(raw) + "</pre>"
         )
-        return HTMLResponse(_themed_page(name, body, back_href, back_label))
+        return HTMLResponse(_themed_page(name, body, back_href, back_label), headers=trusted_page_headers())
 
     if ext == ".epub":
         book_title, chapters = _epub_spine(target)
@@ -2820,7 +2888,7 @@ async def read_document(
                 + '<div class="card"><p class="mono">This EPUB could not be parsed for inline reading. '
                 'Use <a href="' + file_url + '" download>Download raw</a> to open it in a dedicated reader.</p></div>'
             )
-            return HTMLResponse(_themed_page(book_title, body, back_href, back_label))
+            return HTMLResponse(_themed_page(book_title, body, back_href, back_label), headers=trusted_page_headers())
         idx = i if i < len(chapters) else 0
         cur_title, cur_href = chapters[idx]
         chapter_src = (
@@ -2845,7 +2913,7 @@ async def read_document(
             + " / " + str(len(chapters)) + " &middot; " + html.escape(cur_title) + "</div>"
             + '<iframe class="doc-frame" src="' + chapter_src + '" title="' + html.escape(cur_title) + '"></iframe>'
         )
-        return HTMLResponse(_themed_page(book_title, body, back_href, back_label))
+        return HTMLResponse(_themed_page(book_title, body, back_href, back_label), headers=trusted_page_headers())
 
     body = (
         "<h1>" + esc_name + "</h1>"
@@ -2853,7 +2921,7 @@ async def read_document(
         + "</code> files. "
         '<a class="btn" href="' + file_url + '" download>Download raw</a></p></div>'
     )
-    return HTMLResponse(_themed_page(name, body, back_href, back_label))
+    return HTMLResponse(_themed_page(name, body, back_href, back_label), headers=trusted_page_headers())
 
 
 @content_app.get(

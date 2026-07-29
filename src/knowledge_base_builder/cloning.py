@@ -34,6 +34,12 @@ _RUNTIME_ITEMS = (
     "Start-KBB.sh",
     "Install-PortableRust.bat",
     "Portable-Rust-Shell.bat",
+    # Tri-modal tactical deployment infrastructure (Modes A & C).
+    "EFI",
+    "boot",
+    "qemu",
+    "start_sandbox.bat",
+    "start_sandbox.sh",
 )
 # Never copied (live-locked on the source and regenerated on the target).
 # Never copied: SQLite's WAL sidecars are live-locked by the running portal and

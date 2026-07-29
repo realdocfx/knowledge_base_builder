@@ -1,6 +1,7 @@
 from typing import Generator, List, Optional, Dict, Any
 from internetarchive.session import ArchiveSession
 import logging
+import random
 import time
 import shutil
 from pathlib import Path
@@ -27,6 +28,11 @@ __all__ = [
 
 # Format mapping for macros that expand to multiple IA format strings
 # Ordered from best to worst quality for prioritization
+# Upper bound on any server-demanded cooldown. 300 s is the conventional
+# ceiling; beyond it a mirror is unhealthy rather than merely busy, and the
+# operator is better served by an error than by an invisible multi-hour sleep.
+MAX_RETRY_AFTER_SECONDS = 300
+
 FORMAT_MAP = {
     "readable": [
         "Text PDF",
@@ -309,13 +315,30 @@ class ArchiveEngine(BaseEngine):
                     download_stats['errors'].append(f"Network Failure: {str(net_err)}")
                     break
 
-                wait_time = backoff_factor ** attempt
+                # Jitter: a bare backoff_factor ** attempt is deterministic, so N
+                # concurrent instances retry in lockstep and re-collide on every
+                # round. Full jitter spreads them.
+                wait_time = (backoff_factor ** attempt) * (0.5 + random.random())
                 if hasattr(net_err, 'response') and net_err.response is not None:
                     if net_err.response.status_code == 429:
                         retry_after = net_err.response.headers.get("Retry-After")
                         if retry_after and retry_after.isdigit():
-                            wait_time = int(retry_after)
-                            self.logger.warning(f"[{identifier}] HTTP 429: Server demands exact {wait_time}s cooldown.")
+                            demanded = int(retry_after)
+                            # Clamp: an unbounded Retry-After is a denial of service
+                            # handed to any mirror. "Retry-After: 86400000" would
+                            # park the process in an uninterruptible sleep for a
+                            # millennium, indistinguishable from a hang.
+                            wait_time = min(demanded, MAX_RETRY_AFTER_SECONDS)
+                            if demanded > MAX_RETRY_AFTER_SECONDS:
+                                self.logger.warning(
+                                    f"[{identifier}] HTTP 429 demanded {demanded}s; "
+                                    f"clamped to {wait_time}s. A cooldown this long is "
+                                    "not a rate limit -- treat the mirror as unhealthy."
+                                )
+                            else:
+                                self.logger.warning(
+                                    f"[{identifier}] HTTP 429: honouring {wait_time}s cooldown."
+                                )
 
                 self.logger.warning(f"[{identifier}] Tactical retreat. Backing off for {wait_time} seconds before retry...")
                 time.sleep(wait_time)

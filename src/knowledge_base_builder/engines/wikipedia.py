@@ -36,7 +36,10 @@ class WikipediaEngine(BaseEngine):
     def _authenticate(self, username: str, password: str) -> str:
         """Acquire JWT for Wikimedia Enterprise API authorization."""
         payload = {"username": username, "password": password}
-        response = requests.post(self.AUTH_URL, json=payload)
+        # (connect, read) timeouts: without them a black-holed connection hangs
+        # the CLI indefinitely with no output and no way to distinguish it from a
+        # slow network.
+        response = requests.post(self.AUTH_URL, json=payload, timeout=(15, 60))
         response.raise_for_status()
         data = response.json()
         token = data.get("access_token") or data.get("token")

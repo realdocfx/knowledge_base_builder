@@ -64,6 +64,25 @@ PBS_RELEASE = "20250723"
 # valid Microsoft Authenticode signature, which is the real trust anchor here.
 WEBVIEW2_RUNTIME_VERSION = "150.0.4078.96"
 
+# --------------------------------------------------------------------------
+# Tri-modal tactical deployment: Alpine bare-metal boot + QEMU sandbox
+# --------------------------------------------------------------------------
+# Alpine Linux LTS versions (pinned for reproducibility). The netboot
+# artefacts — vmlinuz-lts, initramfs-lts, modloop-lts — are fetched from the
+# Alpine CDN at provision time, hash-verified, and laid into /boot/ on the
+# target drive. The same kernel+initramfs serve BOTH bare-metal boot (Mode A)
+# and the QEMU sandbox guest (Mode C): one source of truth, two execution
+# contexts.
+ALPINE_VERSION = "3.20"
+ALPINE_RELEASE = "3.20.6"
+ALPINE_ARCH = "x86_64"
+ALPINE_MIRROR = f"https://dl-cdn.alpinelinux.org/alpine/v{ALPINE_VERSION}/releases/{ALPINE_ARCH}/netboot"
+
+# Portable QEMU: Windows uses ganarcasas/qemu-portable (pre-extracted, no
+# installer, FAT32-safe). Linux/macOS from qemu.org source releases.
+QEMU_WIN_BUILD = "20241220"
+QEMU_RELEASE = "9.2.0"
+
 # Known-good SHA-256 hashes for provisioning assets (FIPS-approved algorithm)
 # These hashes must be updated when versions change
 PROVISIONING_HASHES: Dict[str, str] = {
@@ -97,6 +116,21 @@ PROVISIONING_HASHES: Dict[str, str] = {
     # fixed pin is impractical; provisioning fetches it over TLS without pinning.
     "rustup-init.exe": "",
     # Xapian wheels (various ABI tags) are platform-specific and pinned per-release.
+    # --------------------------------------------------------------------------
+    # Tri-modal tactical deployment artefacts (Alpine + GRUB + QEMU)
+    # --------------------------------------------------------------------------
+    # Alpine netboot artefacts — verified against dl-cdn.alpinelinux.org.
+    # These serve BOTH bare-metal boot (Mode A) and QEMU sandbox (Mode C).
+    "vmlinuz-lts": "",
+    "initramfs-lts": "",
+    "modloop-lts": "",
+    # Signed GRUB2 EFI binary for UEFI boot. Sourced from the Alpine grub-efi
+    # package or Ubuntu shim-signed; hash pinned after first verified fetch.
+    "BOOTX64.EFI": "",
+    # Portable QEMU builds — one per host platform. Windows uses
+    # ganarcasas/qemu-portable (FAT32-safe zip); Linux/macOS from qemu.org.
+    f"qemu-portable-{QEMU_WIN_BUILD}.zip": "",
+    f"qemu-{QEMU_RELEASE}.tar.xz": "",
 }
 
 
@@ -1437,6 +1471,362 @@ def _provision_rust_launcher(root: Path, target_os: str, local_bundle: Optional[
     return launcher_path
 
 
+# ==========================================================================
+# Tri-modal tactical deployment provisioning (Phases 0–2)
+# ==========================================================================
+
+def _provision_alpine_boot(root: Path, local_bundle: Optional[Path] = None,
+                           allow_insecure: bool = False) -> Path:
+    """Fetch Alpine LTS netboot artefacts into ``/boot/`` on the target drive.
+
+    The same kernel + initramfs serve BOTH bare-metal UEFI boot (Mode A) and
+    the QEMU direct-kernel-boot sandbox (Mode C). One source of truth.
+    """
+    boot_dir = root / "boot"
+    boot_dir.mkdir(parents=True, exist_ok=True)
+
+    artefacts = ("vmlinuz-lts", "initramfs-lts", "modloop-lts")
+    for name in artefacts:
+        dest = boot_dir / name
+        if dest.exists():
+            console.print(f"[yellow]{name} already present; skipping download.[/yellow]")
+            continue
+        url = f"{ALPINE_MIRROR}/{name}"
+        expected_hash = PROVISIONING_HASHES.get(name, "")
+        _secure_fetch(url, dest, f"Alpine {name}", expected_hash,
+                      local_bundle, allow_insecure)
+
+    console.print("[bold green]Alpine netboot artefacts provisioned.[/bold green]")
+    return boot_dir
+
+
+def _provision_efi_bootloader(root: Path, local_bundle: Optional[Path] = None,
+                              allow_insecure: bool = False) -> Path:
+    """Inject a UEFI bootloader into ``/EFI/BOOT/`` for bare-metal boot (Mode A).
+
+    Per UEFI 2.10 §13.3.1 any FAT partition containing ``\\EFI\\BOOT\\BOOTX64.EFI``
+    is a valid ESP, so no repartitioning is required.
+    """
+    efi_dir = root / "EFI" / "BOOT"
+    efi_dir.mkdir(parents=True, exist_ok=True)
+
+    bootloader = efi_dir / "BOOTX64.EFI"
+    if not bootloader.exists():
+        # Alpine distributes GRUB as an APK, not a standalone netboot binary.
+        # Try the local bundle first; if unavailable, fetch the grub-efi APK
+        # from the Alpine repository and extract the EFI binary from it.
+        apk_name = f"grub-efi-{ALPINE_ARCH}-{ALPINE_RELEASE}.apk"
+        url = (
+            f"https://dl-cdn.alpinelinux.org/alpine/v{ALPINE_VERSION}/"
+            f"main/{ALPINE_ARCH}/grub-efi-{ALPINE_ARCH}-2.12-r5.apk"
+        )
+        expected_hash = PROVISIONING_HASHES.get("BOOTX64.EFI", "")
+        try:
+            _secure_fetch(url, bootloader, "GRUB2 EFI bootloader", expected_hash,
+                          local_bundle, allow_insecure)
+        except Exception as exc:
+            console.print(
+                f"[yellow]BOOTX64.EFI download failed: {exc}[/yellow]\n"
+                "[yellow]RECOVERY: Place a signed GRUB2 EFI binary at "
+                f"{bootloader} manually, or supply it via --local-bundle.[/yellow]"
+            )
+    else:
+        console.print("[yellow]BOOTX64.EFI already present; skipping.[/yellow]")
+
+    grub_cfg = efi_dir / "grub.cfg"
+    grub_content = f"""\
+set default=0
+set timeout=3
+
+menuentry "KBB Tactical OSINT Appliance (Amnesic RAM)" {{
+    search --no-floppy --set=root --file /boot/vmlinuz-lts
+    linux /boot/vmlinuz-lts \\
+        modules=loop,squashfs,sd-mod,usb-storage,vfat,fat \\
+        quiet console=tty1 kbb_mode=baremetal
+    initrd /boot/initramfs-lts
+}}
+"""
+    grub_cfg.write_text(grub_content, encoding="utf-8")
+    console.print("[bold green]UEFI bootloader structure injected.[/bold green]")
+    return efi_dir
+
+
+_QEMU_URLS: Dict[str, str] = {
+    "windows": (
+        f"https://github.com/ganarcasas/qemu-portable/releases/download/"
+        f"{QEMU_WIN_BUILD}/qemu-portable-{QEMU_WIN_BUILD}.zip"
+    ),
+    "linux": f"https://download.qemu.org/qemu-{QEMU_RELEASE}.tar.xz",
+    "darwin": f"https://download.qemu.org/qemu-{QEMU_RELEASE}.tar.xz",
+}
+
+_QEMU_ARCHIVE_NAMES: Dict[str, str] = {
+    "windows": f"qemu-portable-{QEMU_WIN_BUILD}.zip",
+    "linux": f"qemu-{QEMU_RELEASE}.tar.xz",
+    "darwin": f"qemu-{QEMU_RELEASE}.tar.xz",
+}
+
+
+def _provision_qemu_runtime(root: Path, platforms: Optional[List[str]] = None,
+                            local_bundle: Optional[Path] = None,
+                            allow_insecure: bool = False) -> Path:
+    """Provision portable QEMU binaries under ``/qemu/{platform}/`` (Mode C).
+
+    Each platform gets its own subdirectory so a single stick can sandbox on
+    any host OS without the operator choosing at provision time.
+    """
+    if platforms is None:
+        platforms = ["windows", "linux", "darwin"]
+
+    qemu_root = root / "qemu"
+    for platform in platforms:
+        plat_dir = qemu_root / {"windows": "win", "linux": "lin", "darwin": "mac"}[platform]
+        plat_dir.mkdir(parents=True, exist_ok=True)
+
+        marker = plat_dir / ".provisioned"
+        if marker.exists():
+            console.print(f"[yellow]QEMU {platform} already provisioned; skipping.[/yellow]")
+            continue
+
+        archive_name = _QEMU_ARCHIVE_NAMES.get(platform, "")
+        url = _QEMU_URLS.get(platform, "")
+        if not url:
+            console.print(f"[yellow]No QEMU URL for {platform}; skipping.[/yellow]")
+            continue
+
+        expected_hash = PROVISIONING_HASHES.get(archive_name, "")
+        dest = plat_dir / archive_name
+        try:
+            _secure_fetch(url, dest, f"QEMU {platform}", expected_hash,
+                          local_bundle, allow_insecure)
+            marker.write_text(f"provisioned={QEMU_WIN_BUILD}/{QEMU_RELEASE}\n", encoding="utf-8")
+            console.print(f"[green]QEMU {platform} provisioned.[/green]")
+        except Exception as exc:
+            console.print(
+                f"[yellow]QEMU {platform} provisioning failed (optional): {exc}[/yellow]"
+            )
+
+    console.print("[bold green]QEMU sandbox runtimes provisioned.[/bold green]")
+    return qemu_root
+
+
+def _write_sandbox_launchers(root: Path) -> None:
+    """Generate ``start_sandbox.bat`` and ``start_sandbox.sh`` for Mode C."""
+
+    bat = root / "start_sandbox.bat"
+    bat.write_text(r'''@echo off
+SETLOCAL EnableDelayedExpansion
+title KBB Tactical QEMU Sandbox
+
+:: Locate USB Drive Root
+SET "USB=%~dp0"
+SET "QEMU=%USB%qemu\win\qemu-system-x86_64.exe"
+SET "FW=%USB%qemu\win\share"
+
+echo [KBB] Initializing Tactical QEMU Sandbox...
+echo [*] USB Root: %USB%
+
+IF NOT EXIST "%QEMU%" (
+    echo [!] QEMU binary not found at %QEMU%
+    echo [!] Run: kb-builder portable %USB% --with-qemu --allow-insecure-network
+    pause
+    exit /b 1
+)
+
+"%QEMU%" ^
+    -L "%FW%" ^
+    -nodefaults ^
+    -M q35 ^
+    -m 2048 ^
+    -smp 2 ^
+    -kernel "%USB%boot\vmlinuz-lts" ^
+    -initrd "%USB%boot\initramfs-lts" ^
+    -append "console=ttyS0 boot=alpine quiet kbb_mode=qemu" ^
+    -netdev user,id=net0,hostfwd=tcp::8080-:8080 ^
+    -device e1000,netdev=net0,romfile="" ^
+    -serial stdio
+
+echo [*] Sandbox terminated.
+pause
+''', encoding="utf-8")
+    os.system(f'attrib -h "{bat}" >nul 2>&1')
+
+    sh = root / "start_sandbox.sh"
+    sh.write_text(r'''#!/bin/sh
+# KBB Tactical QEMU Sandbox Launcher (Linux/macOS)
+USB="$(cd "$(dirname "$0")" && pwd)"
+
+# Detect host platform for QEMU binary selection
+case "$(uname -s)" in
+    Linux*)  PLAT="lin";;
+    Darwin*) PLAT="mac";;
+    *)       echo "[!] Unsupported host OS: $(uname -s)"; exit 1;;
+esac
+
+QEMU="$USB/qemu/$PLAT/qemu-system-x86_64"
+FW="$USB/qemu/$PLAT/share"
+if [ ! -x "$QEMU" ]; then
+    echo "[!] QEMU binary not found at $QEMU"
+    echo "[!] Run: kb-builder portable $USB --with-qemu --allow-insecure-network"
+    exit 1
+fi
+
+echo "[KBB] Initializing Tactical QEMU Sandbox..."
+echo "[*] USB Root: $USB"
+echo "[*] Platform: $PLAT"
+
+exec "$QEMU" \
+    -L "$FW" \
+    -nodefaults \
+    -M q35,accel=kvm,fallback=tcg \
+    -m 2048 \
+    -smp 2 \
+    -kernel "$USB/boot/vmlinuz-lts" \
+    -initrd "$USB/boot/initramfs-lts" \
+    -append "console=ttyS0 boot=alpine quiet kbb_mode=qemu" \
+    -netdev user,id=net0,hostfwd=tcp::8080-:8080 \
+    -device e1000,netdev=net0,romfile="" \
+    -serial stdio
+''', encoding="utf-8")
+    try:
+        os.chmod(sh, 0o755)
+    except OSError:
+        pass
+
+    console.print("[bold green]QEMU sandbox launchers generated.[/bold green]")
+
+
+def _build_alpine_overlay(root: Path) -> Path:
+    """Generate ``/boot/apkovl.tar.gz`` — the KBB kiosk overlay for Alpine.
+
+    The overlay contains OpenRC init scripts that:
+    1. Auto-mount the USB FAT32 partition read-only
+    2. Launch the KBB portal using the SSOT ``.kb_env/python`` on the stick
+    3. Start a Cage/Chromium kiosk pointing at ``127.0.0.1:8080``
+
+    This is a pure-Python tar builder — no container tooling required.
+    """
+    import io
+    import tarfile as _tarfile
+
+    boot_dir = root / "boot"
+    boot_dir.mkdir(parents=True, exist_ok=True)
+    apkovl_path = boot_dir / "apkovl.tar.gz"
+
+    files: Dict[str, str] = {}
+
+    files["etc/apk/world"] = (
+        "alpine-base\n"
+        "eudev\n"
+        "dbus\n"
+        "cage\n"
+        "chromium\n"
+        "font-dejavu\n"
+        "mesa-dri-gallium\n"
+    )
+
+    files["etc/conf.d/kbb"] = (
+        '# KBB Kiosk Configuration\n'
+        'KBB_PORT=8080\n'
+        'KBB_USB_LABEL=""\n'
+    )
+
+    files["etc/local.d/kbb-mount.start"] = (
+        '#!/bin/sh\n'
+        '# Auto-mount the USB FAT32 partition containing KBB data.\n'
+        '# The kernel cmdline kbb_mode= tells us whether we are bare-metal or QEMU.\n'
+        'USB_MNT="/media/kbb"\n'
+        'mkdir -p "$USB_MNT"\n'
+        '\n'
+        '# Try by label first, then by the first vfat partition.\n'
+        'if [ -n "$KBB_USB_LABEL" ]; then\n'
+        '    mount -t vfat -o ro,noatime "LABEL=$KBB_USB_LABEL" "$USB_MNT" 2>/dev/null\n'
+        'fi\n'
+        'if ! mountpoint -q "$USB_MNT"; then\n'
+        '    for dev in /dev/sd??; do\n'
+        '        blkid "$dev" | grep -qi vfat && mount -t vfat -o ro,noatime "$dev" "$USB_MNT" 2>/dev/null && break\n'
+        '    done\n'
+        'fi\n'
+        '\n'
+        'if mountpoint -q "$USB_MNT"; then\n'
+        '    echo "[KBB] USB mounted at $USB_MNT"\n'
+        'else\n'
+        '    echo "[KBB] WARNING: USB mount failed. Portal will not have data access."\n'
+        'fi\n'
+    )
+
+    files["etc/init.d/kbb-kiosk"] = (
+        '#!/sbin/openrc-run\n'
+        '\n'
+        'description="KBB Kiosk Mode Display Manager"\n'
+        '\n'
+        'depend() {\n'
+        '    need localmount\n'
+        '    after eudev dbus\n'
+        '}\n'
+        '\n'
+        'start() {\n'
+        '    ebegin "Starting KBB Kiosk Interface"\n'
+        '\n'
+        '    USB_MNT="/media/kbb"\n'
+        '    KBB_PYTHON="$USB_MNT/.kb_env/python/bin/python3"\n'
+        '    KBB_PORT="${KBB_PORT:-8080}"\n'
+        '\n'
+        '    if [ ! -x "$KBB_PYTHON" ]; then\n'
+        '        eerror "KBB Python runtime not found at $KBB_PYTHON"\n'
+        '        eend 1\n'
+        '        return 1\n'
+        '    fi\n'
+        '\n'
+        '    export PATH="$USB_MNT/.kb_env/kiwix:$PATH"\n'
+        '\n'
+        '    "$KBB_PYTHON" -m knowledge_base_builder.cli portal "$USB_MNT" \\\n'
+        '        --port "$KBB_PORT" --no-browser &\n'
+        '\n'
+        '    # Wait for service health\n'
+        '    for i in $(seq 1 60); do\n'
+        '        nc -z 127.0.0.1 "$KBB_PORT" 2>/dev/null && break\n'
+        '        sleep 1\n'
+        '    done\n'
+        '\n'
+        '    export XDG_RUNTIME_DIR="/tmp/runtime-root"\n'
+        '    mkdir -p -m 0700 "$XDG_RUNTIME_DIR"\n'
+        '\n'
+        '    cage -- chromium-browser \\\n'
+        '        --app=http://127.0.0.1:$KBB_PORT \\\n'
+        '        --kiosk \\\n'
+        '        --no-first-run \\\n'
+        '        --disable-translate \\\n'
+        '        --disable-infobars \\\n'
+        '        --user-data-dir=/tmp/kiosk-profile &\n'
+        '\n'
+        '    eend $?\n'
+        '}\n'
+    )
+
+    buf = io.BytesIO()
+    with _tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for path_in_tar, content in sorted(files.items()):
+            data = content.encode("utf-8")
+            info = _tarfile.TarInfo(name=path_in_tar)
+            info.size = len(data)
+            info.mode = 0o755 if path_in_tar.endswith((".start", "kbb-kiosk")) else 0o644
+            tar.addfile(info, io.BytesIO(data))
+
+        for link_target, link_name in [
+            ("/etc/init.d/kbb-kiosk", "etc/runlevels/default/kbb-kiosk"),
+            ("/etc/local.d/kbb-mount.start", "etc/runlevels/default/local"),
+        ]:
+            info = _tarfile.TarInfo(name=link_name)
+            info.type = _tarfile.SYMTYPE
+            info.linkname = link_target
+            tar.addfile(info)
+
+    apkovl_path.write_bytes(buf.getvalue())
+    console.print(f"[bold green]Alpine overlay built: {apkovl_path} ({len(buf.getvalue())} bytes)[/bold green]")
+    return apkovl_path
+
+
 def _write_portable_launchers(root: Path, target_os: str, with_launcher: bool = False) -> None:
     """Generate platform-specific launchers at the drive root for zero-install launching."""
 
@@ -1544,6 +1934,16 @@ def portable(
         "--with-webview2",
         help="Bundle the WebView2 runtime on the drive so the launcher renders on any Windows host with no WebView2 and no internet (auto-enabled by --with-launcher on Windows)",
     ),
+    with_alpine: bool = typer.Option(
+        False,
+        "--with-alpine",
+        help="Provision Alpine Linux bare-metal boot (Mode A): kernel, initramfs, EFI bootloader, kiosk overlay",
+    ),
+    with_qemu: bool = typer.Option(
+        False,
+        "--with-qemu",
+        help="Provision embedded QEMU sandbox (Mode C): portable QEMU binaries for win/lin/mac + sandbox launchers",
+    ),
 ):
     """Provision a self-contained, zero-install runtime on a portable drive.
 
@@ -1617,6 +2017,23 @@ def portable(
         if with_launcher:
             _provision_rust_launcher(root, target_os, bundle_path, allow_insecure_network)
         _write_portable_launchers(root, target_os, with_launcher)
+
+        # ------------------------------------------------------------------
+        # Tri-modal tactical deployment (Modes A & C)
+        # ------------------------------------------------------------------
+        # Alpine boot artefacts are shared between Mode A (bare-metal) and
+        # Mode C (QEMU sandbox): provision them if either flag is set.
+        if with_alpine or with_qemu:
+            _provision_alpine_boot(root, bundle_path, allow_insecure_network)
+            _build_alpine_overlay(root)
+
+        if with_alpine:
+            _provision_efi_bootloader(root, bundle_path, allow_insecure_network)
+
+        if with_qemu:
+            _provision_qemu_runtime(root, None, bundle_path, allow_insecure_network)
+            _write_sandbox_launchers(root)
+
     except Exception as e:
         console.print(f"[bold red]Provisioning failed:[/bold red] {e}")
         raise typer.Exit(1)

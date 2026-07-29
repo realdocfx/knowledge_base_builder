@@ -90,7 +90,25 @@ def test_generated_pages_are_locked_down_but_functional(content_client):
     was blocked. It also added nothing, because raw files carry their own sandbox at
     the point of delivery.
     """
-    r = content_client.get("/files/", follow_redirects=False)
+    # A real bucket is required: without one /files/ returns 503, and an error
+    # response correctly receives the restrictive DEFAULT rather than the
+    # trusted-page policy. Asserting the trusted policy against a 503 tested the
+    # middleware's old permissive default, not the listing.
+    import tempfile
+
+    from knowledge_base_builder.buckets.usb import UsbBucket
+
+    with tempfile.TemporaryDirectory() as td:
+        bucket = UsbBucket(td)
+        bucket.initialize()
+        original = web.BUCKET
+        web.BUCKET = bucket
+        try:
+            r = content_client.get("/files/", follow_redirects=False)
+        finally:
+            web.BUCKET = original
+
+    assert r.status_code == 200, r.status_code
     csp = r.headers.get("content-security-policy", "")
     assert "default-src 'none'" in csp, csp
     assert "object-src 'none'" in csp and "form-action 'none'" in csp, csp
@@ -169,6 +187,209 @@ def test_active_content_types_are_forced_to_download(suffix):
 def test_inert_content_types_still_render_inline(suffix):
     """The reader must keep working for the formats it exists to display."""
     assert web.content_disposition_for(f"payload{suffix}") == "inline", suffix
+
+
+# --------------------------------------------------------------------------
+# Wiki proxy -- third population on the content plane
+# --------------------------------------------------------------------------
+# The wiki route proxies kiwix-serve output. It is neither raw downloaded bytes
+# (which get sandbox) nor KBB-generated markup (which gets CONTENT_TRUSTED_CSP).
+# It is a known web application serving curated ZIM content through the origin-
+# isolated content plane. It needs its own CSP that allows kiwix to function
+# (scripts, styles, search XHR) while preventing exfiltration and framing abuse.
+
+def test_wiki_csp_constant_exists():
+    """The wiki CSP must be a named constant so auditors can find and review it."""
+    csp = getattr(web, "CONTENT_WIKI_CSP", None)
+    assert csp is not None, (
+        "CONTENT_WIKI_CSP is missing. The wiki route needs its own CSP tier: "
+        "sandbox blocks kiwix entirely, CONTENT_TRUSTED_CSP lacks connect-src "
+        "for search. A third tier is required."
+    )
+
+
+def test_wiki_csp_is_not_sandboxed():
+    """sandbox makes the origin opaque and blocks ALL scripts -- kiwix is dead."""
+    csp = getattr(web, "CONTENT_WIKI_CSP", "")
+    assert "sandbox" not in csp, (
+        f"CONTENT_WIKI_CSP includes sandbox: {csp!r}. Kiwix needs scripts for "
+        "navigation, search, autocomplete and article rendering."
+    )
+
+
+def test_wiki_csp_allows_scripts():
+    """Kiwix uses inline scripts, plus our injected FTS overlay and stealth optic."""
+    csp = getattr(web, "CONTENT_WIKI_CSP", "")
+    assert "script-src" in csp, f"no script-src in wiki CSP: {csp!r}"
+    assert "'self'" in csp, f"scripts from self blocked: {csp!r}"
+    assert "'unsafe-inline'" in csp, (
+        f"inline scripts blocked: {csp!r}. Kiwix and the FTS overlay use inline "
+        "script; this gap is tracked by xfail-strict tests."
+    )
+
+
+def test_wiki_csp_allows_styles_from_self():
+    """Kiwix loads external stylesheets from /wiki/skin/*.css via 'self'."""
+    csp = getattr(web, "CONTENT_WIKI_CSP", "")
+    # Extract the style-src directive
+    style_src = ""
+    for part in csp.split(";"):
+        if "style-src" in part:
+            style_src = part.strip()
+            break
+    assert "'self'" in style_src, (
+        f"style-src does not allow 'self': {style_src!r}. Kiwix stylesheets at "
+        "/wiki/skin/*.css are served from the same origin and must load."
+    )
+
+
+def test_wiki_csp_allows_connect_for_search():
+    """Kiwix search makes XHR/fetch calls to /wiki/search -- connect-src required."""
+    csp = getattr(web, "CONTENT_WIKI_CSP", "")
+    assert "connect-src" in csp, (
+        f"no connect-src in wiki CSP: {csp!r}. Kiwix search will silently fail."
+    )
+    connect = [p.strip() for p in csp.split(";") if "connect-src" in p]
+    assert connect and "'self'" in connect[0], (
+        f"connect-src does not allow 'self': {connect!r}"
+    )
+
+
+def test_wiki_csp_allows_form_action():
+    """Kiwix search form submits to itself; form-action must allow 'self'."""
+    csp = getattr(web, "CONTENT_WIKI_CSP", "")
+    form = [p.strip() for p in csp.split(";") if "form-action" in p]
+    assert form and "'self'" in form[0], (
+        f"form-action blocks self: {form!r}. Kiwix search form won't submit."
+    )
+
+
+def test_wiki_csp_blocks_dangerous_targets():
+    """object-src and base-uri must be 'none' -- standard bypass vectors."""
+    csp = getattr(web, "CONTENT_WIKI_CSP", "")
+    assert "object-src 'none'" in csp, f"object-src not locked: {csp!r}"
+    assert "base-uri 'none'" in csp, f"base-uri not locked: {csp!r}"
+
+
+def test_wiki_csp_locks_frame_ancestors():
+    """Only the console (control plane) may embed the wiki viewer."""
+    csp = getattr(web, "CONTENT_WIKI_CSP", "")
+    assert "frame-ancestors" in csp, f"no frame-ancestors in wiki CSP: {csp!r}"
+    assert "http://127.0.0.1:*" in csp, f"control plane origin not in frame-ancestors"
+
+
+def _make_wiki_html_response():
+    """Helper: call wiki_proxy with a mocked kiwix HTML response."""
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+
+    resp = MagicMock()
+    resp.headers = {"content-type": "text/html; charset=utf-8"}
+    resp.status_code = 200
+    resp.encoding = "utf-8"
+    resp.aread = AsyncMock(
+        return_value=b"<html><head></head><body><p>Article</p></body></html>"
+    )
+    resp.aclose = AsyncMock()
+
+    client = MagicMock()
+    client.send = AsyncMock(return_value=resp)
+    client.build_request.return_value = MagicMock()
+    web.app.state.kiwix_client = client
+
+    class _URL:
+        path = "/wiki/viewer"
+
+    class _QP:
+        def multi_items(self):
+            return []
+
+    class _Req:
+        method = "GET"
+        url = _URL()
+        query_params = _QP()
+        headers = {}
+
+    from knowledge_base_builder.web import wiki_proxy
+
+    return asyncio.run(wiki_proxy(_Req(), "viewer"))
+
+
+def _make_wiki_css_response():
+    """Helper: call wiki_proxy with a mocked kiwix CSS response."""
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+
+    class _AsyncIter:
+        def __init__(self, chunks):
+            self._chunks = list(chunks)
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if not self._chunks:
+                raise StopAsyncIteration
+            return self._chunks.pop(0)
+
+    resp = MagicMock()
+    resp.headers = {"content-type": "text/css; charset=utf-8"}
+    resp.status_code = 200
+    resp.aiter_raw = MagicMock(return_value=_AsyncIter([b"body{color:green}"]))
+    resp.aclose = AsyncMock()
+
+    client = MagicMock()
+    client.send = AsyncMock(return_value=resp)
+    client.build_request.return_value = MagicMock()
+    web.app.state.kiwix_client = client
+
+    class _URL:
+        path = "/wiki/skin/kiwix.css"
+
+    class _QP:
+        def multi_items(self):
+            return []
+
+    class _Req:
+        method = "GET"
+        url = _URL()
+        query_params = _QP()
+        headers = {}
+
+    from knowledge_base_builder.web import wiki_proxy
+
+    async def _run():
+        response = await wiki_proxy(_Req(), "skin/kiwix.css")
+        # Consume the streaming body to collect headers
+        body = b""
+        async for chunk in response.body_iterator:
+            body += chunk
+        return response
+
+    return asyncio.run(_run())
+
+
+def test_wiki_html_response_carries_wiki_csp():
+    """The proxied kiwix HTML must carry CONTENT_WIKI_CSP, not the sandbox default."""
+    response = _make_wiki_html_response()
+    csp = response.headers.get("content-security-policy", "")
+    assert csp, "wiki HTML response has no CSP header at all"
+    assert "sandbox" not in csp, (
+        f"wiki HTML is sandboxed: {csp!r}. Kiwix cannot function."
+    )
+    assert "script-src" in csp, f"wiki HTML blocks scripts: {csp!r}"
+    assert "style-src" in csp, f"wiki HTML blocks styles: {csp!r}"
+    assert "connect-src" in csp, f"wiki HTML blocks search XHR: {csp!r}"
+
+
+def test_wiki_css_response_carries_wiki_csp():
+    """Kiwix stylesheets must not be sandboxed either."""
+    response = _make_wiki_css_response()
+    csp = response.headers.get("content-security-policy", "")
+    assert "sandbox" not in csp, (
+        f"wiki CSS is sandboxed: {csp!r}. While the parent document's CSP governs "
+        "subresource loading, a sandboxed direct navigation would fail."
+    )
 
 
 # --------------------------------------------------------------------------
