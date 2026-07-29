@@ -86,6 +86,25 @@ QEMU_RELEASE = "9.2.0"
 # Alpine release itself; pin it explicitly so the URL and the hash agree.
 GRUB_EFI_APK_VERSION = f"{ALPINE_ARCH}-2.12-r5"
 
+# Where the guest resolves packages from. The stick is mounted read-only at
+# /media/kbb inside the guest, so this is a path, never a URL: once provisioned,
+# the sandbox boots with no network at all.
+OFFLINE_APK_DIR = "/media/kbb/boot/apks"
+
+# The dependency closure `apk fetch --recursive` must mirror for the guest to
+# install its head offline. Anything absent here means a boot that stalls without
+# a display.
+GUEST_APK_CLOSURE = (
+    "cage",
+    "seatd",
+    "webkit2gtk",
+    "gtk+3.0",
+    "mesa-dri-gallium",
+    "font-dejavu",
+    "dbus",
+    "eudev",
+)
+
 # Known-good SHA-256 hashes for provisioning assets (FIPS-approved algorithm)
 # These hashes must be updated when versions change
 PROVISIONING_HASHES: Dict[str, str] = {
@@ -1765,15 +1784,30 @@ def _build_alpine_overlay(root: Path) -> Path:
 
     files: Dict[str, str] = {}
 
+    # The guest renders the SAME Tauri window the host does. Tauri's Linux webview
+    # is WebKitGTK, so that -- not Chromium -- is what the guest needs. Shipping a
+    # browser here would mean a second renderer with its own CSP surface, its own
+    # URL handler and its own downloads UI: ~150 MB of attack surface for a UI the
+    # product does not use.
     files["etc/apk/world"] = (
         "alpine-base\n"
         "eudev\n"
         "dbus\n"
-        "cage\n"
-        "chromium\n"
+        "cage\n"          # single-surface Wayland kiosk: no taskbar, no switcher
+        "seatd\n"         # cage needs a seat manager to claim the DRM device
+        "webkit2gtk\n"    # Tauri's renderer on Linux
+        "gtk+3.0\n"
         "font-dejavu\n"
         "mesa-dri-gallium\n"
     )
+
+    # The guest has no network by design. apk's default configuration points at the
+    # Alpine CDN, so with no repositories file the kiosk install silently fails and
+    # the boot lands on a bare initramfs -- the exact failure Mode C was stuck on.
+    # `kb-builder portable --with-qemu` mirrors the dependency closure to
+    # /boot/apks while the *provisioning* host is online; the guest resolves from
+    # the stick and never touches a mirror.
+    files["etc/apk/repositories"] = f"{OFFLINE_APK_DIR}\n"
 
     files["etc/conf.d/kbb"] = (
         '# KBB Kiosk Configuration\n'
@@ -1842,16 +1876,53 @@ def _build_alpine_overlay(root: Path) -> Path:
         '    export XDG_RUNTIME_DIR="/tmp/runtime-root"\n'
         '    mkdir -p -m 0700 "$XDG_RUNTIME_DIR"\n'
         '\n'
-        '    cage -- chromium-browser \\\n'
-        '        --app=http://127.0.0.1:$KBB_PORT \\\n'
-        '        --kiosk \\\n'
-        '        --no-first-run \\\n'
-        '        --disable-translate \\\n'
-        '        --disable-infobars \\\n'
-        '        --user-data-dir=/tmp/kiosk-profile &\n'
+        '    # The head. cage is a Wayland compositor that shows exactly one surface,\n'
+        '    # fullscreen, with no decorations, no panel and no way to raise a second\n'
+        '    # window -- there is no switcher to invoke because there is no stack. It\n'
+        '    # execs the Tauri binary directly, so the operator sees the identical UI\n'
+        '    # whether KBB was launched host-native or into the sandbox.\n'
+        '    KBB_UI="$USB_MNT/launch_kbb"\n'
+        '    [ -x "$KBB_UI" ] || KBB_UI="$USB_MNT/.kb_env/bin/launch_kbb"\n'
+        '\n'
+        '    if [ ! -x "$KBB_UI" ]; then\n'
+        '        eerror "Tauri UI not found on the stick (looked for launch_kbb)."\n'
+        '        eend 1\n'
+        '        return 1\n'
+        '    fi\n'
+        '\n'
+        '    export KBB_PORTAL_URL="http://127.0.0.1:$KBB_PORT"\n'
+        '\n'
+        '    # Supervise. If the UI exits -- crash, or an operator finding a close\n'
+        '    # path -- cage exits with it and the guest would fall through to a bare\n'
+        '    # TTY. Respawning keeps the only reachable surface the KBB window.\n'
+        '    (\n'
+        '        while true; do\n'
+        '            cage -- "$KBB_UI"\n'
+        '            sleep 1\n'
+        '        done\n'
+        '    ) </dev/null >/dev/null 2>&1 &\n'
         '\n'
         '    eend $?\n'
         '}\n'
+    )
+
+    # Escape-proofing the guest console. Alpine's stock inittab spawns a getty on
+    # tty1-tty6; Ctrl+Alt+F2 from inside any kiosk reaches a root login prompt,
+    # which is a complete bypass of the sandboxed UI. Only tty1 survives, and it
+    # runs the kiosk rather than a login. Sysrq is disabled for the same reason:
+    # Alt+SysRq+B/E/K are documented ways out of a graphical session.
+    files["etc/inittab"] = (
+        "# KBB sandbox: single-surface kiosk, no login prompt on any TTY.\n"
+        "::sysinit:/sbin/openrc sysinit\n"
+        "::sysinit:/sbin/openrc boot\n"
+        "::wait:/sbin/openrc default\n"
+        "tty1::respawn:/sbin/agetty --noclear --autologin root tty1 linux\n"
+        "::ctrlaltdel:/sbin/reboot\n"
+        "::shutdown:/sbin/openrc shutdown\n"
+    )
+    files["etc/sysctl.d/99-kbb-kiosk.conf"] = (
+        "# Alt+SysRq is an escape hatch out of any graphical session.\n"
+        "kernel.sysrq = 0\n"
     )
 
     buf = io.BytesIO()

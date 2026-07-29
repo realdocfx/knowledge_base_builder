@@ -114,22 +114,38 @@ knowledge_base_builder/
 ├── FAQ.md                 # Frequently asked questions
 ├── CHANGELOG.md           # Release notes
 ├── LICENSE                # License file
+├── launcher/              # Rust/Tauri single-click launcher (Mode B)
+│   ├── src/main.rs        # Launcher entry point
+│   ├── Cargo.toml
+│   └── tauri.conf.json
 ├── src/
 │   └── knowledge_base_builder/
 │       ├── __init__.py    # Package exports and version
 │       ├── base.py        # Abstract base classes
-│       ├── cli.py         # CLI interface
+│       ├── cli.py         # CLI interface + tri-modal provisioning
+│       ├── cloning.py     # Drive duplication (virgin + full clone)
+│       ├── audit.py       # Hash-chained audit trail
+│       ├── web.py         # FastAPI portal (control + content planes)
+│       ├── os_utils.py    # FAT32 detection, filename hygiene
+│       ├── wiki_orchestrator.py  # Kiwix OPDS orchestrator
+│       ├── presentation.py      # kiwix-serve launcher
 │       ├── buckets/
-│       │   ├── __init__.py
 │       │   ├── usb.py     # USB/local storage bucket
-│       │   └── zim.py     # ZIM binary storage bucket
-│       └── engines/
-│           ├── __init__.py
-│           ├── archive.py # Internet Archive API engine
-│           └── wikipedia.py # Wikipedia / Wikimedia engine
-└── tests/                 # Test files
-    ├── test_robustness.py
-    └── conftest.py
+│       │   └── zim.py     # ZIM binary storage + FAT32 splitting
+│       ├── engines/
+│       │   ├── archive.py # Internet Archive API engine
+│       │   └── wikipedia.py # Wikipedia / Wikimedia engine
+│       └── docs/
+│           └── MANUAL.md  # Operator field manual (served in portal)
+└── tests/                 # 363+ tests across 35 files
+    ├── conftest.py
+    ├── test_tactical_provision.py  # Mode A/C provisioning (20 tests)
+    ├── test_origin_split.py       # Content-plane CSP + wiki CSP (36 tests)
+    ├── test_audit2_phase0.py      # Audit remediation (N1/N2/N11/D15)
+    ├── test_zim_hash_window.py    # FAT32 split geometry (42 tests)
+    ├── test_fs_detection.py       # Filesystem detection (41 tests)
+    ├── test_filename_sanitisation.py  # Path hygiene (33 tests)
+    └── ...
 ```
 
 ### Module Responsibilities
@@ -141,6 +157,50 @@ knowledge_base_builder/
 - **`buckets/zim.py`**: ZIM binary storage and validation
 - **`engines/archive.py`**: Internet Archive API, downloads, search, concurrency
 - **`engines/wikipedia.py`**: Wikipedia OpenZIM and Wikimedia Enterprise integration
+- **`cloning.py`**: Drive duplication with SHA-256 manifest and capacity checks
+- **`audit.py`**: Hash-chained audit trail (AU-2/AU-3/AU-12 events)
+- **`web.py`**: FastAPI portal with origin-split security (control + content planes)
+- **`os_utils.py`**: FAT32/exFAT detection, filename sanitisation, cross-platform helpers
+
+### Tri-Modal Provisioning (`cli.py`)
+
+The `portable` command provisions a USB drive with three additive, non-destructive flags:
+
+| Flag | Mode | What it provisions |
+|------|------|-------------------|
+| *(default)* | B | `.kb_env/` (Python, kiwix, packages), `C2_Portal.bat`/`.sh` |
+| `--with-launcher` | B | `Launch_KBB.exe` (Rust/Tauri), WebView2 runtime |
+| `--with-alpine` | A | `/boot/` (Alpine kernel, initramfs, modloop, kiosk overlay), `/EFI/BOOT/` (GRUB2 + grub.cfg) |
+| `--with-qemu` | C | `/qemu/` (portable QEMU per platform), `start_sandbox.bat`/`.sh` |
+
+All flags compose: `--with-alpine --with-qemu` provisions both. Alpine boot artefacts are **shared** between Modes A and C (the same `vmlinuz-lts` + `initramfs-lts` serve both).
+
+**Key constants** (in `cli.py`):
+- `ALPINE_VERSION` / `ALPINE_RELEASE` — pinned Alpine LTS version
+- `QEMU_WIN_BUILD` / `QEMU_RELEASE` — portable QEMU build identifiers
+- `PROVISIONING_HASHES` — SHA-256 pins for all downloaded artefacts
+
+**Testing the tri-modal provisioning:**
+
+```bash
+# Run only the tactical provisioning tests (20 tests)
+pytest tests/test_tactical_provision.py -v
+
+# Key test areas:
+# - Constants and hash entries exist
+# - Alpine boot directory creation
+# - EFI structure + grub.cfg content
+# - apkovl.tar.gz contains kiosk init, USB mount script, runlevel links
+# - apkovl reuses .kb_env/python (SSOT verification)
+# - QEMU URLs cover all 3 platforms
+# - Sandbox launchers use raw passthrough (NOT vvfat)
+# - Non-destructive: existing files untouched after provision
+# - Idempotent: running twice produces identical output
+```
+
+**Why raw disk passthrough instead of QEMU vvfat:**
+
+QEMU's `vvfat` (virtual FAT) driver reconstructs a FAT filesystem in memory from a host directory. It has a hard limit on root directory entries and cannot handle sticks with many files (the typical KBB stick has 100+ items at the root). The `start_sandbox.bat` script instead passes `\\.\PhysicalDriveN` directly — the guest Alpine kernel sees the real FAT32 partition and mounts it normally. This works with any number of files, any file size, and any directory depth.
 
 ## Coding Standards
 

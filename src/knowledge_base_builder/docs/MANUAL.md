@@ -1,20 +1,24 @@
 # KBB Field Manual — Building & Duplicating a Stick
 
-A **KBB stick** is a portable USB drive that boots the Knowledge Base portal on any
-Windows host with a single click (`Launch_KBB.exe`), using an embedded Python
-runtime, `kiwix-serve`, and a **bundled WebView2** — no install, no internet, no
-pre-existing WebView2 required.
+A **KBB stick** is a portable USB drive that runs the Knowledge Base portal in
+three modes: **host-native** (single click on any Windows/Linux/macOS host),
+**bare-metal Alpine boot** (amnesic RAM execution, zero host trace), and **QEMU
+sandbox** (hypervisor-isolated from host EDR/DLP). All three share one Python
+runtime, one Alpine kernel, and one dataset — no duplication.
 
-This manual covers three scenarios:
+This manual covers five scenarios:
 
 | # | Goal | Needs a terminal? | Needs internet? |
 |---|------|-------------------|-----------------|
 | 1 | First build from GitHub onto an empty drive | **Yes** (one-time, on a build PC) | Yes (to download the runtime + content) |
 | 2 | Make a **virgin** stick from an existing one | No — done in the portal UI | No |
 | 3 | **Full duplicate** of a stick to a new one | No — done in the portal UI | No |
+| 4 | **Bare-metal boot** from the stick (Mode A) | No — UEFI boot menu | No |
+| 5 | **QEMU sandbox** from the stick (Mode C) | No — double-click launcher | No |
 
-Scenarios 2 and 3 are performed entirely from the portal's **Drive Provisioning**
-panel — no command line.
+Scenarios 2–3 are performed from the portal's **Drive Provisioning** panel.
+Scenarios 4–5 require one-time provisioning (Scenario 1 with `--with-alpine`
+and/or `--with-qemu`).
 
 ---
 
@@ -114,6 +118,100 @@ items, ZIM slices, search state).
 
 ---
 
+## Scenario 4 — Bare-metal boot from the stick (Mode A, offline, no terminal)
+
+Boot the target hardware directly from the USB stick. Alpine Linux loads entirely
+into RAM — **zero trace** on host storage upon power-off or physical device
+detachment. The KBB portal runs in a Cage/Chromium kiosk.
+
+**One-time preparation** (on the build PC, once per stick):
+```bash
+kb-builder portable E:\ --with-alpine --allow-insecure-network
+```
+This downloads the Alpine kernel, initramfs, modloop, and GRUB2 EFI bootloader
+(~175 MB), and generates the KBB kiosk overlay (`apkovl.tar.gz`).
+
+**Using it in the field:**
+1. Insert the stick into the target hardware.
+2. Enter the UEFI/BIOS boot menu (typically **F12**, **F2**, or **Esc** at power-on).
+3. Select the USB drive. GRUB shows: **"KBB Tactical OSINT Appliance (Amnesic RAM)"**.
+4. Press Enter. Alpine loads into RAM (~5 seconds), mounts the stick read-only,
+   and starts the KBB portal in a fullscreen Cage/Chromium kiosk.
+5. **Power off = total erasure.** Nothing is written to the host's internal storage.
+
+**Requirements:**
+- UEFI firmware (most hardware since ~2012). Legacy BIOS/CSM is not supported.
+- FAT32 USB partition (the stick must be FAT32 for UEFI boot — this is the
+  standard KBB format).
+- The stick's content is mounted **read-only** inside the Alpine guest.
+
+> **Secure Boot:** if Secure Boot is enabled, the host firmware must trust the
+> GRUB2 binary at `EFI\BOOT\BOOTX64.EFI`. Unsigned GRUB will be rejected.
+> Either disable Secure Boot in UEFI settings or replace the binary with a
+> shim-signed version (e.g., from Ubuntu's `shim-signed` package).
+
+---
+
+## Scenario 5 — QEMU sandbox from the stick (Mode C, offline, no terminal)
+
+Run the KBB portal **inside a hypervisor** on the host OS. The QEMU virtual
+machine isolates OSINT processing from the host's EDR, DLP, and antivirus
+telemetry. The stick's content is passed to the guest via read-only raw disk
+passthrough — no file size or entry count limits.
+
+**One-time preparation** (on the build PC, once per stick):
+```bash
+kb-builder portable E:\ --with-qemu --allow-insecure-network
+```
+This downloads the portable QEMU binary (~240 MB for Windows) and generates the
+sandbox launcher scripts.
+
+**Using it in the field:**
+
+### Windows
+1. Insert the stick.
+2. Double-click **`start_sandbox.bat`** at the drive root.
+3. A UAC prompt appears — click **Yes** (raw disk access requires admin).
+4. A console window shows Alpine booting; the KBB portal starts inside the VM.
+5. Open `http://localhost:8080` in the host browser.
+
+### Linux / macOS
+1. Insert the stick and note the mount point.
+2. Run `./start_sandbox.sh` from the stick root.
+3. Enter sudo password when prompted.
+4. Open `http://localhost:8080` in the host browser.
+
+**How it works:**
+- The launcher auto-detects the USB's physical drive number (Windows) or block
+  device (Linux/macOS).
+- QEMU boots the **same Alpine kernel** used by Mode A — direct-kernel-boot,
+  no virtual disk image, no BIOS emulation.
+- The stick's FAT32 partition is passed as a read-only virtio block device
+  (`\\.\PhysicalDriveN` on Windows, `/dev/sdX` on Linux). The guest mounts it
+  at `/media/kbb` and runs the KBB portal from `.kb_env/python`.
+- Port 8080 is forwarded from the guest to the host for browser access.
+
+**Why not QEMU's virtual FAT (`vvfat`) driver?**
+
+The `vvfat` driver reconstructs a FAT filesystem in memory. It has a hard root
+directory entry limit and fails on sticks with many files (the typical KBB stick
+has 100+ items). Raw disk passthrough has no such limit — it gives the guest the
+real FAT32 partition directly.
+
+---
+
+## Provisioning both modes at once
+
+```bash
+kb-builder portable E:\ --with-alpine --with-qemu --allow-insecure-network
+```
+
+All flags are **additive and non-destructive** — existing content on the stick
+is never touched. The Alpine kernel + initramfs are shared between Modes A and C
+(single source of truth).
+
+---
+
 ## Operator interface (MIL-STD-1472H)
 
 ### Optics: Daylight Mosaic and Tactical Night-Green
@@ -174,6 +272,8 @@ wait), and the embedded ZIM reader shows a spinner until the first page loads.
 |------|:------:|:----:|
 | `.kb_env/` (Python, kiwix, WebView2) | ✅ | ✅ |
 | `Launch_KBB.exe` + launcher scripts | ✅ | ✅ |
+| `EFI/` + `boot/` (Mode A infrastructure) | ✅ | ✅ |
+| `qemu/` + sandbox launchers (Mode C infrastructure) | ✅ | ✅ |
 | Downloaded Archive.org items | ❌ | ✅ |
 | ZIM archives / split slices | ❌ | ✅ |
 | Sync state / search index | ❌ (fresh) | rebuilt on first run |

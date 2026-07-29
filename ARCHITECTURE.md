@@ -155,6 +155,66 @@ Knowledge-Base-Builder is a Python-based CLI tool that treats local storage (typ
 - Reads `.kb_state/sync_state.json` via `UsbBucket.get_state()`
 - Discovers finalized `.zim` and split `.zim??` archives on the bucket root
 
+### 5. Tri-Modal Deployment Layer (`cli.py` provisioning functions)
+
+**Responsibilities:**
+- Provision Alpine Linux bare-metal boot infrastructure (Mode A)
+- Provision QEMU sandbox hypervisor binaries (Mode C)
+- Generate platform-specific sandbox launchers with raw disk passthrough
+- Build the Alpine kiosk overlay (`apkovl.tar.gz`) that reuses `.kb_env/python`
+- Extend `cloning.py` so drive duplication includes boot/QEMU infrastructure
+
+**Execution Modes:**
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                    Single USB FAT32 Drive                        │
+│                                                                  │
+│  ┌──────────────┐  ┌──────────────┐  ┌────────────────────────┐ │
+│  │   Mode A     │  │   Mode B     │  │      Mode C            │ │
+│  │  Bare-Metal  │  │ Host-Native  │  │   QEMU Sandbox         │ │
+│  │  Alpine Boot │  │  Execution   │  │   (Hypervisor)         │ │
+│  │              │  │              │  │                        │ │
+│  │ EFI/BOOT/ ──►│  │ Launch_KBB ──►│  │ start_sandbox.bat ──►  │ │
+│  │ boot/     ──►│  │ C2_Portal  ──►│  │ qemu/win/ ──►          │ │
+│  └──────┬───────┘  └──────┬───────┘  └──────┬─────────────────┘ │
+│         │                 │                 │                    │
+│         ▼                 ▼                 ▼                    │
+│  ┌──────────────────────────────────────────────────────────────┐│
+│  │              Shared Components (DRY / SSOT)                  ││
+│  │  .kb_env/python  — single Python runtime for all modes       ││
+│  │  .kb_env/kiwix   — kiwix-serve binary                       ││
+│  │  boot/vmlinuz-lts — Alpine kernel (Mode A + C share it)     ││
+│  │  boot/initramfs-lts — Alpine initramfs (Mode A + C)         ││
+│  │  boot/apkovl.tar.gz — KBB kiosk overlay (Mode A + C)       ││
+│  └──────────────────────────────────────────────────────────────┘│
+│                                                                  │
+│  ┌──────────────────────────────────────────────────────────────┐│
+│  │              Content (never touched by provisioning)          ││
+│  │  *.zimaa, *.zimab, ...  — ZIM split slices                  ││
+│  │  <Archive.org dirs>/    — PDF/media libraries                ││
+│  │  .kb_state/             — audit log, search index, state    ││
+│  └──────────────────────────────────────────────────────────────┘│
+└──────────────────────────────────────────────────────────────────┘
+```
+
+**Key Design Decisions:**
+- **Non-destructive provisioning**: `--with-alpine` and `--with-qemu` only add files; existing content is never moved or deleted
+- **Shared kernel**: `boot/vmlinuz-lts` and `boot/initramfs-lts` serve both bare-metal UEFI boot and QEMU direct-kernel-boot — one artefact, two execution contexts
+- **SSOT Python runtime**: the Alpine kiosk overlay mounts the USB and runs `.kb_env/python/bin/python3` directly — no second Python installation inside the RAM disk
+- **Raw disk passthrough**: QEMU uses `\\.\PhysicalDriveN` (Windows) or `/dev/sdX` (Linux) instead of the `vvfat` virtual FAT driver, which has a hard root directory entry limit and cannot handle sticks with many files
+- **Self-elevating launchers**: `start_sandbox.bat` requests UAC elevation; `start_sandbox.sh` uses sudo — raw disk access requires privilege on all platforms
+
+**Provisioning Functions (in `cli.py`):**
+
+| Function | Purpose | Used by |
+|---|---|---|
+| `_provision_alpine_boot()` | Fetch kernel/initramfs/modloop from Alpine CDN | Mode A, C |
+| `_provision_efi_bootloader()` | Inject GRUB2 EFI binary + `grub.cfg` | Mode A |
+| `_provision_qemu_runtime()` | Fetch portable QEMU per platform | Mode C |
+| `_write_sandbox_launchers()` | Generate `start_sandbox.bat`/`.sh` | Mode C |
+| `_build_alpine_overlay()` | Build `apkovl.tar.gz` kiosk overlay | Mode A, C |
+
 ## Data Flow
 
 ### Initialization Flow
