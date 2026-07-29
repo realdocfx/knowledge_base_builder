@@ -1830,17 +1830,22 @@ def _build_alpine_overlay(root: Path) -> Path:
     files["etc/local.d/kbb-mount.start"] = (
         '#!/bin/sh\n'
         '# Auto-mount the USB FAT32 partition containing KBB data.\n'
-        '# The kernel cmdline kbb_mode= tells us whether we are bare-metal or QEMU.\n'
+        '# Bare-metal (Mode A): the stick is /dev/sd?? (USB mass storage).\n'
+        '# QEMU sandbox (Mode C): the stick is /dev/vda? (virtio block device).\n'
         'USB_MNT="/media/kbb"\n'
         'mkdir -p "$USB_MNT"\n'
         '\n'
-        '# Try by label first, then by the first vfat partition.\n'
+        '# Try by label first.\n'
         'if [ -n "$KBB_USB_LABEL" ]; then\n'
         '    mount -t vfat -o ro,noatime "LABEL=$KBB_USB_LABEL" "$USB_MNT" 2>/dev/null\n'
         'fi\n'
+        '\n'
+        '# Scan both USB (sd??) and virtio (vda?) block devices.\n'
         'if ! mountpoint -q "$USB_MNT"; then\n'
-        '    for dev in /dev/sd??; do\n'
-        '        blkid "$dev" | grep -qi vfat && mount -t vfat -o ro,noatime "$dev" "$USB_MNT" 2>/dev/null && break\n'
+        '    for dev in /dev/vda1 /dev/vda /dev/sda1 /dev/sdb1 /dev/sdc1; do\n'
+        '        [ -b "$dev" ] || continue\n'
+        '        blkid "$dev" 2>/dev/null | grep -qi vfat && \\\n'
+        '            mount -t vfat -o ro,noatime "$dev" "$USB_MNT" 2>/dev/null && break\n'
         '    done\n'
         'fi\n'
         '\n'
@@ -1918,16 +1923,42 @@ def _build_alpine_overlay(root: Path) -> Path:
         '}\n'
     )
 
-    # Escape-proofing the guest console. Alpine's stock inittab spawns a getty on
-    # tty1-tty6; Ctrl+Alt+F2 from inside any kiosk reaches a root login prompt,
-    # which is a complete bypass of the sandboxed UI. Only tty1 survives, and it
-    # runs the kiosk rather than a login. Sysrq is disabled for the same reason:
-    # Alt+SysRq+B/E/K are documented ways out of a graphical session.
+    # --------------------------------------------------------------------------
+    # Identity: Alpine netboot creates NO /etc/shadow, so login rejects every
+    # password including empty. The overlay must ship both passwd and shadow
+    # with a passwordless root so that autologin works on first boot.
+    # --------------------------------------------------------------------------
+    files["etc/passwd"] = (
+        "root:x:0:0:root:/root:/bin/sh\n"
+        "daemon:x:1:1:daemon:/usr/sbin:/sbin/nologin\n"
+        "nobody:x:65534:65534:nobody:/nonexistent:/sbin/nologin\n"
+    )
+    # Empty second field = no password. login(1) accepts autologin for this.
+    files["etc/shadow"] = (
+        "root::0:0::::::\n"
+        "daemon:!::0::::::\n"
+        "nobody:!::0::::::\n"
+    )
+    files["etc/group"] = (
+        "root:x:0:root\n"
+        "daemon:x:1:\n"
+        "nogroup:x:65534:\n"
+        "wheel:x:10:root\n"
+        "video:x:44:root\n"
+        "input:x:97:root\n"
+    )
+
+    # --------------------------------------------------------------------------
+    # Console: QEMU -serial stdio maps to /dev/ttyS0. Bare-metal uses tty1.
+    # The inittab spawns autologin on BOTH so the same overlay works for Mode A
+    # and Mode C. No other TTYs exist — Ctrl+Alt+F2 reaches nothing.
+    # --------------------------------------------------------------------------
     files["etc/inittab"] = (
-        "# KBB sandbox: single-surface kiosk, no login prompt on any TTY.\n"
+        "# KBB sandbox: autologin on serial + tty1, no other consoles.\n"
         "::sysinit:/sbin/openrc sysinit\n"
         "::sysinit:/sbin/openrc boot\n"
         "::wait:/sbin/openrc default\n"
+        "ttyS0::respawn:/sbin/agetty --noclear --autologin root ttyS0 vt100\n"
         "tty1::respawn:/sbin/agetty --noclear --autologin root tty1 linux\n"
         "::ctrlaltdel:/sbin/reboot\n"
         "::shutdown:/sbin/openrc shutdown\n"
@@ -1935,6 +1966,38 @@ def _build_alpine_overlay(root: Path) -> Path:
     files["etc/sysctl.d/99-kbb-kiosk.conf"] = (
         "# Alt+SysRq is an escape hatch out of any graphical session.\n"
         "kernel.sysrq = 0\n"
+    )
+
+    # --------------------------------------------------------------------------
+    # Auto-start: if the kiosk service fails (missing cage/webkit2gtk APKs),
+    # the portal backend should still run so the host browser can reach it.
+    # This profile script fires on any autologin shell.
+    # --------------------------------------------------------------------------
+    files["root/.profile"] = (
+        '#!/bin/sh\n'
+        '# KBB auto-start: run the portal backend on login.\n'
+        'USB_MNT="/media/kbb"\n'
+        'KBB_PYTHON="$USB_MNT/.kb_env/python/bin/python3"\n'
+        'KBB_PORT="${KBB_PORT:-8080}"\n'
+        '\n'
+        '# Mount the stick if not already mounted (kbb-mount.start may not have run).\n'
+        'if ! mountpoint -q "$USB_MNT" 2>/dev/null; then\n'
+        '    mkdir -p "$USB_MNT"\n'
+        '    for dev in /dev/vda1 /dev/vda /dev/sda1 /dev/sdb1; do\n'
+        '        [ -b "$dev" ] || continue\n'
+        '        mount -t vfat -o ro,noatime "$dev" "$USB_MNT" 2>/dev/null && break\n'
+        '    done\n'
+        'fi\n'
+        '\n'
+        'if [ -x "$KBB_PYTHON" ]; then\n'
+        '    export PATH="$USB_MNT/.kb_env/kiwix:$PATH"\n'
+        '    echo "[KBB] Starting portal on port $KBB_PORT..."\n'
+        '    "$KBB_PYTHON" -m knowledge_base_builder.cli portal "$USB_MNT" --port "$KBB_PORT" --no-browser\n'
+        'else\n'
+        '    echo "[KBB] Python runtime not found at $KBB_PYTHON"\n'
+        '    echo "[KBB] The stick may not be mounted. Try: mount -t vfat /dev/vda1 $USB_MNT"\n'
+        '    /bin/sh\n'
+        'fi\n'
     )
 
     buf = io.BytesIO()
