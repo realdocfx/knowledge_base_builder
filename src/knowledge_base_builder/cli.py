@@ -1799,6 +1799,170 @@ def _write_sandbox_launchers(root: Path, port: int = 8080) -> None:
     )
 
 
+def _guest_init_files() -> Dict[str, str]:
+    """The guest's init configuration -- one definition, two consumers.
+
+    Both the QEMU guest image and the bare-metal ``apkovl`` need this, and writing
+    it twice is exactly how ``etc/apk/world`` and the offline mirror drifted into a
+    guest with no ``/sbin/init``. Returns ``{path_relative_to_root: content}``.
+
+    Two properties are deliberate rather than incidental:
+
+    **No console is interactive.** There is no ``getty`` line at all. A login
+    prompt on a spare TTY is the documented way out of every kiosk, and under QEMU
+    a getty on ``ttyS0`` additionally hands a root shell to whoever is at the
+    *host* keyboard. Diagnostics are written *to* the console; nothing reads
+    *from* it.
+
+    **The boot reports whether the UI is actually running.** CI cannot look at a
+    screen, and "the runlevel was reached" is not evidence that a window exists --
+    a boot that ended in an emergency shell once satisfied an assertion of that
+    shape. So the kiosk emits ``KBB-HEAD-STARTED`` once cage has claimed a DRM
+    device and ``KBB-UI-ALIVE`` only after confirming the Tauri process survived a
+    grace period. The second marker is the one that matters: launching a process
+    that dies immediately is the common failure, and it is indistinguishable from
+    success without the wait.
+    """
+    files: Dict[str, str] = {}
+
+    files["etc/inittab"] = (
+        "# KBB sandbox: no interactive console exists.\n"
+        "#\n"
+        "# There is deliberately no getty on any TTY. Ctrl+Alt+F2 reaches nothing,\n"
+        "# and under QEMU -serial stdio the host cannot type into the guest either.\n"
+        "# The kiosk is started by OpenRC in the default runlevel instead.\n"
+        "::sysinit:/sbin/openrc sysinit\n"
+        "::sysinit:/sbin/openrc boot\n"
+        "::wait:/sbin/openrc default\n"
+        "::ctrlaltdel:/sbin/reboot\n"
+        "::shutdown:/sbin/openrc shutdown\n"
+    )
+
+    files["etc/sysctl.d/99-kbb-kiosk.conf"] = (
+        "# Alt+SysRq+K kills the compositor and leaves the operator looking at\n"
+        "# whatever is behind it. Alt+SysRq+B/E are equivalent exits.\n"
+        "kernel.sysrq = 0\n"
+    )
+
+    files["etc/conf.d/kbb"] = (
+        "# KBB kiosk configuration.\n"
+        "KBB_PORT=8080\n"
+        "KBB_DATA=/media/kbb\n"
+    )
+
+    files["etc/init.d/kbb-kiosk"] = (
+        '#!/sbin/openrc-run\n'
+        '\n'
+        'description="KBB kiosk: the Tauri UI under a single-surface compositor"\n'
+        '\n'
+        'depend() {\n'
+        '    need localmount\n'
+        '    after eudev dbus seatd\n'
+        '}\n'
+        '\n'
+        '# Everything the operator or CI needs to see goes to the console. Nothing\n'
+        '# reads from it -- see the inittab note on why there is no getty.\n'
+        'kbb_log() {\n'
+        '    echo "[KBB] $*" > /dev/console 2>/dev/null\n'
+        '    echo "[KBB] $*"\n'
+        '}\n'
+        '\n'
+        'start() {\n'
+        '    ebegin "Starting KBB kiosk"\n'
+        '\n'
+        '    KBB_PORT="${KBB_PORT:-8080}"\n'
+        '    KBB_DATA="${KBB_DATA:-/media/kbb}"\n'
+        '    KBB_UI="/usr/local/bin/launch_kbb"\n'
+        '\n'
+        '    # The stick, when one is attached. The UI comes up regardless: it shows\n'
+        '    # its own boot screen while it probes for the portal, so a missing or\n'
+        '    # still-mounting archive must not gate the window appearing.\n'
+        '    mkdir -p "$KBB_DATA"\n'
+        '    if ! mountpoint -q "$KBB_DATA"; then\n'
+        '        for dev in /dev/vdb1 /dev/vdb /dev/sdb1 /dev/sda1; do\n'
+        '            [ -b "$dev" ] || continue\n'
+        '            mount -o ro,noatime "$dev" "$KBB_DATA" 2>/dev/null && break\n'
+        '        done\n'
+        '    fi\n'
+        '    mountpoint -q "$KBB_DATA" && kbb_log "archive mounted at $KBB_DATA" \\\n'
+        '        || kbb_log "no archive attached; UI will start without content"\n'
+        '\n'
+        '    # The portal, from the guest image if the stick did not supply one.\n'
+        '    KBB_PY=""\n'
+        '    for cand in "$KBB_DATA/.kb_env/python-linux/bin/python3" /usr/bin/python3; do\n'
+        '        [ -x "$cand" ] && KBB_PY="$cand" && break\n'
+        '    done\n'
+        '    if [ -n "$KBB_PY" ]; then\n'
+        '        kbb_log "portal python: $KBB_PY"\n'
+        '        "$KBB_PY" -m knowledge_base_builder.cli portal "$KBB_DATA" \\\n'
+        '            --port "$KBB_PORT" --no-browser >/dev/console 2>&1 &\n'
+        '    else\n'
+        '        kbb_log "no python found; UI will show its offline screen"\n'
+        '    fi\n'
+        '\n'
+        '    if [ ! -x "$KBB_UI" ]; then\n'
+        '        kbb_log "FATAL: $KBB_UI missing -- the image was built wrong"\n'
+        '        eend 1\n'
+        '        return 1\n'
+        '    fi\n'
+        '\n'
+        '    export XDG_RUNTIME_DIR=/tmp/kbb-runtime\n'
+        '    mkdir -p -m 0700 "$XDG_RUNTIME_DIR"\n'
+        '    export KBB_PORTAL_URL="http://127.0.0.1:$KBB_PORT"\n'
+        '    export WEBKIT_DISABLE_COMPOSITING_MODE=1\n'
+        '\n'
+        '    # cage is the head: one surface, fullscreen, no decorations, no panel\n'
+        '    # and no stack to raise a second window from. There is no switcher to\n'
+        '    # invoke because there is nothing to switch to.\n'
+        '    #\n'
+        '    # Supervised, because if the UI exits cage exits with it and the guest\n'
+        '    # would present a bare console.\n'
+        '    (\n'
+        '        while true; do\n'
+        '            kbb_log "KBB-HEAD-STARTED cage -> $KBB_UI"\n'
+        '            cage -- "$KBB_UI" >/dev/console 2>&1 &\n'
+        '            cage_pid=$!\n'
+        '\n'
+        '            # Launched is not running. A window that dies on a missing DRM\n'
+        '            # node or an unresolved library looks identical to success until\n'
+        '            # something waits and checks.\n'
+        '            sleep 12\n'
+        '            if kill -0 "$cage_pid" 2>/dev/null; then\n'
+        '                kbb_log "KBB-UI-ALIVE pid=$cage_pid"\n'
+        '            else\n'
+        '                kbb_log "KBB-UI-EXIT the UI did not survive startup"\n'
+        '            fi\n'
+        '            wait "$cage_pid" 2>/dev/null\n'
+        '            kbb_log "UI exited; restarting"\n'
+        '            sleep 1\n'
+        '        done\n'
+        '    ) </dev/null >/dev/null 2>&1 &\n'
+        '\n'
+        '    eend 0\n'
+        '}\n'
+    )
+
+    return files
+
+
+# Paths that must be executable for OpenRC and the init to work at all.
+_GUEST_EXECUTABLES = ("etc/init.d/kbb-kiosk",)
+
+
+def write_guest_root_config(root: Path) -> None:
+    """Write the guest init configuration into an Alpine root at ``root``.
+
+    Used when building the self-contained guest image, where the filesystem is
+    populated at build time rather than assembled by ``apk`` during boot.
+    """
+    for rel, content in _guest_init_files().items():
+        target = root / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        if rel in _GUEST_EXECUTABLES:
+            target.chmod(0o755)
+
+
 def _build_alpine_overlay(root: Path) -> Path:
     """Generate ``/boot/apkovl.tar.gz`` — the KBB kiosk overlay for Alpine.
 
@@ -1833,11 +1997,6 @@ def _build_alpine_overlay(root: Path) -> Path:
     # the stick and never touches a mirror.
     files["etc/apk/repositories"] = f"{OFFLINE_APK_DIR}\n"
 
-    files["etc/conf.d/kbb"] = (
-        '# KBB Kiosk Configuration\n'
-        'KBB_PORT=8080\n'
-        'KBB_USB_LABEL=""\n'
-    )
 
     files["etc/local.d/kbb-mount.start"] = (
         '#!/bin/sh\n'
@@ -1868,72 +2027,6 @@ def _build_alpine_overlay(root: Path) -> Path:
         'fi\n'
     )
 
-    files["etc/init.d/kbb-kiosk"] = (
-        '#!/sbin/openrc-run\n'
-        '\n'
-        'description="KBB Kiosk Mode Display Manager"\n'
-        '\n'
-        'depend() {\n'
-        '    need localmount\n'
-        '    after eudev dbus\n'
-        '}\n'
-        '\n'
-        'start() {\n'
-        '    ebegin "Starting KBB Kiosk Interface"\n'
-        '\n'
-        '    USB_MNT="/media/kbb"\n'
-        '    KBB_PYTHON="$USB_MNT/.kb_env/python/bin/python3"\n'
-        '    KBB_PORT="${KBB_PORT:-8080}"\n'
-        '\n'
-        '    if [ ! -x "$KBB_PYTHON" ]; then\n'
-        '        eerror "KBB Python runtime not found at $KBB_PYTHON"\n'
-        '        eend 1\n'
-        '        return 1\n'
-        '    fi\n'
-        '\n'
-        '    export PATH="$USB_MNT/.kb_env/kiwix:$PATH"\n'
-        '\n'
-        '    "$KBB_PYTHON" -m knowledge_base_builder.cli portal "$USB_MNT" \\\n'
-        '        --port "$KBB_PORT" --no-browser &\n'
-        '\n'
-        '    # Wait for service health\n'
-        '    for i in $(seq 1 60); do\n'
-        '        nc -z 127.0.0.1 "$KBB_PORT" 2>/dev/null && break\n'
-        '        sleep 1\n'
-        '    done\n'
-        '\n'
-        '    export XDG_RUNTIME_DIR="/tmp/runtime-root"\n'
-        '    mkdir -p -m 0700 "$XDG_RUNTIME_DIR"\n'
-        '\n'
-        '    # The head. cage is a Wayland compositor that shows exactly one surface,\n'
-        '    # fullscreen, with no decorations, no panel and no way to raise a second\n'
-        '    # window -- there is no switcher to invoke because there is no stack. It\n'
-        '    # execs the Tauri binary directly, so the operator sees the identical UI\n'
-        '    # whether KBB was launched host-native or into the sandbox.\n'
-        '    KBB_UI="$USB_MNT/launch_kbb"\n'
-        '    [ -x "$KBB_UI" ] || KBB_UI="$USB_MNT/.kb_env/bin/launch_kbb"\n'
-        '\n'
-        '    if [ ! -x "$KBB_UI" ]; then\n'
-        '        eerror "Tauri UI not found on the stick (looked for launch_kbb)."\n'
-        '        eend 1\n'
-        '        return 1\n'
-        '    fi\n'
-        '\n'
-        '    export KBB_PORTAL_URL="http://127.0.0.1:$KBB_PORT"\n'
-        '\n'
-        '    # Supervise. If the UI exits -- crash, or an operator finding a close\n'
-        '    # path -- cage exits with it and the guest would fall through to a bare\n'
-        '    # TTY. Respawning keeps the only reachable surface the KBB window.\n'
-        '    (\n'
-        '        while true; do\n'
-        '            cage -- "$KBB_UI"\n'
-        '            sleep 1\n'
-        '        done\n'
-        '    ) </dev/null >/dev/null 2>&1 &\n'
-        '\n'
-        '    eend $?\n'
-        '}\n'
-    )
 
     # --------------------------------------------------------------------------
     # Identity: Alpine netboot creates NO /etc/shadow, so login rejects every
@@ -1960,78 +2053,11 @@ def _build_alpine_overlay(root: Path) -> Path:
         "input:x:97:root\n"
     )
 
-    # --------------------------------------------------------------------------
-    # Console: QEMU -serial stdio maps to /dev/ttyS0. Bare-metal uses tty1.
-    # The inittab spawns autologin on BOTH so the same overlay works for Mode A
-    # and Mode C. No other TTYs exist — Ctrl+Alt+F2 reaches nothing.
-    # --------------------------------------------------------------------------
-    files["etc/inittab"] = (
-        "# KBB sandbox: one console, and it runs the kiosk rather than a login.\n"
-        "#\n"
-        "# There is deliberately no getty on ttyS0. QEMU maps the serial line to\n"
-        "# the host, so an autologin there is a root prompt inside the sandbox\n"
-        "# handed to whoever is at the host keyboard -- the sandbox would then be\n"
-        "# only as strong as their willingness not to type into it. Diagnostics\n"
-        "# still go to the serial console as output; nothing reads from it.\n"
-        "::sysinit:/sbin/openrc sysinit\n"
-        "::sysinit:/sbin/openrc boot\n"
-        "::wait:/sbin/openrc default\n"
-        "tty1::respawn:/sbin/agetty --noclear --autologin root tty1 linux\n"
-        "::ctrlaltdel:/sbin/reboot\n"
-        "::shutdown:/sbin/openrc shutdown\n"
-    )
-    files["etc/sysctl.d/99-kbb-kiosk.conf"] = (
-        "# Alt+SysRq is an escape hatch out of any graphical session.\n"
-        "kernel.sysrq = 0\n"
-    )
 
-    # --------------------------------------------------------------------------
-    # Auto-start: if the kiosk service fails (missing cage/webkit2gtk APKs),
-    # the portal backend should still run so the host browser can reach it.
-    # This profile script fires on any autologin shell.
-    # --------------------------------------------------------------------------
-    files["root/.profile"] = (
-        '#!/bin/sh\n'
-        '# KBB auto-start: run the portal backend on login.\n'
-        'USB_MNT="/media/kbb"\n'
-        'KBB_PORT="${KBB_PORT:-8080}"\n'
-        '\n'
-        '# Mount the stick if not already mounted (kbb-mount.start may not have run).\n'
-        'if ! mountpoint -q "$USB_MNT" 2>/dev/null; then\n'
-        '    mkdir -p "$USB_MNT"\n'
-        '    for dev in /dev/vda1 /dev/vda /dev/sda1 /dev/sdb1; do\n'
-        '        [ -b "$dev" ] || continue\n'
-        '        mount -t vfat -o ro,noatime "$dev" "$USB_MNT" 2>/dev/null && break\n'
-        '    done\n'
-        'fi\n'
-        '\n'
-        '# Find the Linux Python. The stick carries both a Windows embed\n'
-        '# (.kb_env/python/python.exe) and a Linux python-build-standalone\n'
-        '# (.kb_env/python-linux/bin/python3). The guest must use the Linux one.\n'
-        'KBB_PYTHON=""\n'
-        'for candidate in \\\n'
-        '    "$USB_MNT/.kb_env/python-linux/bin/python3" \\\n'
-        '    "$USB_MNT/.kb_env/python/bin/python3" \\\n'
-        '    "/usr/bin/python3"; do\n'
-        '    [ -x "$candidate" ] && KBB_PYTHON="$candidate" && break\n'
-        'done\n'
-        '\n'
-        'if [ -n "$KBB_PYTHON" ]; then\n'
-        '    export PATH="$USB_MNT/.kb_env/kiwix:$PATH"\n'
-        '    echo "[KBB] Using Python: $KBB_PYTHON"\n'
-        '    echo "[KBB] Starting portal on port $KBB_PORT..."\n'
-        '    "$KBB_PYTHON" -m knowledge_base_builder.cli portal "$USB_MNT" --port "$KBB_PORT" --no-browser\n'
-        'else\n'
-        '    echo "[KBB] No Linux Python found on the stick."\n'
-        '    echo "[KBB] Looked in: .kb_env/python-linux/bin/python3, .kb_env/python/bin/python3, /usr/bin/python3"\n'
-        '    # NOT a shell. Dropping to /bin/sh here would put a root prompt on\n'
-        '    # screen on exactly the path most likely to be taken in the field,\n'
-        '    # which is a complete escape from the sandbox. Halting instead tells\n'
-        '    # the operator something is wrong and grants them nothing.\n'
-        '    sleep 20\n'
-        '    poweroff -f\n'
-        'fi\n'
-    )
+
+    # Init configuration comes from the single shared definition, so the
+    # bare-metal overlay and the QEMU guest image cannot drift apart.
+    files.update(_guest_init_files())
 
     buf = io.BytesIO()
     with _tarfile.open(fileobj=buf, mode="w:gz") as tar:

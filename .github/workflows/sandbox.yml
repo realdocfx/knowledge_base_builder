@@ -5,15 +5,22 @@
 #
 #   1. The guest UI is a Tauri binary linked against musl + WebKitGTK. It cannot
 #      be compiled on Windows, so nothing local proves it links at all.
-#   2. The guest installs its head from a package cache on the stick with no
-#      network. Resolving that closure needs `apk`, which is Linux-only.
-#   3. "It boots" is a claim about a kernel, an EFI stub and an overlay parser.
+#   2. The guest root is an Alpine filesystem. Assembling it needs apk.
+#   3. "The UI comes up" is a claim about a kernel, a compositor and a DRM node.
 #      Reading the provisioning code cannot establish it; only booting can.
 #
-# So these run in CI, and a failure here is a real failure -- these jobs are not
-# advisory. The boot job in particular is the regression guard for the state Mode
-# C was stuck in: Alpine started, found the overlay, and then landed on a bare
-# initramfs because the kiosk's packages were not present.
+# These jobs are not advisory -- a failure here is a real failure.
+#
+# The pipeline builds a *self-contained* guest: packages are resolved at build
+# time from upstream signed repositories, and the stick ships a finished
+# filesystem. The earlier design had the guest install itself at boot from a
+# mirror on the medium, which made the boot depend on that repository being
+# present, reachable and trusted. It failed on trust -- `apk index` produces an
+# unsigned APKINDEX, Alpine's initramfs runs apk without --allow-untrusted, so
+# every base install was refused and the root came up empty: "/sbin/init not
+# found in new root". Resolving at build time removes the whole class, and is
+# also what lets the stick run with no host and no network: there is nothing
+# left for the guest to ask anyone for.
 name: sandbox
 
 on:
@@ -23,6 +30,8 @@ on:
       - 'launcher/**'
       - '.github/workflows/sandbox.yml'
       - 'tests/test_sandbox_head.py'
+      - 'tests/test_guest_root_config.py'
+      - 'tests/test_one_click_sandbox.py'
   pull_request:
   workflow_dispatch:
 
@@ -47,7 +56,10 @@ jobs:
         with:
           python-version: '3.12'
       - run: pip install -e . pytest
-      - run: python -m pytest tests/test_sandbox_head.py tests/test_tactical_provision.py -q
+      - run: >-
+          python -m pytest -q
+          tests/test_sandbox_head.py tests/test_tactical_provision.py
+          tests/test_guest_root_config.py tests/test_one_click_sandbox.py
 
   # ---------------------------------------------------------------------------
   # The guest's head, mirrored offline.
@@ -182,131 +194,188 @@ jobs:
           retention-days: 7
 
   # ---------------------------------------------------------------------------
-  # Bootability. Assembles a FAT32 EFI image the way the provisioner does and
-  # boots it under QEMU/OVMF with a serial console.
+  # The guest image: a complete Alpine root with the head, the runtime and the
+  # Tauri UI already installed.
   #
-  # The assertion is deliberately about the *overlay pipeline*, not about the UI
-  # appearing: a CI runner has no GPU and the image carries no ZIM data, so the
-  # kiosk cannot paint. What it can prove -- and what was actually broken -- is
-  # that firmware finds the EFI stub, the kernel loads, apkovl is located and
-  # unpacked, and our OpenRC service is registered and runs.
+  # This replaces the netboot + apkovl + offline-mirror arrangement, and the
+  # reason is not convenience. That design had the guest *install itself at boot*
+  # from a package repository, which means the boot depends on a repository being
+  # present, reachable and trusted. It failed on the last of those: `apk index`
+  # produces an unsigned APKINDEX, Alpine's initramfs runs apk without
+  # --allow-untrusted, so every base install was refused and the root came up
+  # empty -- "/sbin/init not found in new root". Signing it properly needs
+  # Alpine's own key, which we cannot have.
+  #
+  # Resolving packages at build time removes the entire class. Here the repos are
+  # upstream and genuinely signed, because CI has network. The stick then carries
+  # a finished filesystem: nothing to resolve, nothing to trust, nothing to fetch.
+  # That is also what makes the stick self-contained -- the guest needs neither
+  # the host nor a network, because there is nothing left for it to ask for.
+  #
+  # Built without privileges: `apk add --root` needs none, and `mke2fs -d`
+  # populates a filesystem image from a directory without a loop mount.
   # ---------------------------------------------------------------------------
-  boot:
-    name: bootability (QEMU/OVMF)
+  guest-image:
+    name: guest image (self-contained)
     runs-on: ubuntu-latest
-    needs: [overlay, apk-closure]
+    needs: [guest-ui]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
-        with:
-          python-version: '3.12'
-
-      - name: Emulation and image tooling
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq qemu-system-x86 ovmf dosfstools mtools curl
-
-      - name: Fetch Alpine netboot artefacts
-        run: |
-          set -eux
-          BASE="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_VERSION}/releases/${ALPINE_ARCH}/netboot"
-          mkdir -p stick/boot
-          curl -fsSL -o stick/boot/vmlinuz-lts   "$BASE/vmlinuz-lts"
-          curl -fsSL -o stick/boot/initramfs-lts "$BASE/initramfs-lts"
-          curl -fsSL -o stick/boot/modloop-lts   "$BASE/modloop-lts"
-          ls -lh stick/boot
-
-      - name: Generate the overlay from the shipping code path
-        run: |
-          set -eux
-          pip install -e . >/dev/null
-          python - <<'PY'
-          from pathlib import Path
-          from knowledge_base_builder.cli import _build_alpine_overlay
-          p = _build_alpine_overlay(Path("stick"))
-          print("overlay:", p, p.stat().st_size, "bytes")
-          PY
-          test -f stick/boot/apkovl.tar.gz
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
-          name: guest-apks
-          path: stick/apks
+          name: launch_kbb-alpine-x86_64
+          path: ui
 
-      - name: Mark the medium as an Alpine boot repository
+      - name: Build the Alpine root
         run: |
           set -eux
-          # Alpine's initramfs identifies boot media by locating this marker. Its
-          # absence is why the previous run mounted the FAT32 volume and then
-          # still reported "Mounting boot media: failed" -- the filesystem was
-          # fine; nothing on it said "I am the boot repository".
-          touch stick/apks/.boot_repository
-          find stick/apks -maxdepth 2 | head
+          chmod +x ui/launch_kbb
+          # apk-tools from the Alpine container, writing into a plain directory on
+          # the runner. --initdb makes a fresh root; the repositories are upstream
+          # and signed, so this is the one place trust is actually established.
+          docker run --rm \
+            -v "$PWD:/work" -w /work \
+            alpine:3.20 sh -eux -c '
+              apk add --no-cache alpine-conf
+              mkdir -p /work/rootfs
+              apk add --root /work/rootfs --initdb --arch x86_64 --no-cache \
+                --repository https://dl-cdn.alpinelinux.org/alpine/v3.20/main \
+                --repository https://dl-cdn.alpinelinux.org/alpine/v3.20/community \
+                alpine-base busybox openrc util-linux eudev dbus \
+                linux-lts mkinitfs \
+                cage seatd mesa-dri-gallium mesa-egl \
+                webkit2gtk gtk+3.0 font-dejavu \
+                python3 py3-pip
+            '
+          sudo chown -R "$(id -u):$(id -g)" rootfs
+          du -sh rootfs
 
-      - name: Build a real FAT32 image
+      - name: Install the UI and the kiosk head
         run: |
           set -eux
-          # NOT QEMU's `fat:rw:` VVFAT. That synthesises a FAT16 volume whose
-          # geometry Alpine's init cannot reliably probe -- it reports "Mounting
-          # boot media failed" and lands on a bare initramfs. Commit 02445e0
-          # replaced vvfat with raw passthrough on the stick for this exact
-          # reason; CI has to boot the same shape of medium the field does.
-          dd if=/dev/zero of=stick.img bs=1M count=2048 status=none
-          mkfs.vfat -F 32 -n KBB stick.img
-          mcopy -i stick.img -s stick/boot ::/
-          mcopy -i stick.img -s stick/apks ::/
-          mdir -i stick.img ::/boot
-          mdir -i stick.img ::/apks
+          install -Dm755 ui/launch_kbb rootfs/usr/local/bin/launch_kbb
 
-      - name: Boot it
+          # Generate the guest's OpenRC/init configuration from the shipping code
+          # path rather than restating it here, so the sandbox CI tests the same
+          # bytes the provisioner writes.
+          python3 - <<'PY'
+          import pathlib, sys
+          sys.path.insert(0, "src")
+          from knowledge_base_builder.cli import write_guest_root_config
+          write_guest_root_config(pathlib.Path("rootfs"))
+          print("guest root configured")
+          PY
+
+          # OpenRC needs the kiosk in the default runlevel.
+          mkdir -p rootfs/etc/runlevels/default rootfs/etc/runlevels/sysinit
+          ln -sf /etc/init.d/kbb-kiosk rootfs/etc/runlevels/default/kbb-kiosk
+          for svc in devfs dmesg mdev; do
+            [ -f "rootfs/etc/init.d/$svc" ] && ln -sf "/etc/init.d/$svc" "rootfs/etc/runlevels/sysinit/$svc" || true
+          done
+          for svc in udev dbus seatd; do
+            [ -f "rootfs/etc/init.d/$svc" ] && ln -sf "/etc/init.d/$svc" "rootfs/etc/runlevels/default/$svc" || true
+          done
+          ls -l rootfs/etc/runlevels/default/
+
+      - name: Generate an initramfs that can find a virtio root
+        run: |
+          set -eux
+          KVER=$(ls rootfs/lib/modules | head -1)
+          echo "kernel: $KVER"
+          docker run --rm -v "$PWD/rootfs:/rootfs" alpine:3.20 sh -eux -c "
+            apk add --no-cache mkinitfs
+            cp -a /rootfs /r 2>/dev/null || true
+            chroot /rootfs /sbin/mkinitfs -F 'base virtio ext4 kms dri' -o /boot/initramfs-kbb $KVER
+          "
+          ls -lh rootfs/boot/
+
+      - name: Package the image
+        run: |
+          set -eux
+          # mke2fs -d populates from a directory: no loop device, no privileges.
+          # 3 GiB leaves headroom for the KBB wheel and a writable /tmp.
+          /sbin/mke2fs -t ext4 -d rootfs -L KBBGUEST -m 0 -F kbb_guest.img 3G
+          /sbin/e2fsck -fn kbb_guest.img || true
+          KVER=$(ls rootfs/lib/modules | head -1)
+          cp "rootfs/boot/vmlinuz-lts" vmlinuz-kbb
+          cp "rootfs/boot/initramfs-kbb" initramfs-kbb
+          ls -lh kbb_guest.img vmlinuz-kbb initramfs-kbb
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: kbb-guest-image
+          path: |
+            kbb_guest.img
+            vmlinuz-kbb
+            initramfs-kbb
+          retention-days: 7
+          compression-level: 6
+
+  # ---------------------------------------------------------------------------
+  # Does the UI actually come up?
+  #
+  # Every previous boot assertion checked that the machinery *leading to* the UI
+  # ran. None of them checked the UI, which is why a boot ending in an emergency
+  # shell once passed. This one waits for the guest to report that the Tauri
+  # process is alive, and fails on the markers that mean it is not.
+  # ---------------------------------------------------------------------------
+  guest-boot:
+    name: UI starts in the VM
+    runs-on: ubuntu-latest
+    needs: [guest-image]
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: kbb-guest-image
+
+      - name: Emulation
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-system-x86
+
+      - name: Boot the guest and wait for the UI
         timeout-minutes: 12
         run: |
           set -eux
-          # Direct kernel boot. Firmware chainloading is GRUB's job and is covered
-          # by the provisioner's own tests; what needs emulating here is the
-          # kernel -> initramfs -> apkovl -> OpenRC path.
-          #
-          # No `quiet`: when this fails, the reason is in the lines quiet hides.
-          timeout 540 qemu-system-x86_64 \
-            -m 2048 -smp 2 -nographic -no-reboot \
-            -kernel stick/boot/vmlinuz-lts \
-            -initrd stick/boot/initramfs-lts \
-            -drive file=stick.img,format=raw,if=virtio \
-            -append "console=ttyS0 modules=loop,squashfs,sd-mod,usb-storage,vfat,virtio_blk,virtio_pci alpine_dev=vda:vfat alpine_repo=/media/vda/apks modloop=/boot/modloop-lts apkovl=/dev/vda:vfat:/boot/apkovl.tar.gz kbb_mode=qemu" \
+          # virtio-vga gives the guest a DRM node. cage is a DRM compositor, so
+          # without one it exits instantly -- the runner has no GPU, but virtio-gpu
+          # is a real DRM device to the guest regardless of the host display.
+          timeout 420 qemu-system-x86_64 \
+            -M q35 -m 3072 -smp 2 -no-reboot \
+            -kernel vmlinuz-kbb -initrd initramfs-kbb \
+            -drive file=kbb_guest.img,format=raw,if=virtio \
+            -append "root=/dev/vda rootfstype=ext4 rw console=ttyS0 kbb_mode=qemu" \
+            -device virtio-vga \
+            -display none -serial stdio \
             2>&1 | tee boot.log || true
-          echo "--- boot log tail ---"
-          tail -80 boot.log
+          echo "--- tail ---"; tail -60 boot.log
 
-      - name: Assert the boot reached our overlay
+      - name: Assert the UI started
         run: |
           set -eux
-          # Kernel came up at all.
-          grep -qi "Linux version" boot.log
-          # The medium was mountable. This is the assertion that catches a
-          # regression back to vvfat or a broken image layout.
-          if grep -qiE "Mounting boot media:? failed" boot.log; then
-            echo "::error::boot media not mountable -- the image, not the overlay, is wrong"
+          if grep -qiE "emergency|init not found|Kernel panic" boot.log; then
+            echo "::error::guest did not reach userspace"
+            grep -iE -B3 "emergency|init not found|Kernel panic" boot.log | tail -12
             exit 1
           fi
-          # An emergency shell is a failed boot however far it got. This job
-          # previously went green on a boot that ended here, because the grep
-          # below also matched the kernel command line echoed at line 1 -- the
-          # assertion was satisfied by its own input.
-          if grep -qi "emergency recovery shell" boot.log; then
-            echo "::error::boot fell through to an emergency shell"
-            grep -B3 -i "emergency recovery shell" boot.log | tail -8
+          # cage must have claimed the DRM device.
+          grep -qa "KBB-HEAD-STARTED" boot.log || {
+            echo "::error::cage did not start -- no compositor, so no window"
+            grep -a "KBB-" boot.log || true
             exit 1
-          fi
-          # The root actually came up: init ran and OpenRC reached a runlevel.
-          grep -qiE "Welcome to Alpine|OpenRC .* is starting up|runlevel" boot.log
-          # ...and our overlay was applied. Anchored past the cmdline echo so it
-          # cannot match the parameter that requested it.
-          grep -aiE "Alpine Local Backup|kbb-kiosk|KBB Python runtime|KBB\] USB" boot.log
-          echo "boot reached userspace with the KBB overlay applied"
+          }
+          # ...and the Tauri process must still be alive after it.
+          grep -qa "KBB-UI-ALIVE" boot.log || {
+            echo "::error::the Tauri UI did not stay running"
+            grep -a "KBB-" boot.log || true
+            exit 1
+          }
+          echo "Tauri UI is running inside the VM"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         if: always()
         with:
-          name: boot-log
+          name: guest-boot-log
           path: boot.log
           retention-days: 7
