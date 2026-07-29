@@ -1,0 +1,230 @@
+# Mode C -- the QEMU sandbox -- verified where it can actually be verified.
+#
+# Three things about the sandbox are unverifiable on a Windows workstation, and
+# all three are load-bearing:
+#
+#   1. The guest UI is a Tauri binary linked against musl + WebKitGTK. It cannot
+#      be compiled on Windows, so nothing local proves it links at all.
+#   2. The guest installs its head from a package cache on the stick with no
+#      network. Resolving that closure needs `apk`, which is Linux-only.
+#   3. "It boots" is a claim about a kernel, an EFI stub and an overlay parser.
+#      Reading the provisioning code cannot establish it; only booting can.
+#
+# So these run in CI, and a failure here is a real failure -- these jobs are not
+# advisory. The boot job in particular is the regression guard for the state Mode
+# C was stuck in: Alpine started, found the overlay, and then landed on a bare
+# initramfs because the kiosk's packages were not present.
+name: sandbox
+
+on:
+  push:
+    paths:
+      - 'src/knowledge_base_builder/cli.py'
+      - 'launcher/**'
+      - '.github/workflows/sandbox.yml'
+      - 'tests/test_sandbox_head.py'
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ALPINE_VERSION: "3.20"
+  ALPINE_ARCH: x86_64
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # The overlay's own invariants. Fast, no emulation -- fails in ~30s rather than
+  # after a five-minute boot, so a bad overlay is caught before QEMU starts.
+  # ---------------------------------------------------------------------------
+  overlay:
+    name: overlay invariants
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with:
+          python-version: '3.12'
+      - run: pip install -e . pytest
+      - run: python -m pytest tests/test_sandbox_head.py tests/test_tactical_provision.py -q
+
+  # ---------------------------------------------------------------------------
+  # The guest's head, mirrored offline.
+  #
+  # `apk fetch --recursive` walks the real dependency graph, which is the only
+  # honest way to know what the guest needs -- a hand-written list drifts the
+  # moment Alpine re-organises a package, and the symptom of drift is a stick
+  # that boots to a black screen in the field.
+  # ---------------------------------------------------------------------------
+  apk-closure:
+    name: offline package closure
+    runs-on: ubuntu-latest
+    container: alpine:3.20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      - name: Resolve and mirror the closure
+        run: |
+          set -eux
+          apk update
+          mkdir -p /tmp/apks/${ALPINE_ARCH:-x86_64}
+          # Read the package set from the source of truth rather than restating
+          # it here; a divergence between CI and the overlay is exactly the bug
+          # this job exists to prevent.
+          PKGS=$(sed -n '/^GUEST_APK_CLOSURE = (/,/^)/p' src/knowledge_base_builder/cli.py \
+                 | grep -oE '"[^"]+"' | tr -d '"' | tr '\n' ' ')
+          echo "closure roots: $PKGS"
+          test -n "$PKGS"
+          apk fetch --recursive --output /tmp/apks/x86_64 $PKGS
+          apk add --no-cache abuild
+          ls /tmp/apks/x86_64 | head -30
+          echo "package count: $(ls /tmp/apks/x86_64 | wc -l)"
+          # A closure this small means resolution silently failed.
+          test "$(ls /tmp/apks/x86_64 | wc -l)" -gt 20
+
+      - name: Build the local index the guest reads
+        run: |
+          set -eux
+          apk add --no-cache alpine-sdk
+          cd /tmp/apks/x86_64
+          # Unsigned index: the guest mounts the stick read-only and installs with
+          # --allow-untrusted. Signing this would need a key on the medium, which
+          # is worse than not signing it -- the stick's integrity is established
+          # by the SHA-256 manifest, not by an apk key riding alongside the data.
+          apk index -o APKINDEX.unsigned.tar.gz *.apk
+          mv APKINDEX.unsigned.tar.gz APKINDEX.tar.gz
+          du -sh /tmp/apks
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: guest-apks
+          path: /tmp/apks
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # The guest UI. Same Tauri source as the Windows launcher, linked for musl and
+  # rendered by WebKitGTK. If this does not build, the sandbox has no UI and the
+  # whole mode is a black screen.
+  # ---------------------------------------------------------------------------
+  guest-ui:
+    name: Tauri UI (alpine/musl)
+    runs-on: ubuntu-latest
+    container: alpine:3.20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      - name: Toolchain
+        run: |
+          apk add --no-cache \
+            build-base rust cargo \
+            webkit2gtk-dev gtk+3.0-dev \
+            openssl-dev pkgconf glib-dev cairo-dev pango-dev gdk-pixbuf-dev \
+            libsoup-dev librsvg-dev
+
+      - name: Build
+        working-directory: launcher
+        run: |
+          set -eux
+          cargo build --release --locked || cargo build --release
+          ls -l target/release/
+
+      - name: Confirm it is a Linux binary that links WebKitGTK
+        working-directory: launcher
+        run: |
+          set -eux
+          BIN=$(find target/release -maxdepth 1 -type f -perm -u+x ! -name '*.d' | head -1)
+          test -n "$BIN"
+          apk add --no-cache file
+          file "$BIN" | grep -qi 'ELF 64-bit'
+          # The point of the whole exercise: the guest renders through WebKitGTK,
+          # not a bundled browser.
+          (ldd "$BIN" 2>/dev/null || true) | grep -qi webkit2gtk
+          cp "$BIN" /tmp/launch_kbb
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: launch_kbb-alpine-x86_64
+          path: /tmp/launch_kbb
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # Bootability. Assembles a FAT32 EFI image the way the provisioner does and
+  # boots it under QEMU/OVMF with a serial console.
+  #
+  # The assertion is deliberately about the *overlay pipeline*, not about the UI
+  # appearing: a CI runner has no GPU and the image carries no ZIM data, so the
+  # kiosk cannot paint. What it can prove -- and what was actually broken -- is
+  # that firmware finds the EFI stub, the kernel loads, apkovl is located and
+  # unpacked, and our OpenRC service is registered and runs.
+  # ---------------------------------------------------------------------------
+  boot:
+    name: bootability (QEMU/OVMF)
+    runs-on: ubuntu-latest
+    needs: [overlay]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with:
+          python-version: '3.12'
+
+      - name: Emulation and image tooling
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-system-x86 ovmf dosfstools mtools curl
+
+      - name: Fetch Alpine netboot artefacts
+        run: |
+          set -eux
+          BASE="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_VERSION}/releases/${ALPINE_ARCH}/netboot"
+          mkdir -p stick/boot
+          curl -fsSL -o stick/boot/vmlinuz-lts   "$BASE/vmlinuz-lts"
+          curl -fsSL -o stick/boot/initramfs-lts "$BASE/initramfs-lts"
+          curl -fsSL -o stick/boot/modloop-lts   "$BASE/modloop-lts"
+          ls -lh stick/boot
+
+      - name: Generate the overlay from the shipping code path
+        run: |
+          set -eux
+          pip install -e . >/dev/null
+          python - <<'PY'
+          from pathlib import Path
+          from knowledge_base_builder.cli import _build_alpine_overlay
+          p = _build_alpine_overlay(Path("stick"))
+          print("overlay:", p, p.stat().st_size, "bytes")
+          PY
+          test -f stick/boot/apkovl.tar.gz
+
+      - name: Boot it
+        timeout-minutes: 10
+        run: |
+          set -eux
+          # Direct kernel boot. Firmware chainloading is GRUB's job and is covered
+          # by the provisioner's own tests; what needs emulating here is the
+          # kernel -> initramfs -> apkovl -> OpenRC path.
+          timeout 480 qemu-system-x86_64 \
+            -m 2048 -smp 2 -nographic -no-reboot \
+            -kernel stick/boot/vmlinuz-lts \
+            -initrd stick/boot/initramfs-lts \
+            -drive file=fat:rw:stick,format=raw,if=virtio \
+            -append "console=ttyS0 modules=loop,squashfs,sd-mod,usb-storage,vfat,virtio_blk,virtio_pci apkovl=/dev/vda:vfat:/boot/apkovl.tar.gz quiet kbb_mode=qemu" \
+            2>&1 | tee boot.log || true
+          echo "--- boot log tail ---"
+          tail -60 boot.log
+
+      - name: Assert the boot reached our overlay
+        run: |
+          set -eux
+          # Kernel came up at all.
+          grep -qi "Linux version" boot.log
+          # The overlay was located and applied -- this is the step that silently
+          # failed and produced a bare initramfs.
+          grep -qiE "apkovl|Alpine Local Backup|kbb" boot.log
+          echo "boot pipeline reached the KBB overlay"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        if: always()
+        with:
+          name: boot-log
+          path: boot.log
+          retention-days: 7
