@@ -112,14 +112,35 @@ def content_disposition_for(name: str) -> str:
 async def harden_content_responses(request: Request, call_next):
     """Sandbox everything the content plane emits."""
     response: Response = await call_next(request)
-    # `sandbox` without allow-scripts/allow-same-origin denies script execution,
-    # form submission and same-origin privileges even for HTML that reaches a
-    # browser directly. This is the load-bearing control, not the escaping.
-    response.headers["Content-Security-Policy"] = (
-        "sandbox; default-src 'none'; img-src 'self' data: blob:; "
-        "media-src 'self' blob:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; "
-        "frame-ancestors http://127.0.0.1:* http://localhost:*"
-    )
+    # Two populations live on this origin and they need different policies:
+    #
+    #   * KBB's OWN generated pages (the /files listing, the /read reader shell).
+    #     These are our markup and they need their stylesheet, their theming script
+    #     and an inner frame for the document being read.
+    #   * RAW downloaded files. These are untrusted and get `sandbox` plus
+    #     Content-Disposition: attachment, applied at the point of delivery.
+    #
+    # A blanket `sandbox` here was wrong: it makes the origin opaque and disables
+    # ALL script, so the reader shell could not theme itself and, with no frame-src,
+    # the PDF frame inside it was blocked -- it broke the product's main function
+    # while adding nothing, because the raw-file path already carries its own
+    # sandbox. Handlers that need the stricter policy set it themselves, and this
+    # default is not allowed to overwrite it.
+    if "content-security-policy" not in response.headers:
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'none'; "
+            "script-src 'self' 'unsafe-inline'; "
+            "style-src 'self' 'unsafe-inline'; "
+            "img-src 'self' data: blob:; "
+            "media-src 'self' blob:; "
+            "font-src 'self' data:; "
+            "frame-src 'self'; "
+            "object-src 'none'; "
+            "base-uri 'none'; "
+            "form-action 'none'; "
+            # Only the console may frame this plane.
+            "frame-ancestors http://127.0.0.1:* http://localhost:*"
+        )
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["Referrer-Policy"] = "no-referrer"
     response.headers["Cache-Control"] = "no-store"
@@ -271,13 +292,31 @@ async def add_security_headers(request: Request, call_next):
     response: Response = await call_next(request)
     
     # Content Security Policy - restrict to loopback and local resources only
+    # 'unsafe-eval' is absent deliberately: nothing in any served template calls
+    # eval() or new Function, so permitting it granted an attacker a primitive the
+    # application itself never needed.
+    #
+    # 'unsafe-inline' remains for script-src and is the known remaining gap (D20).
+    # Closing it requires the 491 lines of console JS to move out of the Python
+    # string literal into a served route, and the 22 inline on* handlers to become a
+    # delegated dispatcher -- plus a CSP hash for the pre-paint script, which MUST
+    # stay inline because an external fetch runs after first paint and would
+    # reintroduce the bright flash that night discipline exists to prevent. That is
+    # a bounded refactor of the primary UI, tracked rather than half-applied.
+    #
+    # style-src keeps 'unsafe-inline' for the 21 style= attributes. Inline style is
+    # not an execution primitive, so removing it is presentation work, not a
+    # security control, and is not conflated with the script question.
     response.headers["Content-Security-Policy"] = (
-        "default-src 'self' 'unsafe-inline' 'unsafe-eval' data: blob:; "
+        "default-src 'self' data: blob:; "
         "connect-src 'self' ws://127.0.0.1:* wss://127.0.0.1:* ws://localhost:* wss://localhost:*; "
         "frame-src 'self' http://127.0.0.1:* http://localhost:*; "
+        "frame-ancestors 'none'; "
+        "object-src 'none'; "
+        "base-uri 'none'; "
         "img-src 'self' data: blob:; "
         "style-src 'self' 'unsafe-inline'; "
-        "script-src 'self' 'unsafe-inline' 'unsafe-eval';"
+        "script-src 'self' 'unsafe-inline';"
     )
     
     # Additional security headers
@@ -1138,7 +1177,17 @@ async def static_files(path: str) -> Any:
     disposition = content_disposition_for(target.name)
     return FileResponse(
         target,
-        headers={"Content-Disposition": f'{disposition}; filename="{target.name}"'},
+        headers={
+            "Content-Disposition": f'{disposition}; filename="{target.name}"',
+            # THIS is where sandbox belongs: an opaque, script-disabled context for
+            # bytes that came from Archive.org or Kiwix. Set here rather than plane
+            # wide so KBB's own reader pages keep working.
+            "Content-Security-Policy": (
+                "sandbox; default-src 'none'; img-src 'self' data: blob:; "
+                "media-src 'self' blob:; style-src 'unsafe-inline'; "
+                "frame-ancestors http://127.0.0.1:* http://localhost:*"
+            ),
+        },
     )
 
 

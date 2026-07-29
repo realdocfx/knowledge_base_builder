@@ -81,13 +81,61 @@ def content_client():
     return TestClient(web.content_app)
 
 
-def test_content_responses_are_sandboxed(content_client):
-    """A sandbox CSP denies scripts, forms and same-origin privileges."""
+def test_generated_pages_are_locked_down_but_functional(content_client):
+    """KBB's own pages on this plane get a strict policy -- not a blanket sandbox.
+
+    A plane-wide ``sandbox`` was the first attempt and it broke the product's main
+    function: it makes the origin opaque and disables ALL script, so the reader
+    shell could not theme itself, and with no ``frame-src`` the PDF frame inside it
+    was blocked. It also added nothing, because raw files carry their own sandbox at
+    the point of delivery.
+    """
     r = content_client.get("/files/", follow_redirects=False)
     csp = r.headers.get("content-security-policy", "")
-    assert "sandbox" in csp, f"content plane must sandbox its responses; got {csp!r}"
+    assert "default-src 'none'" in csp, csp
+    assert "object-src 'none'" in csp and "form-action 'none'" in csp, csp
+    # The reader shell must be able to load its own script and embed the document.
+    assert "script-src 'self'" in csp, f"reader pages cannot theme themselves: {csp!r}"
+    assert "frame-src 'self'" in csp, f"the document frame would be blocked: {csp!r}"
+    # Only the console may frame this plane.
+    assert "frame-ancestors http://127.0.0.1:*" in csp, csp
     assert r.headers.get("x-content-type-options") == "nosniff", (
         "without nosniff the browser may re-interpret a payload as HTML"
+    )
+
+
+def test_raw_downloaded_files_are_sandboxed(tmp_path, monkeypatch):
+    """Sandbox belongs on the untrusted bytes, applied where they are delivered."""
+    from knowledge_base_builder.buckets.usb import UsbBucket
+
+    bucket = UsbBucket(str(tmp_path))
+    bucket.initialize()
+    (tmp_path / "payload.pdf").write_bytes(b"%PDF-1.4 x")
+    monkeypatch.setattr(web, "BUCKET", bucket)
+
+    r = TestClient(web.content_app).get("/files/payload.pdf", follow_redirects=False)
+    assert r.status_code == 200, r.status_code
+    csp = r.headers.get("content-security-policy", "")
+    assert "sandbox" in csp, f"raw file served without a sandbox: {csp!r}"
+    assert "default-src 'none'" in csp, csp
+    assert r.headers.get("content-disposition", "").startswith("inline"), (
+        "a PDF is inline-safe and must still render in the reader"
+    )
+
+
+def test_raw_active_content_is_sandboxed_and_downloaded(tmp_path, monkeypatch):
+    """The stored-XSS case: markup must be both sandboxed and forced to download."""
+    from knowledge_base_builder.buckets.usb import UsbBucket
+
+    bucket = UsbBucket(str(tmp_path))
+    bucket.initialize()
+    (tmp_path / "evil.html").write_text("<script>alert(1)</script>", encoding="utf-8")
+    monkeypatch.setattr(web, "BUCKET", bucket)
+
+    r = TestClient(web.content_app).get("/files/evil.html", follow_redirects=False)
+    assert "sandbox" in r.headers.get("content-security-policy", "")
+    assert r.headers.get("content-disposition", "").startswith("attachment"), (
+        "downloaded markup must never render as a document"
     )
 
 
