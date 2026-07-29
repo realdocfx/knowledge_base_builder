@@ -197,3 +197,23 @@ def test_the_kiosk_is_in_the_default_runlevel():
     assert "kbb-kiosk" in cli.GUEST_RUNLEVELS["default"], (
         "the kiosk is never started, so the guest boots to nothing"
     )
+
+
+def test_the_attached_ui_can_authenticate(rootfs):
+    """The guest UI attaches to a portal it did not start, so it needs the token.
+
+    /api/* is token-gated. Without a published token file the window loads and
+    every call returns 401 -- a UI that renders and does nothing, which is harder
+    to diagnose than one that fails to start.
+    """
+    svc = _read(rootfs, "etc/init.d/kbb-kiosk")
+    assert "KBB_TOKEN_FILE" in svc, (
+        "the kiosk starts the portal but never tells it where to publish the "
+        "control-plane token, so the attached UI cannot authenticate"
+    )
+    tok = svc.index("KBB_TOKEN_FILE")
+    assert svc.index("KBB_PORTAL_URL") > 0, "no portal URL exported for the UI"
+    assert "portal" in svc[tok:], (
+        "KBB_TOKEN_FILE is exported after the portal starts, so the portal never "
+        "sees it"
+    )

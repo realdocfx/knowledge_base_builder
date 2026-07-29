@@ -119,7 +119,17 @@ fn main() {
     };
     let kbb_app = usb_root.join(".kb_env").join("app");
 
-    // 2. Allocate the loopback port
+    // 2. Attach or own?
+    //
+    // In the QEMU sandbox the kiosk service starts the portal before the UI, so
+    // the launcher must attach to it rather than spawn a second one -- two
+    // portals would race for the port and duplicate the process. KBB_PORTAL_URL
+    // being set is what says "someone else owns the lifecycle".
+    let external_portal = std::env::var("KBB_PORTAL_URL")
+        .ok()
+        .filter(|u| !u.trim().is_empty());
+
+    // 3. Allocate the loopback port (own-portal mode only)
     let port = get_free_port();
 
     // 3. Spawn KBB FastAPI Portal Backend in an isolated environment
@@ -141,15 +151,41 @@ fn main() {
     // backend mints it with Python's `secrets` and publishes it here; we read it
     // back and navigate pre-authorised. Stale files are removed first so we can
     // never present a previous run's token.
-    let token_path = std::env::temp_dir().join(format!("kbb_token_{}.txt", port));
-    let _ = std::fs::remove_file(&token_path);
+    // When attaching, the portal was started by whoever owns it and publishes
+    // its token where KBB_TOKEN_FILE points; removing that file would destroy
+    // a token we do not own.
+    let token_path = match std::env::var("KBB_TOKEN_FILE") {
+        Ok(p) if !p.trim().is_empty() => std::path::PathBuf::from(p),
+        _ => {
+            let p = std::env::temp_dir().join(format!("kbb_token_{}.txt", port));
+            let _ = std::fs::remove_file(&p);
+            p
+        }
+    };
     cmd.env("KBB_TOKEN_FILE", &token_path);
     
     // Prevent the Python console window from flashing on Windows hosts
     #[cfg(target_os = "windows")]
     cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
 
-    let mut backend_child = cmd.spawn().expect("CRITICAL: Failed to start KBB FastAPI backend.");
+    // A missing interpreter must not kill the UI. Panicking here took the whole
+    // window down, so the operator saw nothing at all -- no diagnosis, and under
+    // cage a bare screen with the supervisor restarting the same failure. The
+    // window opens either way and reports what it could not reach.
+    let mut backend_child: Option<std::process::Child> = if external_portal.is_some() {
+        eprintln!("[KBB] attaching to portal owned by the environment; not spawning one");
+        None
+    } else {
+        match cmd.spawn() {
+            Ok(child) => Some(child),
+            Err(e) => {
+                eprintln!(
+                    "[KBB] could not start the portal backend ({e}); the window will                      open and report the portal as unreachable"
+                );
+                None
+            }
+        }
+    };
 
     // 4. Initialize the hardened Tauri shell. The window opens IMMEDIATELY on the
     // bundled loading screen (index.html), which is told the portal URL via an
@@ -157,7 +193,9 @@ fn main() {
     // *webview* can actually reach the backend. Doing the reachability check from
     // the webview (not a Rust-side request) avoids navigating to a URL the webview
     // cannot open, which otherwise shows ERR_CONNECTION_REFUSED.
-    let target_url = format!("http://127.0.0.1:{}", port);
+    let target_url = external_portal
+        .clone()
+        .unwrap_or_else(|| format!("http://127.0.0.1:{}", port));
 
     tauri::Builder::default()
         .setup(move |app| {
@@ -243,8 +281,11 @@ fn main() {
             // 5. Graceful mission abort & cleanup.
             if let RunEvent::Exit = event {
                 // KBB guarantees data preservation via atomic writes, so a hard kill is safe
-                let _ = backend_child.kill();
-                let _ = backend_child.wait();
+                // Only reap a portal we started; an attached one outlives us.
+                if let Some(child) = backend_child.as_mut() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
             }
         });
 }
