@@ -216,11 +216,14 @@ fn main() {
             let boot_path = std::env::temp_dir().join("kbb_boot.html");
             let boot_written = std::fs::write(&boot_path, LOADING_HTML).is_ok();
             let boot_target = if boot_written {
-                let boot_url = format!(
-                    "file:///{}",
-                    boot_path.to_string_lossy().replace('\\', "/")
-                );
-                match boot_url.parse() {
+                // Url::from_file_path rather than formatting "file:///{}" by hand.
+                // Hand-formatting assumed a Windows path, which has no leading
+                // separator: on Linux "/tmp/kbb_boot.html" became
+                // "file:////tmp/kbb_boot.html" -- four slashes, so the URL parsed
+                // with an empty authority and a path Tauri could not resolve, and
+                // it unwrapped None inside manager.rs. This API knows the platform
+                // rules for both, including drive letters and percent-encoding.
+                match tauri::Url::from_file_path(&boot_path) {
                     Ok(u) => tauri::WindowUrl::External(u),
                     Err(_) => tauri::WindowUrl::App("index.html".into()),
                 }

@@ -326,6 +326,32 @@ jobs:
           PY
           sudo find rootfs/etc/runlevels -maxdepth 2 | sort
 
+      - name: Install KBB and its web stack into the guest
+        run: |
+          set -eux
+          # The portal runs INSIDE the guest, so the package and its web stack have
+          # to be in the image. Nothing may be fetched at boot: that is the whole
+          # point of a self-contained stick.
+          #
+          # Installed with the guest's own interpreter inside a container, so the
+          # wheels selected match musl and the guest's Python minor version rather
+          # than the runner's glibc build.
+          cat > install-kbb.sh <<'SCRIPT'
+          #!/bin/sh
+          set -eux
+          apk add --no-cache python3 py3-pip
+          PYV=$(/work/rootfs/usr/bin/python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+          TARGET="/work/rootfs/usr/lib/python$PYV/site-packages"
+          test -d "$TARGET"
+          pip install --break-system-packages --no-cache-dir --target "$TARGET" "/work[web]"
+          # Prove the guest can import it, using the guest's interpreter.
+          PYTHONPATH="$TARGET" /work/rootfs/usr/bin/python3 -c "import knowledge_base_builder, fastapi, uvicorn; print('guest imports ok')"
+          SCRIPT
+          sed -i 's/^          //' install-kbb.sh
+          chmod +x install-kbb.sh
+          docker run --rm -v "$PWD:/work" -w /work alpine:3.20 /work/install-kbb.sh
+          sudo du -sh rootfs
+
       - name: Generate an initramfs that can find a virtio root
         run: |
           set -eux
