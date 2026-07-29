@@ -33,9 +33,9 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
         python: ["3.11", "3.12", "3.13"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
         with:
           python-version: ${{ matrix.python }}
 
@@ -70,8 +70,8 @@ jobs:
     name: lint (ruff + pyflakes)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
         with:
           python-version: "3.13"
       - run: python -m pip install --upgrade pip ruff pyflakes
@@ -90,8 +90,8 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
         with:
           python-version: "3.13"
       - run: python -m pip install --upgrade pip mypy types-requests
@@ -105,8 +105,8 @@ jobs:
     name: dependency audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
         with:
           python-version: "3.13"
       - run: python -m pip install --upgrade pip pip-audit
@@ -121,8 +121,8 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
         with:
           python-version: "3.13"
       # Here the package IS installed, to exercise the real entry point and catch
@@ -148,3 +148,33 @@ jobs:
               assert p.is_file() and p.stat().st_size > 0, f"missing packaged asset: {rel}"
               print("ok", rel, p.stat().st_size, "bytes")
           PY
+
+  action-pins:
+    name: verify action pins resolve
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      # tests/test_supply_chain.py asserts every `uses:` is a 40-char hex SHA, but
+      # format is not existence: a fabricated SHA passed that check and would only
+      # have surfaced during a release. This resolves each pin against the GitHub
+      # API so an invalid or rewritten ref fails on the commit that introduced it.
+      - name: Resolve every pinned action SHA
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          fail=0
+          refs=$(grep -rhoE "uses: [^ ]+@[0-9a-f]{40}" .github/workflows/*.yml                  | sed 's/uses: //' | sort -u)
+          for ref in $refs; do
+            repo="${ref%@*}"; sha="${ref#*@}"
+            got=$(gh api "repos/$repo/commits/$sha" -q .sha 2>/dev/null || true)
+            if [ "$got" = "$sha" ]; then
+              echo "OK   $ref"
+            else
+              echo "BAD  $ref  (does not resolve)"
+              fail=1
+            fi
+          done
+          exit $fail

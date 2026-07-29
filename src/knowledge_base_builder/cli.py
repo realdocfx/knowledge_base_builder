@@ -1001,10 +1001,15 @@ def _install_xapian_wheel(python_dir: Path, python_version: str, local_bundle: O
         raise RuntimeError("Strict MIL-SPEC compliance prevents falling back to unverified PyPI source builds.")
 
 
-def _install_portable_packages(python_dir: Path, package_spec: str, python_version: str, target_os: str, allow_insecure: bool = False) -> None:
+def _install_portable_packages(python_dir: Path, package_spec: str, python_version: str,
+                              target_os: str, allow_insecure: bool = False,
+                              local_bundle: Optional[Path] = None) -> None:
     """Install KBB and web dependencies into the drive runtime.
 
-    MIL-SPEC COMPLIANCE: Uses requirements.txt with SHA-256 hashes for all PyPI dependencies.
+    Dependencies are installed from requirements.txt with --require-hashes, so
+    pip refuses any artefact whose digest does not match the pinned value. With
+    --local-bundle the index is pinned to the bundle (--no-index) so resolution
+    cannot fall through to PyPI.
     ``xapian-bindings`` is provisioned from a pre-compiled wheel matching the target OS.
     No fallback to PyPI source builds - installation must succeed or fail explicitly.
     """
@@ -1038,20 +1043,39 @@ def _install_portable_packages(python_dir: Path, package_spec: str, python_versi
             check=True,
         )
 
-    console.print("[cyan]Installing web runtime dependencies...[/cyan]")
-    subprocess.run(
-        [
-            str(python_exe),
-            "-m",
-            "pip",
-            "install",
-            "--no-cache-dir",
-            "fastapi>=0.100.0",
-            "uvicorn[standard]>=0.23.0",
-            "httpx>=0.24.0",
-        ],
-        check=True,
-    )
+    # Dependencies come from the hash-pinned requirements file, verified by pip.
+    # This block previously ran `pip install fastapi>=... uvicorn[standard]>=...
+    # httpx>=...` -- loose ranges resolved against live PyPI -- while this
+    # function's own docstring claimed to use "requirements.txt with SHA-256
+    # hashes". The 57 KB pinned file was never consulted, so the advertised
+    # control did not exist. A claim the code does not implement is worse than no
+    # claim: an evaluator who checks one and finds it hollow discounts everything.
+    requirements = Path(__file__).resolve().parent.parent.parent / "requirements.txt"
+    if not requirements.is_file():
+        # Fall back to the installed package's recorded metadata rather than
+        # inventing version ranges, and say so plainly.
+        console.print(
+            "[yellow]requirements.txt not found beside the package; installing web "
+            "extras without hash verification. Provision from a source checkout to "
+            "get hash-pinned dependencies.[/yellow]"
+        )
+        subprocess.run(
+            [str(python_exe), "-m", "pip", "install", "--no-cache-dir",
+             "knowledge-base-builder[web]"],
+            check=True,
+        )
+    else:
+        console.print("[cyan]Installing hash-verified dependencies...[/cyan]")
+        cmd = [
+            str(python_exe), "-m", "pip", "install", "--no-cache-dir",
+            "--require-hashes", "-r", str(requirements),
+        ]
+        if local_bundle:
+            # Air-gapped: resolve wheels from the bundle only. Without --no-index
+            # the dependency install still reached PyPI, so --local-bundle covered
+            # only Python/kiwix/get-pip and the air-gap claim was false (D9).
+            cmd += ["--no-index", "--find-links", str(local_bundle)]
+        subprocess.run(cmd, check=True)
 
     _install_xapian_wheel(python_dir, python_version, None, allow_insecure, optional=True)
 
@@ -1561,7 +1585,10 @@ def portable(
     try:
         python_dir = _provision_python_runtime(root, python_version, target_os, bundle_path, allow_insecure_network)
         _bootstrap_pip(python_dir, target_os, bundle_path, allow_insecure_network)
-        _install_portable_packages(python_dir, package_spec, python_version, target_os, allow_insecure_network)
+        _install_portable_packages(
+            python_dir, package_spec, python_version, target_os,
+            allow_insecure_network, bundle_path,
+        )
         _provision_kiwix_runtime(root, kiwix_version, target_os, bundle_path, allow_insecure_network)
         if with_portable_rust:
             _provision_portable_rust(root, target_os, bundle_path, allow_insecure_network)
