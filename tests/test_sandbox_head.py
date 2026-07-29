@@ -148,3 +148,22 @@ def test_offline_package_source_is_declared(overlay):
         f"repositories still point at a network mirror: {repos!r}. An air-gapped "
         "stick must resolve packages from a local cache."
     )
+
+
+def test_offline_mirror_covers_everything_the_guest_installs(overlay):
+    """The closure must satisfy the world, or the guest boots without an init.
+
+    These were two hand-maintained lists. The mirror carried the head but not
+    ``alpine-base``, so the netboot root had no ``/sbin/init`` and the guest
+    dropped to an emergency recovery shell -- a black screen in the field.
+    """
+    from knowledge_base_builder.cli import GUEST_APK_CLOSURE
+
+    world = {ln.strip() for ln in overlay["etc/apk/world"].splitlines() if ln.strip()}
+    missing = world - set(GUEST_APK_CLOSURE)
+    assert not missing, (
+        f"{sorted(missing)} are installed by the guest but never mirrored to the "
+        "stick; with no network apk cannot resolve them"
+    )
+    # The base system specifically -- this is what was absent.
+    assert "alpine-base" in GUEST_APK_CLOSURE, "no alpine-base: the root has no init"

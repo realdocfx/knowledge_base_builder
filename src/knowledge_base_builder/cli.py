@@ -99,19 +99,33 @@ GRUB_EFI_APK_VERSION = f"{ALPINE_ARCH}-2.12-r5"
 OFFLINE_APK_DIR = "/media/kbb/apks"
 BOOT_REPOSITORY_MARKER = ".boot_repository"
 
-# The dependency closure `apk fetch --recursive` must mirror for the guest to
-# install its head offline. Anything absent here means a boot that stalls without
-# a display.
-GUEST_APK_CLOSURE = (
-    "cage",
-    "seatd",
-    "webkit2gtk",
+# The guest's package world -- the SINGLE source of truth.
+#
+# etc/apk/world and the offline mirror are both generated from this tuple. They
+# were previously two hand-maintained lists and they drifted: the mirror carried
+# the head (cage, webkit2gtk) but not alpine-base, so the netboot root had no
+# /sbin/init and the guest dropped straight to an emergency recovery shell. A
+# closure that does not cover the world it has to satisfy is not a closure.
+GUEST_WORLD = (
+    # Base system. Without these the root has no init and never starts.
+    "alpine-base",
+    "busybox",
+    "openrc",
+    "util-linux",     # agetty, for the single autologin TTY
+    "eudev",
+    "dbus",
+    # The head.
+    "cage",           # single-surface Wayland kiosk: no taskbar, no switcher
+    "seatd",          # cage needs a seat manager to claim the DRM device
+    "webkit2gtk",     # Tauri's renderer on Linux
     "gtk+3.0",
     "mesa-dri-gallium",
     "font-dejavu",
-    "dbus",
-    "eudev",
 )
+
+# What `apk fetch --recursive` mirrors onto the stick. Identical by construction,
+# so the two can no longer disagree.
+GUEST_APK_CLOSURE = GUEST_WORLD
 
 # Known-good SHA-256 hashes for provisioning assets (FIPS-approved algorithm)
 # These hashes must be updated when versions change
@@ -1797,17 +1811,7 @@ def _build_alpine_overlay(root: Path) -> Path:
     # browser here would mean a second renderer with its own CSP surface, its own
     # URL handler and its own downloads UI: ~150 MB of attack surface for a UI the
     # product does not use.
-    files["etc/apk/world"] = (
-        "alpine-base\n"
-        "eudev\n"
-        "dbus\n"
-        "cage\n"          # single-surface Wayland kiosk: no taskbar, no switcher
-        "seatd\n"         # cage needs a seat manager to claim the DRM device
-        "webkit2gtk\n"    # Tauri's renderer on Linux
-        "gtk+3.0\n"
-        "font-dejavu\n"
-        "mesa-dri-gallium\n"
-    )
+    files["etc/apk/world"] = "".join(f"{pkg}\n" for pkg in GUEST_WORLD)
 
     # The guest has no network by design. apk's default configuration points at the
     # Alpine CDN, so with no repositories file the kiosk install silently fails and

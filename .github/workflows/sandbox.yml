@@ -271,10 +271,21 @@ jobs:
             echo "::error::boot media not mountable -- the image, not the overlay, is wrong"
             exit 1
           fi
-          # The overlay was located and applied -- the step that silently failed
-          # and produced a bare initramfs.
-          grep -qiE "Alpine Local Backup|apkovl|kbb" boot.log
-          echo "boot pipeline reached the KBB overlay"
+          # An emergency shell is a failed boot however far it got. This job
+          # previously went green on a boot that ended here, because the grep
+          # below also matched the kernel command line echoed at line 1 -- the
+          # assertion was satisfied by its own input.
+          if grep -qi "emergency recovery shell" boot.log; then
+            echo "::error::boot fell through to an emergency shell"
+            grep -B3 -i "emergency recovery shell" boot.log | tail -8
+            exit 1
+          fi
+          # The root actually came up: init ran and OpenRC reached a runlevel.
+          grep -qiE "Welcome to Alpine|OpenRC .* is starting up|runlevel" boot.log
+          # ...and our overlay was applied. Anchored past the cmdline echo so it
+          # cannot match the parameter that requested it.
+          grep -aiE "Alpine Local Backup|kbb-kiosk|KBB Python runtime|KBB\] USB" boot.log
+          echo "boot reached userspace with the KBB overlay applied"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         if: always()
