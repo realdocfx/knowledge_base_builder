@@ -1712,9 +1712,9 @@ IF NOT EXIST "%QEMU%" (
     -smp 2 ^
     -kernel "%USB%boot\vmlinuz-lts" ^
     -initrd "%USB%boot\initramfs-lts" ^
-    -append "console=ttyS0 modules=loop,squashfs,sd-mod,vfat,fat,virtio_blk,virtio_pci apkovl=/dev/vda1:vfat:/boot/apkovl.tar.gz quiet kbb_mode=qemu" ^
+    -append "console=ttyS0 modules=loop,squashfs,sd-mod,vfat,fat,virtio_blk,virtio_pci apkovl=/dev/vda1:vfat:/boot/apkovl.tar.gz alpine_repo=/media/vda1/apks kbb_mode=qemu" ^
     -drive file=%RAW%,format=raw,if=virtio,readonly=on ^
-    -netdev user,id=net0,hostfwd=tcp::8080-:8080 ^
+    -netdev user,id=net0,hostfwd=tcp::18080-:8080 ^
     -device e1000,netdev=net0,romfile="" ^
     -serial stdio
 
@@ -1773,9 +1773,9 @@ exec sudo "$QEMU" \
     -smp 2 \
     -kernel "$USB/boot/vmlinuz-lts" \
     -initrd "$USB/boot/initramfs-lts" \
-    -append "console=ttyS0 modules=loop,squashfs,sd-mod,vfat,fat,virtio_blk,virtio_pci apkovl=/dev/vda1:vfat:/boot/apkovl.tar.gz quiet kbb_mode=qemu" \
+    -append "console=ttyS0 modules=loop,squashfs,sd-mod,vfat,fat,virtio_blk,virtio_pci apkovl=/dev/vda1:vfat:/boot/apkovl.tar.gz alpine_repo=/media/vda1/apks kbb_mode=qemu" \
     -drive file="$RAW",format=raw,if=virtio,readonly=on \
-    -netdev user,id=net0,hostfwd=tcp::8080-:8080 \
+    -netdev user,id=net0,hostfwd=tcp::18080-:8080 \
     -device e1000,netdev=net0,romfile="" \
     -serial stdio
 ''', encoding="utf-8")
