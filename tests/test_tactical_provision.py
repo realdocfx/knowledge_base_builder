@@ -205,7 +205,7 @@ def test_sandbox_launcher_uses_raw_passthrough(tmp_path):
     assert "fat:ro:" not in bat_text and "fat:rw:" not in bat_text, (
         "Windows launcher still uses vvfat virtual FAT driver"
     )
-    assert r"\\.\%" in bat_text, "Windows launcher missing raw volume handle"
+    assert "PhysicalDrive" in bat_text, "Windows launcher missing raw physical drive handle"
 
     sh_text = (tmp_path / "start_sandbox.sh").read_text(encoding="utf-8")
     assert "fat:ro:" not in sh_text and "fat:rw:" not in sh_text, (

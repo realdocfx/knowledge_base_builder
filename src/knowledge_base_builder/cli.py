@@ -1633,13 +1633,19 @@ net session >nul 2>&1 || (
 :: Locate USB Drive Root and raw volume handle
 SET "USB=%~dp0"
 SET "DRV=%~d0"
-SET "RAW=\\.\%DRV%"
 SET "QEMU=%USB%qemu\win\qemu-system-x86_64.exe"
 SET "FW=%USB%qemu\win\share"
 
+:: Auto-detect the PhysicalDrive number for this drive letter.
+:: \\.\D: would be simpler but the host locks the mounted volume;
+:: \\.\PhysicalDriveN bypasses the lock. The guest sees the whole
+:: disk with its partition table, so the FAT32 data is at /dev/vda1.
+FOR /F %%i IN ('powershell -NoProfile -Command "(Get-Partition -DriveLetter %DRV:~0,1%).DiskNumber"') DO SET DISKNUM=%%i
+SET "RAW=\\.\PhysicalDrive%DISKNUM%"
+
 echo [KBB] Initializing Tactical QEMU Sandbox...
 echo [*] USB Root : %USB%
-echo [*] Raw Volume: %RAW%
+echo [*] Raw Disk : %RAW% (PhysicalDrive%DISKNUM%)
 
 IF NOT EXIST "%QEMU%" (
     echo [!] QEMU binary not found at %QEMU%
@@ -1659,7 +1665,7 @@ IF NOT EXIST "%QEMU%" (
     -smp 2 ^
     -kernel "%USB%boot\vmlinuz-lts" ^
     -initrd "%USB%boot\initramfs-lts" ^
-    -append "console=ttyS0 modules=loop,squashfs,sd-mod,vfat,fat,virtio_blk,virtio_pci alpine_dev=/dev/vda:vfat quiet kbb_mode=qemu" ^
+    -append "console=ttyS0 modules=loop,squashfs,sd-mod,vfat,fat,virtio_blk,virtio_pci apkovl=/dev/vda1:vfat:/boot/apkovl.tar.gz quiet kbb_mode=qemu" ^
     -drive file=%RAW%,format=raw,if=virtio,readonly=on ^
     -netdev user,id=net0,hostfwd=tcp::8080-:8080 ^
     -device e1000,netdev=net0,romfile="" ^
@@ -1720,7 +1726,7 @@ exec sudo "$QEMU" \
     -smp 2 \
     -kernel "$USB/boot/vmlinuz-lts" \
     -initrd "$USB/boot/initramfs-lts" \
-    -append "console=ttyS0 modules=loop,squashfs,sd-mod,vfat,fat,virtio_blk,virtio_pci alpine_dev=/dev/vda:vfat quiet kbb_mode=qemu" \
+    -append "console=ttyS0 modules=loop,squashfs,sd-mod,vfat,fat,virtio_blk,virtio_pci apkovl=/dev/vda1:vfat:/boot/apkovl.tar.gz quiet kbb_mode=qemu" \
     -drive file="$RAW",format=raw,if=virtio,readonly=on \
     -netdev user,id=net0,hostfwd=tcp::8080-:8080 \
     -device e1000,netdev=net0,romfile="" \
