@@ -810,6 +810,15 @@ def _extract_tarball(tarball_path: Path, dest: Path) -> None:
 
 def _patch_embedded_pth(python_dir: Path, target_os: str) -> None:
     """Patch the embeddable python*._pth to enable site-packages and import site."""
+    # The ._pth mechanism is specific to the Windows *embeddable* distribution.
+    # python-build-standalone (Linux/macOS) ships a normal prefixed layout with a
+    # working site-packages and no ._pth at all, so demanding one aborted
+    # provisioning on those targets entirely. Nothing to patch is not an error.
+    if not str(target_os).lower().startswith("win"):
+        logger_msg = f"{target_os}: standalone runtime needs no ._pth patch"
+        console.print(f"[dim]{logger_msg}[/dim]")
+        return
+
     pth_files = list(python_dir.glob("python*._pth"))
     if not pth_files:
         raise RuntimeError(f"No python*._pth file found in {python_dir}")
@@ -849,7 +858,7 @@ def _provision_python_runtime(root: Path, python_version: str, target_os: str, l
     python_dir = env_dir / "python"
     python_dir.mkdir(parents=True, exist_ok=True)
 
-    exe_ext = get_executable_extension()
+    exe_ext = get_executable_extension(target_os)
     python_exe = python_dir / f"python{exe_ext}"
 
     if python_exe.exists():
@@ -902,7 +911,7 @@ def _bootstrap_pip(python_dir: Path, target_os: str, local_bundle: Optional[Path
     """Install pip, setuptools, and wheel into the embeddable Python runtime."""
     from .os_utils import get_executable_extension
 
-    exe_ext = get_executable_extension()
+    exe_ext = get_executable_extension(target_os)
     python_exe = python_dir / f"python{exe_ext}"
     get_pip = python_dir / "get-pip.py"
     if not get_pip.exists():
@@ -936,7 +945,10 @@ def _install_xapian_wheel(python_dir: Path, python_version: str, local_bundle: O
     """
     from .os_utils import get_executable_extension
 
-    exe_ext = get_executable_extension()
+    # Xapian is provisioned from a pre-compiled *Windows* wheel (win_amd64), so this
+    # path is Windows-only by construction -- state that explicitly rather than
+    # inheriting whatever the host happens to be.
+    exe_ext = get_executable_extension("windows")
     python_exe = python_dir / f"python{exe_ext}"
     v = python_version.split(".")[:2]
     abi_tag = f"cp{v[0]}{v[1]}"
@@ -1015,7 +1027,7 @@ def _install_portable_packages(python_dir: Path, package_spec: str, python_versi
     """
     from .os_utils import get_executable_extension
 
-    exe_ext = get_executable_extension()
+    exe_ext = get_executable_extension(target_os)
     python_exe = python_dir / f"python{exe_ext}"
 
     # Strip extras from the spec so we control the web dependencies ourselves.
@@ -1098,7 +1110,7 @@ def _provision_kiwix_runtime(root: Path, kiwix_version: str, target_os: str, loc
     kiwix_dir = env_dir / "kiwix"
     kiwix_dir.mkdir(parents=True, exist_ok=True)
 
-    exe_ext = get_executable_extension()
+    exe_ext = get_executable_extension(target_os)
     kiwix_serve = kiwix_dir / f"kiwix-serve{exe_ext}"
 
     if kiwix_serve.exists():

@@ -9,6 +9,7 @@ import subprocess
 import sys
 import webbrowser
 from pathlib import Path
+from typing import Optional
 
 
 # Canonical filesystem tokens the application reasons about. The kernel's own
@@ -272,13 +273,17 @@ def get_platform_name() -> str:
         return "linux"
 
 
-def get_executable_extension() -> str:
-    """Get the appropriate executable extension for the current platform.
-    
-    Returns:
-        '.exe' on Windows, empty string on POSIX systems
+def get_executable_extension(target_os: Optional[str] = None) -> str:
+    """Executable suffix for *target_os*, defaulting to the running host.
+
+    Provisioning builds a runtime for a *target*, which need not be this machine.
+    Callers that omitted the argument silently used the host, so building a Linux
+    stick from Windows searched a .tar.gz extraction for "python.exe" -- which is
+    why cross-provisioning could not work despite --target-os advertising it.
     """
-    return ".exe" if is_windows() else ""
+    if target_os is None:
+        return ".exe" if is_windows() else ""
+    return ".exe" if str(target_os).lower().startswith("win") else ""
 
 
 def get_script_extension() -> str:
