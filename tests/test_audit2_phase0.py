@@ -85,8 +85,20 @@ def test_no_console_sink_concatenates_a_bare_api_value():
     will always be one sink behind; this one looks for the shape.
     """
     js = _console_js()
-    offenders = re.findall(r"innerHTML\s*=\s*[^;]*?\+\s*[a-z]\w*\.[a-z_]\w*", js, re.I)
-    bare = [o for o in offenders if "esc" not in o]
+    # Only flag property access on a DATA object. Built-ins compute values rather
+    # than carry them -- `Math.round(...)` and `JSON.stringify(...)` are not
+    # injection sinks, and flagging them would train the reader to ignore this
+    # guard, which is worse than not having it.
+    data_access = re.compile(
+        r"innerHTML\s*=\s*[^;]*?\+\s*(?!Math\.|JSON\.|Date\.|Number\.|String\.|Object\.)"
+        r"\b([a-z]\w*)\.([a-z_]\w*)",
+        re.I,
+    )
+    bare = [
+        m.group(0).replace("\n", " ")
+        for m in data_access.finditer(js)
+        if "esc" not in m.group(0)
+    ]
     assert not bare, f"unescaped API value(s) concatenated into innerHTML: {bare}"
 
 

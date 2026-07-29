@@ -9,9 +9,7 @@ Validates the non-destructive in-place injection of:
 
 from __future__ import annotations
 
-import io
 import tarfile
-from pathlib import Path
 
 import pytest
 

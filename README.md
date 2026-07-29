@@ -25,6 +25,7 @@ A hyper-ergonomic CLI tool for downloading and managing Internet Archive and Wik
 - **Hierarchical Offline Search**: full-content SQLite FTS5 index over the secured library, ranking name/metadata matches above body-text matches (no cloud, no AI vectors)
 - **Airgapped Portable Launcher (Windows)**: single-click `Launch_KBB.exe` with an embedded Python runtime and a **bundled WebView2** runtime, so the portal renders on any Windows host with no WebView2 and no internet
 - **Hash-Verified Provisioning**: every downloaded runtime asset (Python, kiwix-tools, get-pip, WebView2) is checked against a pinned SHA-256 before use
+- **Tri-Modal Tactical Deployment**: a single USB stick supports three execution modes — **bare-metal Alpine boot** (amnesic RAM, zero host trace), **host-native** (standard launch), and **QEMU sandbox** (hypervisor-isolated from host EDR/DLP) — sharing one kernel and one Python runtime (DRY/SSOT)
 
 ## Installation
 
@@ -266,7 +267,76 @@ The *target* host needs no Rust, no internet, and no WebView2 — only the built
 > Exclude the build processes in an elevated shell:
 > `Add-MpPreference -ExclusionProcess "rustc.exe","cargo.exe"`.
 
-### 10. Check Bucket Status
+### 10. Tri-Modal Tactical Deployment (Modes A / B / C)
+
+A single KBB stick supports three execution modes. All three share the same
+Alpine kernel, the same `.kb_env/python` runtime, and the same data — one
+source of truth, three deployment contexts.
+
+| Mode | Name | Host footprint | Isolation | Launch |
+|------|------|---------------|-----------|--------|
+| **A** | Bare-metal Alpine boot | Zero (RAM only) | Total physical | UEFI boot menu |
+| **B** | Host-native | Standard process | None | `Launch_KBB.exe` or `C2_Portal.bat` |
+| **C** | QEMU sandbox | Hypervisor process | VM-isolated from EDR/DLP | `start_sandbox.bat` |
+
+#### Provision Mode A (bare-metal boot)
+
+```bash
+kb-builder portable D:\ --with-alpine --allow-insecure-network
+```
+
+Injects `/boot/` (Alpine kernel + initramfs + kiosk overlay), `/EFI/BOOT/`
+(GRUB2 bootloader + `grub.cfg`). The target host boots from USB via the UEFI
+boot menu — Alpine loads into RAM, mounts the stick read-only, and launches
+the KBB portal in a Cage/Chromium kiosk. Zero trace on host storage.
+
+#### Provision Mode C (QEMU sandbox)
+
+```bash
+kb-builder portable D:\ --with-qemu --allow-insecure-network
+```
+
+Downloads portable QEMU binaries and generates `start_sandbox.bat` /
+`start_sandbox.sh`. The launcher self-elevates (UAC on Windows, sudo on
+Linux), auto-detects the USB's physical drive, and boots the same Alpine
+kernel inside a QEMU VM with raw disk passthrough (read-only). The portal
+runs inside the VM, accessible from the host browser at `http://localhost:8080`.
+
+#### Provision both modes at once
+
+```bash
+kb-builder portable D:\ --with-alpine --with-qemu --allow-insecure-network
+```
+
+All flags are additive and non-destructive — existing content is never
+touched. The Alpine kernel + initramfs are shared between Modes A and C (DRY).
+
+#### Drive layout after full provisioning
+
+```
+D:\
+├── Launch_KBB.exe              # Mode B: Rust/Tauri launcher
+├── C2_Portal.bat               # Mode B: batch launcher
+├── start_sandbox.bat           # Mode C: QEMU sandbox (Windows)
+├── start_sandbox.sh            # Mode C: QEMU sandbox (Linux/macOS)
+├── EFI/BOOT/                   # Mode A: UEFI bootloader
+│   ├── BOOTX64.EFI
+│   └── grub.cfg
+├── boot/                       # Mode A+C: shared Alpine kernel
+│   ├── vmlinuz-lts
+│   ├── initramfs-lts
+│   ├── modloop-lts
+│   └── apkovl.tar.gz           # KBB kiosk overlay
+├── qemu/                       # Mode C: portable QEMU
+│   ├── win/                    # Windows binaries
+│   ├── lin/                    # Linux binaries
+│   └── mac/                    # macOS binaries
+├── .kb_env/                    # Shared runtime (Python, kiwix, WebView2)
+├── .kb_state/                  # State (audit, index, sync)
+└── <content>/                  # ZIM slices, Archive.org items (UNTOUCHED)
+```
+
+### 11. Check Bucket Status
 
 ```bash
 kb-builder stats /path/to/usb/drive

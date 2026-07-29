@@ -275,7 +275,7 @@ def test_wiki_csp_locks_frame_ancestors():
     """Only the console (control plane) may embed the wiki viewer."""
     csp = getattr(web, "CONTENT_WIKI_CSP", "")
     assert "frame-ancestors" in csp, f"no frame-ancestors in wiki CSP: {csp!r}"
-    assert "http://127.0.0.1:*" in csp, f"control plane origin not in frame-ancestors"
+    assert "http://127.0.0.1:*" in csp, "control plane origin not in frame-ancestors"
 
 
 def _make_wiki_html_response():

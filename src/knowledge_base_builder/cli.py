@@ -82,6 +82,9 @@ ALPINE_MIRROR = f"https://dl-cdn.alpinelinux.org/alpine/v{ALPINE_VERSION}/releas
 # installer, FAT32-safe). Linux/macOS from qemu.org source releases.
 QEMU_WIN_BUILD = "20241220"
 QEMU_RELEASE = "9.2.0"
+# GRUB2 EFI is packaged as an Alpine APK and versioned separately from the
+# Alpine release itself; pin it explicitly so the URL and the hash agree.
+GRUB_EFI_APK_VERSION = f"{ALPINE_ARCH}-2.12-r5"
 
 # Known-good SHA-256 hashes for provisioning assets (FIPS-approved algorithm)
 # These hashes must be updated when versions change
@@ -1515,10 +1518,13 @@ def _provision_efi_bootloader(root: Path, local_bundle: Optional[Path] = None,
         # Alpine distributes GRUB as an APK, not a standalone netboot binary.
         # Try the local bundle first; if unavailable, fetch the grub-efi APK
         # from the Alpine repository and extract the EFI binary from it.
-        apk_name = f"grub-efi-{ALPINE_ARCH}-{ALPINE_RELEASE}.apk"
+        # GRUB's APK version is independent of ALPINE_RELEASE, so it needs its own
+        # pin. Deriving a name from ALPINE_RELEASE and then fetching a different
+        # hardcoded version -- as this did -- is how a provisioning URL silently
+        # drifts from the artefact whose hash is pinned.
         url = (
             f"https://dl-cdn.alpinelinux.org/alpine/v{ALPINE_VERSION}/"
-            f"main/{ALPINE_ARCH}/grub-efi-{ALPINE_ARCH}-2.12-r5.apk"
+            f"main/{ALPINE_ARCH}/grub-efi-{GRUB_EFI_APK_VERSION}.apk"
         )
         expected_hash = PROVISIONING_HASHES.get("BOOTX64.EFI", "")
         try:
@@ -1534,17 +1540,17 @@ def _provision_efi_bootloader(root: Path, local_bundle: Optional[Path] = None,
         console.print("[yellow]BOOTX64.EFI already present; skipping.[/yellow]")
 
     grub_cfg = efi_dir / "grub.cfg"
-    grub_content = f"""\
+    grub_content = """\
 set default=0
 set timeout=3
 
-menuentry "KBB Tactical OSINT Appliance (Amnesic RAM)" {{
+menuentry "KBB Tactical OSINT Appliance (Amnesic RAM)" {
     search --no-floppy --set=root --file /boot/vmlinuz-lts
     linux /boot/vmlinuz-lts \\
         modules=loop,squashfs,sd-mod,usb-storage,vfat,fat \\
         quiet console=tty1 kbb_mode=baremetal
     initrd /boot/initramfs-lts
-}}
+}
 """
     grub_cfg.write_text(grub_content, encoding="utf-8")
     console.print("[bold green]UEFI bootloader structure injected.[/bold green]")
