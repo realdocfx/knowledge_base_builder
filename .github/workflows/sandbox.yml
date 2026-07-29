@@ -231,26 +231,36 @@ jobs:
         run: |
           set -eux
           chmod +x ui/launch_kbb
-          # apk-tools from the Alpine container, writing into a plain directory
-          # on the runner. Three things have to be in place before `add` works,
-          # and omitting any of them yields "no such package" for everything:
+          cat > build-root.sh <<'SCRIPT'
+          #!/bin/sh
+          # Assemble the guest root with apk-tools from the Alpine container,
+          # writing into a plain directory on the runner (no privileges needed).
+          #
+          # Three things must be in place before `add` works, and omitting any of
+          # them yields "no such package" for every package including alpine-base:
           #   - the repositories file must live INSIDE the new root, because that
           #     is where --root makes apk look;
           #   - the signing keys must be copied in, or every index fails
-          #     verification and is discarded;
-          #   - --update-cache must fetch those indexes (with --no-cache there is
-          #     no index to select packages from at all).
-          # This is where trust is actually established: the repositories are
-          # upstream and signed, and CI has the network to verify them. The stick
-          # ships the result, so the guest never repeats this step.
-          docker run --rm             -v "$PWD:/work" -w /work             alpine:3.20 sh -eux -c '
-              R=/work/rootfs
-              mkdir -p "$R/etc/apk/keys"
-              printf "%s
-"                 "https://dl-cdn.alpinelinux.org/alpine/v3.20/main"                 "https://dl-cdn.alpinelinux.org/alpine/v3.20/community"                 > "$R/etc/apk/repositories"
-              cp /etc/apk/keys/* "$R/etc/apk/keys/"
-              apk --root "$R" --initdb --arch x86_64 --update-cache add                 alpine-base busybox openrc util-linux eudev dbus                 linux-lts mkinitfs                 cage seatd mesa-dri-gallium mesa-egl                 webkit2gtk gtk+3.0 font-dejavu                 python3 py3-pip
-            '
+          #     verification and is silently discarded;
+          #   - --update-cache must fetch those indexes; with --no-cache there is
+          #     no index to select packages from at all.
+          #
+          # This is also where trust is established: the repositories are upstream
+          # and signed, and CI has the network to verify them. The stick ships the
+          # result, so the guest never repeats this step and needs no repository.
+          set -eux
+          R=/work/rootfs
+          mkdir -p "$R/etc/apk/keys"
+          {
+            echo "https://dl-cdn.alpinelinux.org/alpine/v3.20/main"
+            echo "https://dl-cdn.alpinelinux.org/alpine/v3.20/community"
+          } > "$R/etc/apk/repositories"
+          cp /etc/apk/keys/* "$R/etc/apk/keys/"
+          apk --root "$R" --initdb --arch x86_64 --update-cache add alpine-base busybox openrc util-linux eudev dbus linux-lts mkinitfs cage seatd mesa-dri-gallium mesa-egl webkit2gtk gtk+3.0 font-dejavu python3 py3-pip
+          SCRIPT
+          sed -i 's/^          //' build-root.sh
+          chmod +x build-root.sh
+          docker run --rm -v "$PWD:/work" -w /work alpine:3.20 /work/build-root.sh
           sudo chown -R "$(id -u):$(id -g)" rootfs
           du -sh rootfs
 
