@@ -291,21 +291,40 @@ jobs:
           print("guest root configured")
           PY
 
-          # OpenRC needs the kiosk in the default runlevel, and its dependencies
-          # present in the runlevels they belong to.
-          sudo mkdir -p rootfs/etc/runlevels/default rootfs/etc/runlevels/sysinit
-          sudo ln -sf /etc/init.d/kbb-kiosk rootfs/etc/runlevels/default/kbb-kiosk
-          for svc in devfs dmesg mdev hwdrivers; do
-            if [ -f "rootfs/etc/init.d/$svc" ]; then
-              sudo ln -sf "/etc/init.d/$svc" "rootfs/etc/runlevels/sysinit/$svc"
-            fi
-          done
-          for svc in udev dbus seatd localmount; do
-            if [ -f "rootfs/etc/init.d/$svc" ]; then
-              sudo ln -sf "/etc/init.d/$svc" "rootfs/etc/runlevels/default/$svc"
-            fi
-          done
-          sudo ls -l rootfs/etc/runlevels/default/
+          # Runlevels come from GUEST_RUNLEVELS in cli.py, not from a list written
+          # out here. The previous version hand-wired them and got two things
+          # wrong that cost a full CI cycle each: it added mdev alongside udev (two
+          # device managers racing over /dev) and omitted udev-trigger (so udev
+          # never coldplugged and libinput enumerated an empty database, with the
+          # input devices plainly present in dmesg).
+          sudo -E "$(command -v python)" - <<'PY'
+          import os, subprocess, sys
+          sys.path.insert(0, "src")
+          from knowledge_base_builder.cli import GUEST_RUNLEVELS, GUEST_FORBIDDEN_SERVICES
+
+          root = "rootfs"
+          for runlevel, services in GUEST_RUNLEVELS.items():
+              d = os.path.join(root, "etc", "runlevels", runlevel)
+              os.makedirs(d, exist_ok=True)
+              for svc in services:
+                  if not os.path.isfile(os.path.join(root, "etc", "init.d", svc)):
+                      print(f"  skip {runlevel}/{svc} (not installed)")
+                      continue
+                  link = os.path.join(d, svc)
+                  if os.path.islink(link) or os.path.exists(link):
+                      os.remove(link)
+                  os.symlink(f"/etc/init.d/{svc}", link)
+                  print(f"  {runlevel}/{svc}")
+
+          # Remove anything explicitly incompatible, wherever Alpine's defaults put it.
+          for banned in GUEST_FORBIDDEN_SERVICES:
+              for runlevel in os.listdir(os.path.join(root, "etc", "runlevels")):
+                  link = os.path.join(root, "etc", "runlevels", runlevel, banned)
+                  if os.path.islink(link) or os.path.exists(link):
+                      os.remove(link)
+                      print(f"  removed {runlevel}/{banned}")
+          PY
+          sudo find rootfs/etc/runlevels -maxdepth 2 | sort
 
       - name: Generate an initramfs that can find a virtio root
         run: |
