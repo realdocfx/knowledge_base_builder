@@ -184,11 +184,34 @@ def test_write_sandbox_launchers(tmp_path):
     assert "boot\\vmlinuz-lts" in bat_text
     assert "boot\\initramfs-lts" in bat_text
     assert "kbb_mode=qemu" in bat_text
+    assert "readonly=on" in bat_text, "raw passthrough must be read-only"
 
     sh_text = sh.read_text(encoding="utf-8")
     assert "boot/vmlinuz-lts" in sh_text
     assert "boot/initramfs-lts" in sh_text
     assert "kbb_mode=qemu" in sh_text
+    assert "readonly=on" in sh_text, "raw passthrough must be read-only"
+
+
+def test_sandbox_launcher_uses_raw_passthrough(tmp_path):
+    """Launchers must use raw volume passthrough, NOT vvfat virtual FAT.
+
+    The vvfat driver has a hard root directory entry limit and cannot handle
+    sticks with many files. Raw passthrough works with any content count.
+    """
+    cli._write_sandbox_launchers(tmp_path)
+
+    bat_text = (tmp_path / "start_sandbox.bat").read_text(encoding="utf-8")
+    assert "fat:ro:" not in bat_text and "fat:rw:" not in bat_text, (
+        "Windows launcher still uses vvfat virtual FAT driver"
+    )
+    assert r"\\.\%" in bat_text, "Windows launcher missing raw volume handle"
+
+    sh_text = (tmp_path / "start_sandbox.sh").read_text(encoding="utf-8")
+    assert "fat:ro:" not in sh_text and "fat:rw:" not in sh_text, (
+        "POSIX launcher still uses vvfat virtual FAT driver"
+    )
+    assert "findmnt" in sh_text, "POSIX launcher missing block device detection"
 
 
 def test_sandbox_launcher_detects_platform(tmp_path):

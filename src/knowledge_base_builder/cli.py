@@ -1618,13 +1618,28 @@ def _write_sandbox_launchers(root: Path) -> None:
 SETLOCAL EnableDelayedExpansion
 title KBB Tactical QEMU Sandbox
 
-:: Locate USB Drive Root
+:: ----------------------------------------------------------------
+:: Self-elevate: raw volume passthrough (\\.\X:) requires admin.
+:: The QEMU vvfat virtual FAT driver cannot handle drives with many
+:: files (root directory entry limit), so we pass the real FAT32
+:: volume directly -- works with any content count or file size.
+:: ----------------------------------------------------------------
+net session >nul 2>&1 || (
+    echo [KBB] Requesting administrator access for raw volume passthrough...
+    powershell -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
+    exit /b
+)
+
+:: Locate USB Drive Root and raw volume handle
 SET "USB=%~dp0"
+SET "DRV=%~d0"
+SET "RAW=\\.\%DRV%"
 SET "QEMU=%USB%qemu\win\qemu-system-x86_64.exe"
 SET "FW=%USB%qemu\win\share"
 
 echo [KBB] Initializing Tactical QEMU Sandbox...
-echo [*] USB Root: %USB%
+echo [*] USB Root : %USB%
+echo [*] Raw Volume: %RAW%
 
 IF NOT EXIST "%QEMU%" (
     echo [!] QEMU binary not found at %QEMU%
@@ -1633,6 +1648,9 @@ IF NOT EXIST "%QEMU%" (
     exit /b 1
 )
 
+:: Raw volume passthrough: the guest Alpine kernel sees the real FAT32
+:: partition as /dev/vda and mounts it directly. readonly=on prevents
+:: any guest-side write to the stick.
 "%QEMU%" ^
     -L "%FW%" ^
     -nodefaults ^
@@ -1641,7 +1659,8 @@ IF NOT EXIST "%QEMU%" (
     -smp 2 ^
     -kernel "%USB%boot\vmlinuz-lts" ^
     -initrd "%USB%boot\initramfs-lts" ^
-    -append "console=ttyS0 boot=alpine quiet kbb_mode=qemu" ^
+    -append "console=ttyS0 modules=loop,squashfs,sd-mod,vfat,fat,virtio_blk,virtio_pci alpine_dev=/dev/vda:vfat quiet kbb_mode=qemu" ^
+    -drive file=%RAW%,format=raw,if=virtio,readonly=on ^
     -netdev user,id=net0,hostfwd=tcp::8080-:8080 ^
     -device e1000,netdev=net0,romfile="" ^
     -serial stdio
@@ -1654,6 +1673,7 @@ pause
     sh = root / "start_sandbox.sh"
     sh.write_text(r'''#!/bin/sh
 # KBB Tactical QEMU Sandbox Launcher (Linux/macOS)
+# Raw block-device passthrough: works with any content count or size.
 USB="$(cd "$(dirname "$0")" && pwd)"
 
 # Detect host platform for QEMU binary selection
@@ -1671,11 +1691,28 @@ if [ ! -x "$QEMU" ]; then
     exit 1
 fi
 
-echo "[KBB] Initializing Tactical QEMU Sandbox..."
-echo "[*] USB Root: $USB"
-echo "[*] Platform: $PLAT"
+# Auto-detect the block device backing this mount point.
+# Linux: findmnt; macOS: diskutil.
+RAW=""
+if command -v findmnt >/dev/null 2>&1; then
+    RAW="$(findmnt -no SOURCE "$USB" 2>/dev/null)"
+elif command -v diskutil >/dev/null 2>&1; then
+    RAW="$(diskutil info "$USB" 2>/dev/null | awk '/Device Node/{print $NF}')"
+fi
 
-exec "$QEMU" \
+if [ -z "$RAW" ] || [ ! -e "$RAW" ]; then
+    echo "[!] Could not detect block device for $USB"
+    echo "[!] RECOVERY: pass the device manually:"
+    echo "    $QEMU ... -drive file=/dev/sdX,format=raw,if=virtio,readonly=on"
+    exit 1
+fi
+
+echo "[KBB] Initializing Tactical QEMU Sandbox..."
+echo "[*] USB Root : $USB"
+echo "[*] Raw Device: $RAW"
+echo "[*] Platform  : $PLAT"
+
+exec sudo "$QEMU" \
     -L "$FW" \
     -nodefaults \
     -M q35,accel=kvm,fallback=tcg \
@@ -1683,7 +1720,8 @@ exec "$QEMU" \
     -smp 2 \
     -kernel "$USB/boot/vmlinuz-lts" \
     -initrd "$USB/boot/initramfs-lts" \
-    -append "console=ttyS0 boot=alpine quiet kbb_mode=qemu" \
+    -append "console=ttyS0 modules=loop,squashfs,sd-mod,vfat,fat,virtio_blk,virtio_pci alpine_dev=/dev/vda:vfat quiet kbb_mode=qemu" \
+    -drive file="$RAW",format=raw,if=virtio,readonly=on \
     -netdev user,id=net0,hostfwd=tcp::8080-:8080 \
     -device e1000,netdev=net0,romfile="" \
     -serial stdio
