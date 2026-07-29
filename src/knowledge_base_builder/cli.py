@@ -1799,6 +1799,28 @@ def _write_sandbox_launchers(root: Path, port: int = 8080) -> None:
     )
 
 
+# Services the guest needs, by runlevel.
+#
+# `udev-trigger` is the one that is easy to miss and expensive to diagnose.
+# Without it udev never coldplugs, so devices that already existed when udev
+# started are never tagged in the udev database. libinput enumerates through
+# libudev, finds nothing, and wlroots refuses to start -- while dmesg plainly
+# shows "QEMU Virtio Keyboard ... input4". The compositor's error message
+# ("no input devices") describes the udev view, not the kernel's.
+#
+# `mdev` must NOT be here. Alpine ships either mdev or udev, never both: two
+# device managers race over /dev, and the one that loses leaves libinput reading a
+# database nobody populated. `setup-devd udev` removes mdev for this reason.
+GUEST_RUNLEVELS = {
+    "sysinit": ("devfs", "dmesg", "udev", "udev-trigger", "udev-settle", "hwdrivers"),
+    "boot": ("modules", "sysctl", "hostname", "bootmisc", "syslog"),
+    "default": ("dbus", "seatd", "local", "kbb-kiosk"),
+}
+
+# Services whose presence breaks the guest, checked rather than assumed absent.
+GUEST_FORBIDDEN_SERVICES = ("mdev",)
+
+
 def _guest_init_files() -> Dict[str, str]:
     """The guest's init configuration -- one definition, two consumers.
 

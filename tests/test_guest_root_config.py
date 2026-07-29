@@ -165,3 +165,35 @@ def test_overlay_and_image_share_one_definition():
         "the apkovl builds its own inittab/kiosk instead of using the shared "
         "definition; that is the drift that produced a guest with no /sbin/init"
     )
+
+
+def test_udev_coldplug_is_wired():
+    """Without udev-trigger, libinput sees nothing and the compositor refuses.
+
+    The kernel had already created "QEMU Virtio Keyboard ... input4" when this
+    failed. libinput enumerates through libudev, not the kernel, so an
+    un-triggered udev means an empty database and cage exits with "no input
+    devices" -- a message that describes the udev view and misdirects toward the
+    GPU.
+    """
+    sysinit = cli.GUEST_RUNLEVELS["sysinit"]
+    assert "udev" in sysinit, "no udev at all"
+    assert "udev-trigger" in sysinit, (
+        "udev starts but never coldplugs; devices present at boot stay untagged"
+    )
+
+
+def test_two_device_managers_are_not_both_wired():
+    """Alpine ships mdev or udev, never both; they race over /dev."""
+    all_services = {s for svcs in cli.GUEST_RUNLEVELS.values() for s in svcs}
+    for banned in cli.GUEST_FORBIDDEN_SERVICES:
+        assert banned not in all_services, (
+            f"{banned!r} is wired alongside udev: two device managers race and the "
+            "loser leaves libinput reading a database nobody populated"
+        )
+
+
+def test_the_kiosk_is_in_the_default_runlevel():
+    assert "kbb-kiosk" in cli.GUEST_RUNLEVELS["default"], (
+        "the kiosk is never started, so the guest boots to nothing"
+    )
