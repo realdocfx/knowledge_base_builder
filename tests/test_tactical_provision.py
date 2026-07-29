@@ -178,38 +178,52 @@ def test_write_sandbox_launchers(tmp_path):
     assert sh.exists(), "start_sandbox.sh not generated"
 
     bat_text = bat.read_text(encoding="utf-8")
-    assert "qemu\\win\\qemu-system-x86_64.exe" in bat_text
-    assert "boot\\vmlinuz-lts" in bat_text
-    assert "boot\\initramfs-lts" in bat_text
+    assert r"qemu\win\qemu-system-x86_64.exe" in bat_text
+    assert r"boot\vmlinuz-lts" in bat_text
+    assert r"boot\initramfs-lts" in bat_text
     assert "kbb_mode=qemu" in bat_text
-    assert "readonly=on" in bat_text, "raw passthrough must be read-only"
 
     sh_text = sh.read_text(encoding="utf-8")
     assert "boot/vmlinuz-lts" in sh_text
     assert "boot/initramfs-lts" in sh_text
     assert "kbb_mode=qemu" in sh_text
-    assert "readonly=on" in sh_text, "raw passthrough must be read-only"
 
 
-def test_sandbox_launcher_uses_raw_passthrough(tmp_path):
-    """Launchers must use raw volume passthrough, NOT vvfat virtual FAT.
+def test_sandbox_launcher_attaches_no_writable_medium(tmp_path):
+    """No vvfat, and no block device at all.
 
-    The vvfat driver has a hard root directory entry limit and cannot handle
-    sticks with many files. Raw passthrough works with any content count.
+    The vvfat prohibition still stands: that driver has a hard root-directory
+    entry limit and cannot present a populated stick.
+
+    What replaced it has changed, though. Raw ``PhysicalDriveN`` passthrough
+    solved the vvfat limit but needed Administrator, and the UAC dialog it raised
+    is a second action by the operator -- which "one click, no additional input"
+    excludes. The guest now takes its overlay and packages over HTTP from the
+    host (Alpine netboot's own mechanism), so no medium is attached at all. That
+    is strictly stronger than ``readonly=on``: there is nothing to write to, so
+    the guest is amnesic by construction rather than by flag.
     """
     cli._write_sandbox_launchers(tmp_path)
 
-    bat_text = (tmp_path / "start_sandbox.bat").read_text(encoding="utf-8")
-    assert "fat:ro:" not in bat_text and "fat:rw:" not in bat_text, (
-        "Windows launcher still uses vvfat virtual FAT driver"
-    )
-    assert "PhysicalDrive" in bat_text, "Windows launcher missing raw physical drive handle"
-
-    sh_text = (tmp_path / "start_sandbox.sh").read_text(encoding="utf-8")
-    assert "fat:ro:" not in sh_text and "fat:rw:" not in sh_text, (
-        "POSIX launcher still uses vvfat virtual FAT driver"
-    )
-    assert "findmnt" in sh_text, "POSIX launcher missing block device detection"
+    for name in ("start_sandbox.bat", "start_sandbox.sh"):
+        raw = (tmp_path / name).read_text(encoding="utf-8")
+        # Strip comments before matching. These scripts explain in prose why they
+        # do NOT use sudo or vvfat, and a substring guard that reads the prose
+        # fails on the very comment documenting the fix -- which teaches the
+        # reader to ignore the guard. Assert on what executes.
+        text = "\n".join(
+            ln for ln in raw.splitlines()
+            if not ln.lstrip().startswith(("#", "::", "REM ", "rem "))
+        )
+        assert "fat:ro:" not in text and "fat:rw:" not in text, (
+            f"{name} uses the vvfat driver, which cannot present a populated stick"
+        )
+        assert "-drive" not in text, (
+            f"{name} attaches a block device; the guest is meant to have no medium"
+        )
+        assert "PhysicalDrive" not in text and "sudo" not in text, (
+            f"{name} needs elevation, so the operator must consent to a prompt"
+        )
 
 
 def test_sandbox_launcher_detects_platform(tmp_path):

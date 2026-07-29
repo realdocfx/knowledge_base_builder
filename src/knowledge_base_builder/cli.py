@@ -654,6 +654,12 @@ def portal(
     host: str = typer.Option("127.0.0.1", "--host", "-h", help="Bind address"),
     port: int = typer.Option(8080, "--port", "-p", help="Port to serve the portal on"),
     no_browser: bool = typer.Option(False, "--no-browser", help="Do not open the dashboard in a web browser"),
+    sandbox_assets: bool = typer.Option(
+        False,
+        "--sandbox-assets",
+        help="Serve the Alpine overlay and package repo unauthenticated at "
+             "/sandbox/* for the QEMU guest (Mode C only)",
+    ),
 ):
     """Launch the FastAPI C2 Knowledge Portal for the local bucket."""
     try:
@@ -666,6 +672,19 @@ def portal(
         raise typer.Exit(1) from exc
 
     portal_app.state.bucket_root = str(Path(path).resolve())
+
+    if sandbox_assets:
+        # The guest's initramfs cannot present a token, so /sandbox/* has to be
+        # reachable without one. Arm it only when asked, and say so on the console:
+        # an unauthenticated route that opens silently is one nobody audits.
+        from . import web as _web
+
+        _web.SANDBOX_ASSETS = True
+        console.print(
+            "[yellow]Sandbox assets armed:[/yellow] /sandbox/apkovl.tar.gz and "
+            "/sandbox/apks/* are served without a token (loopback only)."
+        )
+
     display_host = "127.0.0.1" if host in ("0.0.0.0", "::") else host
     # Hand the operator a pre-authorised URL: /api/* now requires the
     # control-plane token, which the dashboard swaps for a session cookie.
@@ -1657,134 +1676,127 @@ def _provision_qemu_runtime(root: Path, platforms: Optional[List[str]] = None,
     return qemu_root
 
 
-def _write_sandbox_launchers(root: Path) -> None:
-    """Generate ``start_sandbox.bat`` and ``start_sandbox.sh`` for Mode C."""
+def _write_sandbox_launchers(root: Path, port: int = 8080) -> None:
+    r"""Generate the one-click Mode C launchers.
 
+    Design note -- why there is no raw-device passthrough here.
+
+    The previous launcher self-elevated so it could hand QEMU
+    ``\\.\PhysicalDriveN``, because QEMU's vvfat driver cannot present a FAT32
+    volume with a populated root directory. Elevation means a UAC dialog, and a
+    dialog is a second action by the operator, which the requirement excludes.
+    Suppressing it is not possible on a machine the stick has never been plugged
+    into -- and a stick that only starts where it was provisioned is not a
+    portable stick.
+
+    So the guest gets its overlay, its package repository and its UI binary the
+    way Alpine netboot is actually designed to get them: over HTTP from
+    ``10.0.2.2``, the host as seen through QEMU's user-mode NAT. That address is
+    the host, never the internet, so an air-gapped machine serves it fine. No
+    block device is attached at all -- nothing needs privileges, and the guest is
+    purely amnesic because it has no writable medium to persist to.
+
+    The trade-off is explicit and belongs in the reader's head: the portal
+    process runs on the *host*. The guest reaches it through exactly one TCP port
+    on the NAT gateway (``restrict=on`` blocks every other destination, including
+    the internet) and has no other route to the host. Operator actions are fully
+    confined by cage; the server itself is not VM-isolated.
+    """
+    # virtio-vga is not decoration. cage is a DRM compositor: with -nodefaults
+    # and no GPU device the guest has no framebuffer, cage exits immediately, and
+    # the sandbox shows nothing however correct the overlay is.
+    cmdline = (
+        "console=tty0 "
+        "modules=loop,squashfs,sd-mod,virtio_blk,virtio_pci,virtio_net "
+        "ip=dhcp "
+        f"apkovl=http://10.0.2.2:{port}/sandbox/apkovl.tar.gz "
+        f"alpine_repo=http://10.0.2.2:{port}/sandbox/apks "
+        f"kbb_mode=qemu kbb_portal=http://10.0.2.2:{port}"
+    )
+
+
+    win_lines = [
+        "@echo off",
+        "SETLOCAL EnableDelayedExpansion",
+        ":: KBB Tactical QEMU Sandbox -- one click, no prompts.",
+        ":: No elevation: the guest has no block device, so no raw handle is",
+        ":: needed. See _write_sandbox_launchers() for the reasoning.",
+        'SET "USB=%~dp0"',
+        'SET "QEMU=%USB%qemu\\win\\qemu-system-x86_64.exe"',
+        'SET "FW=%USB%qemu\\win\\share"',
+        'IF NOT EXIST "%QEMU%" (',
+        "    echo [!] QEMU missing. Run: kb-builder portable %USB% --with-qemu",
+        "    timeout /t 10 >nul",
+        "    exit /b 1",
+        ")",
+        ":: Bring the portal up first: the guest fetches its overlay from it.",
+        'start "" /B "%USB%.kb_env\\python\\pythonw.exe" -m knowledge_base_builder.cli '
+        f'portal "%USB%" --port {port} --no-browser --sandbox-assets',
+        ":: Wait on readiness rather than sleeping a guessed interval.",
+        'powershell -NoProfile -Command "$sw=[Diagnostics.Stopwatch]::StartNew();'
+        "while($sw.Elapsed.TotalSeconds -lt 90){try{"
+        f"(New-Object Net.Sockets.TcpClient('127.0.0.1',{port})).Close();exit 0"
+        '}catch{Start-Sleep -Milliseconds 400}};exit 1"',
+        "IF ERRORLEVEL 1 (",
+        "    echo [!] Portal did not become ready in 90s.",
+        "    timeout /t 15 >nul",
+        "    exit /b 1",
+        ")",
+        '"%QEMU%" -L "%FW%" -nodefaults -M q35 -m 3072 -smp 2 ^',
+        '    -kernel "%USB%boot\\vmlinuz-lts" -initrd "%USB%boot\\initramfs-lts" ^',
+        f'    -append "{cmdline}" ^',
+        "    -device virtio-vga ^",
+        "    -device virtio-tablet-pci -device virtio-keyboard-pci ^",
+        # restrict=on is load-bearing: QEMU drops every packet not destined
+        # for the one forwarded port, so the guest cannot reach the host LAN
+        # or the internet even where the host has both.
+        f"    -netdev user,id=net0,restrict=on,guestfwd=tcp:10.0.2.2:{port}-cmd:nc 127.0.0.1 {port} ^",
+        '    -device virtio-net-pci,netdev=net0,romfile="" ^',
+        "    -full-screen -display sdl,grab-mod=rctrl",
+    ]
     bat = root / "start_sandbox.bat"
-    bat.write_text(r'''@echo off
-SETLOCAL EnableDelayedExpansion
-title KBB Tactical QEMU Sandbox
-
-:: ----------------------------------------------------------------
-:: Self-elevate: raw volume passthrough (\\.\X:) requires admin.
-:: The QEMU vvfat virtual FAT driver cannot handle drives with many
-:: files (root directory entry limit), so we pass the real FAT32
-:: volume directly -- works with any content count or file size.
-:: ----------------------------------------------------------------
-net session >nul 2>&1 || (
-    echo [KBB] Requesting administrator access for raw volume passthrough...
-    powershell -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
-    exit /b
-)
-
-:: Locate USB Drive Root and raw volume handle
-SET "USB=%~dp0"
-SET "DRV=%~d0"
-SET "QEMU=%USB%qemu\win\qemu-system-x86_64.exe"
-SET "FW=%USB%qemu\win\share"
-
-:: Auto-detect the PhysicalDrive number for this drive letter.
-:: \\.\D: would be simpler but the host locks the mounted volume;
-:: \\.\PhysicalDriveN bypasses the lock. The guest sees the whole
-:: disk with its partition table, so the FAT32 data is at /dev/vda1.
-FOR /F %%i IN ('powershell -NoProfile -Command "(Get-Partition -DriveLetter %DRV:~0,1%).DiskNumber"') DO SET DISKNUM=%%i
-SET "RAW=\\.\PhysicalDrive%DISKNUM%"
-
-echo [KBB] Initializing Tactical QEMU Sandbox...
-echo [*] USB Root : %USB%
-echo [*] Raw Disk : %RAW% (PhysicalDrive%DISKNUM%)
-
-IF NOT EXIST "%QEMU%" (
-    echo [!] QEMU binary not found at %QEMU%
-    echo [!] Run: kb-builder portable %USB% --with-qemu --allow-insecure-network
-    pause
-    exit /b 1
-)
-
-:: Raw volume passthrough: the guest Alpine kernel sees the real FAT32
-:: partition as /dev/vda and mounts it directly. readonly=on prevents
-:: any guest-side write to the stick.
-"%QEMU%" ^
-    -L "%FW%" ^
-    -nodefaults ^
-    -M q35 ^
-    -m 2048 ^
-    -smp 2 ^
-    -kernel "%USB%boot\vmlinuz-lts" ^
-    -initrd "%USB%boot\initramfs-lts" ^
-    -append "console=ttyS0 modules=loop,squashfs,sd-mod,vfat,fat,virtio_blk,virtio_pci apkovl=/dev/vda1:vfat:/boot/apkovl.tar.gz alpine_repo=/media/vda1/apks kbb_mode=qemu" ^
-    -drive file=%RAW%,format=raw,if=virtio,readonly=on ^
-    -netdev user,id=net0,hostfwd=tcp::18080-:8080 ^
-    -device e1000,netdev=net0,romfile="" ^
-    -serial stdio
-
-echo [*] Sandbox terminated.
-pause
-''', encoding="utf-8")
+    bat.write_bytes(("\r\n".join(win_lines) + "\r\n").encode("utf-8"))
     os.system(f'attrib -h "{bat}" >nul 2>&1')
 
+    posix_lines = [
+        "#!/bin/sh",
+        "# KBB Tactical QEMU Sandbox -- one click, no prompts (Linux/macOS).",
+        "# No sudo: the guest has no block device, so no raw handle is needed.",
+        "set -eu",
+        'USB="$(cd "$(dirname "$0")" && pwd)"',
+        'case "$(uname -s)" in',
+        "    Linux*)  PLAT=lin;;",
+        "    Darwin*) PLAT=mac;;",
+        '    *) echo "[!] Unsupported host: $(uname -s)"; exit 1;;',
+        "esac",
+        'QEMU="$USB/qemu/$PLAT/qemu-system-x86_64"',
+        '[ -x "$QEMU" ] || { echo "[!] QEMU missing: $QEMU"; exit 1; }',
+        'PY="$USB/.kb_env/python-linux/bin/python3"',
+        '[ -x "$PY" ] || PY="$(command -v python3 || true)"',
+        '[ -n "$PY" ] || { echo "[!] No Python for the portal"; exit 1; }',
+        f'"$PY" -m knowledge_base_builder.cli portal "$USB" --port {port} '
+        "--no-browser --sandbox-assets &",
+        "i=0",
+        f"while ! nc -z 127.0.0.1 {port} 2>/dev/null; do",
+        '    i=$((i+1)); [ "$i" -gt 225 ] && { echo "[!] portal did not start"; exit 1; }',
+        "    sleep 0.4",
+        "done",
+        'exec "$QEMU" -L "$USB/qemu/$PLAT/share" -nodefaults -M q35 -m 3072 -smp 2 \\',
+        '    -kernel "$USB/boot/vmlinuz-lts" -initrd "$USB/boot/initramfs-lts" \\',
+        f'    -append "{cmdline}" \\',
+        "    -device virtio-vga \\",
+        "    -device virtio-tablet-pci -device virtio-keyboard-pci \\",
+        f"    -netdev user,id=net0,restrict=on,guestfwd=tcp:10.0.2.2:{port}-cmd:nc 127.0.0.1 {port} \\",
+        '    -device virtio-net-pci,netdev=net0,romfile="" \\',
+        "    -full-screen -display sdl,grab-mod=rctrl",
+    ]
     sh = root / "start_sandbox.sh"
-    sh.write_text(r'''#!/bin/sh
-# KBB Tactical QEMU Sandbox Launcher (Linux/macOS)
-# Raw block-device passthrough: works with any content count or size.
-USB="$(cd "$(dirname "$0")" && pwd)"
+    sh.write_bytes(("\n".join(posix_lines) + "\n").encode("utf-8"))
+    sh.chmod(0o755)
 
-# Detect host platform for QEMU binary selection
-case "$(uname -s)" in
-    Linux*)  PLAT="lin";;
-    Darwin*) PLAT="mac";;
-    *)       echo "[!] Unsupported host OS: $(uname -s)"; exit 1;;
-esac
-
-QEMU="$USB/qemu/$PLAT/qemu-system-x86_64"
-FW="$USB/qemu/$PLAT/share"
-if [ ! -x "$QEMU" ]; then
-    echo "[!] QEMU binary not found at $QEMU"
-    echo "[!] Run: kb-builder portable $USB --with-qemu --allow-insecure-network"
-    exit 1
-fi
-
-# Auto-detect the block device backing this mount point.
-# Linux: findmnt; macOS: diskutil.
-RAW=""
-if command -v findmnt >/dev/null 2>&1; then
-    RAW="$(findmnt -no SOURCE "$USB" 2>/dev/null)"
-elif command -v diskutil >/dev/null 2>&1; then
-    RAW="$(diskutil info "$USB" 2>/dev/null | awk '/Device Node/{print $NF}')"
-fi
-
-if [ -z "$RAW" ] || [ ! -e "$RAW" ]; then
-    echo "[!] Could not detect block device for $USB"
-    echo "[!] RECOVERY: pass the device manually:"
-    echo "    $QEMU ... -drive file=/dev/sdX,format=raw,if=virtio,readonly=on"
-    exit 1
-fi
-
-echo "[KBB] Initializing Tactical QEMU Sandbox..."
-echo "[*] USB Root : $USB"
-echo "[*] Raw Device: $RAW"
-echo "[*] Platform  : $PLAT"
-
-exec sudo "$QEMU" \
-    -L "$FW" \
-    -nodefaults \
-    -M q35,accel=kvm,fallback=tcg \
-    -m 2048 \
-    -smp 2 \
-    -kernel "$USB/boot/vmlinuz-lts" \
-    -initrd "$USB/boot/initramfs-lts" \
-    -append "console=ttyS0 modules=loop,squashfs,sd-mod,vfat,fat,virtio_blk,virtio_pci apkovl=/dev/vda1:vfat:/boot/apkovl.tar.gz alpine_repo=/media/vda1/apks kbb_mode=qemu" \
-    -drive file="$RAW",format=raw,if=virtio,readonly=on \
-    -netdev user,id=net0,hostfwd=tcp::18080-:8080 \
-    -device e1000,netdev=net0,romfile="" \
-    -serial stdio
-''', encoding="utf-8")
-    try:
-        os.chmod(sh, 0o755)
-    except OSError:
-        pass
-
-    console.print("[bold green]QEMU sandbox launchers generated.[/bold green]")
+    console.print(
+        "[bold green]QEMU sandbox launchers generated (no elevation required).[/bold green]"
+    )
 
 
 def _build_alpine_overlay(root: Path) -> Path:
@@ -1954,11 +1966,16 @@ def _build_alpine_overlay(root: Path) -> Path:
     # and Mode C. No other TTYs exist — Ctrl+Alt+F2 reaches nothing.
     # --------------------------------------------------------------------------
     files["etc/inittab"] = (
-        "# KBB sandbox: autologin on serial + tty1, no other consoles.\n"
+        "# KBB sandbox: one console, and it runs the kiosk rather than a login.\n"
+        "#\n"
+        "# There is deliberately no getty on ttyS0. QEMU maps the serial line to\n"
+        "# the host, so an autologin there is a root prompt inside the sandbox\n"
+        "# handed to whoever is at the host keyboard -- the sandbox would then be\n"
+        "# only as strong as their willingness not to type into it. Diagnostics\n"
+        "# still go to the serial console as output; nothing reads from it.\n"
         "::sysinit:/sbin/openrc sysinit\n"
         "::sysinit:/sbin/openrc boot\n"
         "::wait:/sbin/openrc default\n"
-        "ttyS0::respawn:/sbin/agetty --noclear --autologin root ttyS0 vt100\n"
         "tty1::respawn:/sbin/agetty --noclear --autologin root tty1 linux\n"
         "::ctrlaltdel:/sbin/reboot\n"
         "::shutdown:/sbin/openrc shutdown\n"
@@ -2007,8 +2024,12 @@ def _build_alpine_overlay(root: Path) -> Path:
         'else\n'
         '    echo "[KBB] No Linux Python found on the stick."\n'
         '    echo "[KBB] Looked in: .kb_env/python-linux/bin/python3, .kb_env/python/bin/python3, /usr/bin/python3"\n'
-        '    echo "[KBB] The stick may not be mounted. Try: mount -t vfat /dev/vda1 $USB_MNT"\n'
-        '    /bin/sh\n'
+        '    # NOT a shell. Dropping to /bin/sh here would put a root prompt on\n'
+        '    # screen on exactly the path most likely to be taken in the field,\n'
+        '    # which is a complete escape from the sandbox. Halting instead tells\n'
+        '    # the operator something is wrong and grants them nothing.\n'
+        '    sleep 20\n'
+        '    poweroff -f\n'
         'fi\n'
     )
 

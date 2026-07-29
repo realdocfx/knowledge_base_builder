@@ -330,9 +330,25 @@ app.add_middleware(
 )
 
 
+# Mode C only. The QEMU guest fetches its Alpine overlay and package repository
+# with the busybox wget in its initramfs, which cannot present a token, so those
+# two routes have to sit outside the control-plane auth. That is a real hole, so
+# it is closed by default and opened only by the sandbox launcher's
+# --sandbox-assets. It exposes the overlay and public Alpine packages: nothing
+# whose disclosure matters.
+SANDBOX_ASSETS = False
+
+_SANDBOX_PREFIX = "/sandbox/"
+
+
 @app.middleware("http")
 async def enforce_api_auth(request: Request, call_next):
     """Reject unauthenticated control-plane calls before they reach a handler."""
+    # Narrow exemption: the sandbox assets, and only while the sandbox is armed.
+    # Checked against the *prefix* rather than a route name so a future route
+    # cannot inherit the exemption by accident.
+    if SANDBOX_ASSETS and request.url.path.startswith(_SANDBOX_PREFIX):
+        return await call_next(request)
     if not request_is_authorised(request):
         return JSONResponse(
             {"detail": "unauthorised: missing or invalid control-plane token"},
@@ -773,6 +789,59 @@ async def dashboard(t: str = "") -> Any:
             path="/",
         )
     return response
+
+
+# ---------------------------------------------------------------------------
+# Mode C sandbox assets (unauthenticated by necessity -- see SANDBOX_ASSETS).
+# ---------------------------------------------------------------------------
+def _sandbox_file(subtree: str, relative: str) -> Path:
+    r"""Resolve ``relative`` under the subtree, refusing anything that escapes it.
+
+    This is the one unauthenticated read surface in the process, so containment
+    is enforced on the resolved real path rather than by inspecting the string for
+    ``..``. Substring checks are defeated by encodings (``..%2f``), by ``....//``,
+    and on Windows by ``..\``; resolve-then-compare is defeated by none of them
+    because it asks the filesystem where the path actually landed.
+    """
+    if BUCKET is None:
+        raise HTTPException(status_code=503, detail="no bucket mounted")
+    # Contain within the SUBTREE the route owns, not merely within the stick.
+    # Containing against the stick root is not enough and looked sufficient: with
+    # `apks/../secret.txt` the resolved path is still under the stick, so a
+    # root-level check waves it through and the operator's files are readable on
+    # an unauthenticated route. The base has to be the narrowest directory the
+    # route is entitled to.
+    base = (Path(BUCKET.root) / subtree).resolve()
+    target = (base / relative).resolve()
+    if base not in target.parents and target != base:
+        raise HTTPException(status_code=404, detail="not found")
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail="not found")
+    return target
+
+
+@app.get("/sandbox/apkovl.tar.gz")
+async def sandbox_apkovl():
+    """The Alpine overlay the guest applies at boot."""
+    if not SANDBOX_ASSETS:
+        raise HTTPException(status_code=404, detail="not found")
+    return FileResponse(
+        _sandbox_file("boot", "apkovl.tar.gz"),
+        media_type="application/gzip",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.get("/sandbox/apks/{path:path}")
+async def sandbox_apks(path: str):
+    """The offline Alpine package repository the guest installs its head from."""
+    if not SANDBOX_ASSETS:
+        raise HTTPException(status_code=404, detail="not found")
+    return FileResponse(
+        _sandbox_file("apks", path),
+        media_type="application/octet-stream",
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @app.get("/api/stats")
