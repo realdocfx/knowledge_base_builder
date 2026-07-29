@@ -268,18 +268,22 @@ jobs:
           sed -i 's/^          //' build-root.sh
           chmod +x build-root.sh
           docker run --rm -v "$PWD:/work" -w /work alpine:3.20 /work/build-root.sh
-          sudo chown -R "$(id -u):$(id -g)" rootfs
-          du -sh rootfs
+          sudo du -sh rootfs
 
       - name: Install the UI and the kiosk head
         run: |
           set -eux
-          install -Dm755 ui/launch_kbb rootfs/usr/local/bin/launch_kbb
+          # rootfs stays root-owned. It is a Linux root filesystem: chowning it to
+          # the runner would hand the guest a / owned by uid 1001, with setuid
+          # binaries stripped of their owner. Everything that writes into it runs
+          # through sudo instead.
+          sudo install -Dm755 ui/launch_kbb rootfs/usr/local/bin/launch_kbb
 
-          # Generate the guest's OpenRC/init configuration from the shipping code
-          # path rather than restating it here, so the sandbox CI tests the same
-          # bytes the provisioner writes.
-          python3 - <<'PY'
+          # Generate the guest's init config from the shipping code path rather
+          # than restating it in YAML, so CI exercises the same bytes the
+          # provisioner writes. sudo -E with an explicit interpreter, because
+          # `sudo python3` would pick the system python and miss the install.
+          sudo -E "$(command -v python)" - <<'PY'
           import pathlib, sys
           sys.path.insert(0, "src")
           from knowledge_base_builder.cli import write_guest_root_config
@@ -287,39 +291,46 @@ jobs:
           print("guest root configured")
           PY
 
-          # OpenRC needs the kiosk in the default runlevel.
-          mkdir -p rootfs/etc/runlevels/default rootfs/etc/runlevels/sysinit
-          ln -sf /etc/init.d/kbb-kiosk rootfs/etc/runlevels/default/kbb-kiosk
-          for svc in devfs dmesg mdev; do
-            [ -f "rootfs/etc/init.d/$svc" ] && ln -sf "/etc/init.d/$svc" "rootfs/etc/runlevels/sysinit/$svc" || true
+          # OpenRC needs the kiosk in the default runlevel, and its dependencies
+          # present in the runlevels they belong to.
+          sudo mkdir -p rootfs/etc/runlevels/default rootfs/etc/runlevels/sysinit
+          sudo ln -sf /etc/init.d/kbb-kiosk rootfs/etc/runlevels/default/kbb-kiosk
+          for svc in devfs dmesg mdev hwdrivers; do
+            if [ -f "rootfs/etc/init.d/$svc" ]; then
+              sudo ln -sf "/etc/init.d/$svc" "rootfs/etc/runlevels/sysinit/$svc"
+            fi
           done
-          for svc in udev dbus seatd; do
-            [ -f "rootfs/etc/init.d/$svc" ] && ln -sf "/etc/init.d/$svc" "rootfs/etc/runlevels/default/$svc" || true
+          for svc in udev dbus seatd localmount; do
+            if [ -f "rootfs/etc/init.d/$svc" ]; then
+              sudo ln -sf "/etc/init.d/$svc" "rootfs/etc/runlevels/default/$svc"
+            fi
           done
-          ls -l rootfs/etc/runlevels/default/
+          sudo ls -l rootfs/etc/runlevels/default/
 
       - name: Generate an initramfs that can find a virtio root
         run: |
           set -eux
           KVER=$(ls rootfs/lib/modules | head -1)
           echo "kernel: $KVER"
-          docker run --rm -v "$PWD/rootfs:/rootfs" alpine:3.20 sh -eux -c "
-            apk add --no-cache mkinitfs
-            cp -a /rootfs /r 2>/dev/null || true
-            chroot /rootfs /sbin/mkinitfs -F 'base virtio ext4 kms dri' -o /boot/initramfs-kbb $KVER
-          "
-          ls -lh rootfs/boot/
+          # mkinitfs runs inside the guest root so the modules it embeds match the
+          # kernel that will boot. Without the virtio feature the initramfs cannot
+          # see /dev/vda and the kernel panics with no root.
+          docker run --rm -v "$PWD/rootfs:/rootfs" alpine:3.20 \
+            chroot /rootfs /sbin/mkinitfs -F "base virtio ext4 kms dri" \
+              -o "/boot/initramfs-kbb" "$KVER"
+          sudo ls -lh rootfs/boot/
 
       - name: Package the image
         run: |
           set -eux
-          # mke2fs -d populates from a directory: no loop device, no privileges.
-          # 3 GiB leaves headroom for the KBB wheel and a writable /tmp.
-          /sbin/mke2fs -t ext4 -d rootfs -L KBBGUEST -m 0 -F kbb_guest.img 3G
-          /sbin/e2fsck -fn kbb_guest.img || true
-          KVER=$(ls rootfs/lib/modules | head -1)
-          cp "rootfs/boot/vmlinuz-lts" vmlinuz-kbb
-          cp "rootfs/boot/initramfs-kbb" initramfs-kbb
+          # mke2fs -d populates from a directory with no loop mount, but it must
+          # run as root to read setuid binaries such as busybox's bbsuid and to
+          # preserve ownership into the image.
+          sudo /sbin/mke2fs -t ext4 -d rootfs -L KBBGUEST -m 0 -F kbb_guest.img 3G
+          sudo /sbin/e2fsck -fn kbb_guest.img || true
+          sudo cp rootfs/boot/vmlinuz-lts vmlinuz-kbb
+          sudo cp rootfs/boot/initramfs-kbb initramfs-kbb
+          sudo chown "$(id -u):$(id -g)" kbb_guest.img vmlinuz-kbb initramfs-kbb
           ls -lh kbb_guest.img vmlinuz-kbb initramfs-kbb
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
