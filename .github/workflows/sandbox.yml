@@ -116,18 +116,28 @@ jobs:
 
       - name: Toolchain
         run: |
+          set -eux
+          # Alpine 3.20's `rust` package cannot parse the manifests of current
+          # dependencies (time 0.3.54 and friends use newer Cargo features), so
+          # the distro toolchain fails during resolution -- before compiling a
+          # line. rustup gives a current stable with a musl host target, which is
+          # what the guest binary needs anyway.
           apk add --no-cache \
-            build-base rust cargo \
+            build-base rustup \
             webkit2gtk-dev gtk+3.0-dev \
             openssl-dev pkgconf glib-dev cairo-dev pango-dev gdk-pixbuf-dev \
-            libsoup-dev librsvg-dev
+            libsoup-dev librsvg-dev file
+          rustup-init -y --no-modify-path --default-toolchain stable --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Build
         working-directory: launcher
         run: |
           set -eux
-          cargo build --release --locked || cargo build --release
-          ls -l target/release/
+          rustc --version
+          cargo --version
+          # --locked would pin us to a lockfile resolved by a different toolchain.
+          cargo build --release
 
       - name: Confirm it is a Linux binary that links WebKitGTK
         working-directory: launcher
@@ -195,31 +205,52 @@ jobs:
           PY
           test -f stick/boot/apkovl.tar.gz
 
+      - name: Build a real FAT32 image
+        run: |
+          set -eux
+          # NOT QEMU's `fat:rw:` VVFAT. That synthesises a FAT16 volume whose
+          # geometry Alpine's init cannot reliably probe -- it reports "Mounting
+          # boot media failed" and lands on a bare initramfs. Commit 02445e0
+          # replaced vvfat with raw passthrough on the stick for this exact
+          # reason; CI has to boot the same shape of medium the field does.
+          dd if=/dev/zero of=stick.img bs=1M count=768 status=none
+          mkfs.vfat -F 32 -n KBB stick.img
+          mcopy -i stick.img -s stick/boot ::/
+          mdir -i stick.img ::/boot
+
       - name: Boot it
-        timeout-minutes: 10
+        timeout-minutes: 12
         run: |
           set -eux
           # Direct kernel boot. Firmware chainloading is GRUB's job and is covered
           # by the provisioner's own tests; what needs emulating here is the
           # kernel -> initramfs -> apkovl -> OpenRC path.
-          timeout 480 qemu-system-x86_64 \
+          #
+          # No `quiet`: when this fails, the reason is in the lines quiet hides.
+          timeout 540 qemu-system-x86_64 \
             -m 2048 -smp 2 -nographic -no-reboot \
             -kernel stick/boot/vmlinuz-lts \
             -initrd stick/boot/initramfs-lts \
-            -drive file=fat:rw:stick,format=raw,if=virtio \
-            -append "console=ttyS0 modules=loop,squashfs,sd-mod,usb-storage,vfat,virtio_blk,virtio_pci apkovl=/dev/vda:vfat:/boot/apkovl.tar.gz quiet kbb_mode=qemu" \
+            -drive file=stick.img,format=raw,if=virtio \
+            -append "console=ttyS0 modules=loop,squashfs,sd-mod,usb-storage,vfat,virtio_blk,virtio_pci alpine_dev=vda:vfat modloop=/boot/modloop-lts apkovl=/dev/vda:vfat:/boot/apkovl.tar.gz kbb_mode=qemu" \
             2>&1 | tee boot.log || true
           echo "--- boot log tail ---"
-          tail -60 boot.log
+          tail -80 boot.log
 
       - name: Assert the boot reached our overlay
         run: |
           set -eux
           # Kernel came up at all.
           grep -qi "Linux version" boot.log
-          # The overlay was located and applied -- this is the step that silently
-          # failed and produced a bare initramfs.
-          grep -qiE "apkovl|Alpine Local Backup|kbb" boot.log
+          # The medium was mountable. This is the assertion that catches a
+          # regression back to vvfat or a broken image layout.
+          if grep -qi "Mounting boot media failed" boot.log; then
+            echo "::error::boot media not mountable -- the image, not the overlay, is wrong"
+            exit 1
+          fi
+          # The overlay was located and applied -- the step that silently failed
+          # and produced a bare initramfs.
+          grep -qiE "Alpine Local Backup|apkovl|kbb" boot.log
           echo "boot pipeline reached the KBB overlay"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
