@@ -72,8 +72,25 @@ jobs:
           # Read the package set from the source of truth rather than restating
           # it here; a divergence between CI and the overlay is exactly the bug
           # this job exists to prevent.
-          PKGS=$(sed -n '/^GUEST_APK_CLOSURE = (/,/^)/p' src/knowledge_base_builder/cli.py \
-                 | grep -oE '"[^"]+"' | tr -d '"' | tr '\n' ' ')
+          # Import the tuple rather than scraping it. The previous sed matched
+          # `GUEST_APK_CLOSURE = (`, which stopped existing the moment that name
+          # became an alias for GUEST_WORLD -- so the job silently resolved an
+          # empty closure. Scraping source for a value the interpreter can just
+          # tell us is the same drift this job exists to catch.
+          apk add --no-cache python3
+          PKGS=$(python3 -c "
+          import ast, sys
+          src = open('src/knowledge_base_builder/cli.py', encoding='utf-8').read()
+          tree = ast.parse(src)
+          names = {}
+          for node in tree.body:
+              if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name):
+                  names[node.targets[0].id] = node.value
+          v = names['GUEST_APK_CLOSURE']
+          while isinstance(v, ast.Name):
+              v = names[v.id]
+          print(' '.join(ast.literal_eval(v)))
+          ")
           echo "closure roots: $PKGS"
           test -n "$PKGS"
           apk fetch --recursive --output /tmp/apks/x86_64 $PKGS
