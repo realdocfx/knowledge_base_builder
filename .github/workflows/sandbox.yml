@@ -459,16 +459,15 @@ jobs:
             grep -a "KBB-" boot.log || true
             exit 1
           }
-          # ...and the portal must have finished starting, not merely begun.
-          # "Waiting for application startup" is uvicorn's *first* line; a boot
-          # that stops there has a UI pointed at a socket nobody is listening on.
-          grep -qa "Application startup complete" boot.log || {
-            echo "::error::the portal never finished starting"
-            grep -aiE "uvicorn|portal|Traceback|Errno" boot.log | tail -20
-            exit 1
-          }
-          # ...and it must actually answer. The guest curls its own portal and
-          # echoes the status, because a listening socket is not a working app.
+          # The portal must actually answer. The guest fetches a page from its own
+          # portal and echoes the result.
+          #
+          # This deliberately does NOT grep for uvicorn's "Application startup
+          # complete". That line goes to /dev/console through a redirection, so
+          # Python block-buffers it and it can still be sitting in a buffer when
+          # the VM is shut down -- a run where the portal demonstrably served a
+          # page failed that check. Asserting on a dependency's log output tests
+          # its logging; asserting on a fetch tests the product.
           grep -qa "KBB-PORTAL-OK" boot.log || {
             echo "::error::the portal is listening but did not serve a page"
             grep -a "KBB-PORTAL" boot.log || true
