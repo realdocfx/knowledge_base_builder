@@ -1813,7 +1813,9 @@ def _write_sandbox_launchers(root: Path, port: int = 8080) -> None:
 # database nobody populated. `setup-devd udev` removes mdev for this reason.
 GUEST_RUNLEVELS = {
     "sysinit": ("devfs", "dmesg", "udev", "udev-trigger", "udev-settle", "hwdrivers"),
-    "boot": ("modules", "sysctl", "hostname", "bootmisc", "syslog"),
+    # `networking` is what brings `lo` up. Its absence is not a networking
+    # problem -- it means the guest cannot reach its own portal.
+    "boot": ("modules", "sysctl", "hostname", "bootmisc", "syslog", "networking"),
     "default": ("dbus", "seatd", "local", "kbb-kiosk"),
 }
 
@@ -1864,6 +1866,15 @@ def _guest_init_files() -> Dict[str, str]:
         "# Alt+SysRq+K kills the compositor and leaves the operator looking at\n"
         "# whatever is behind it. Alt+SysRq+B/E are equivalent exits.\n"
         "kernel.sysrq = 0\n"
+    )
+
+    # The loopback interface. Nothing brings `lo` up on its own, and without it
+    # there is no 127.0.0.1 at all -- the portal failed with "[Errno 99] address
+    # not available" while binding, which reads like a port conflict and is not.
+    # The whole design talks to itself over loopback, so this is load-bearing.
+    files["etc/network/interfaces"] = (
+        "auto lo\n"
+        "iface lo inet loopback\n"
     )
 
     files["etc/conf.d/kbb"] = (

@@ -217,3 +217,18 @@ def test_the_attached_ui_can_authenticate(rootfs):
         "KBB_TOKEN_FILE is exported after the portal starts, so the portal never "
         "sees it"
     )
+
+
+def test_loopback_is_configured(rootfs):
+    """No `lo`, no 127.0.0.1 -- and the entire design talks to itself over it.
+
+    The portal failed to bind with "[Errno 99] address not available", which reads
+    like a port conflict but means the loopback interface was never brought up.
+    """
+    iface = _read(rootfs, "etc/network/interfaces")
+    assert "lo" in iface and "loopback" in iface, (
+        f"loopback not configured: {iface!r}"
+    )
+    assert "networking" in cli.GUEST_RUNLEVELS["boot"], (
+        "etc/network/interfaces exists but no service brings it up"
+    )
