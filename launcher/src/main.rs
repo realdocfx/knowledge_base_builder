@@ -207,29 +207,37 @@ fn main() {
                  window.__kbbBoot = function(p,n,a,m,e){{ window.__kbbBootQueue.push([p,n,a,m,e]); }};",
                 target_url
             );
-            // Materialise the embedded boot screen to a temp file and load it over
-            // file://. Two dead ends ruled this: Chromium (hence WebView2) BLOCKS
+            // How the boot screen is loaded differs per webview, and the reason is
+            // not cosmetic.
+            //
+            // On Windows the screen is materialised to a temp file and loaded over
+            // file://. Two dead ends forced that: WebView2 is Chromium and BLOCKS
             // top-level navigation to data: URLs, and Tauri's distDir/devPath
-            // resolution silently fell back to http://127.0.0.1:80 (the bare
-            // "127.0.0.1 refused to connect" page). file:// has neither problem.
-            // Never panics: falls back to the bundled asset path if anything fails.
-            let boot_path = std::env::temp_dir().join("kbb_boot.html");
-            let boot_written = std::fs::write(&boot_path, LOADING_HTML).is_ok();
-            let boot_target = if boot_written {
-                // Url::from_file_path rather than formatting "file:///{}" by hand.
-                // Hand-formatting assumed a Windows path, which has no leading
-                // separator: on Linux "/tmp/kbb_boot.html" became
-                // "file:////tmp/kbb_boot.html" -- four slashes, so the URL parsed
-                // with an empty authority and a path Tauri could not resolve, and
-                // it unwrapped None inside manager.rs. This API knows the platform
-                // rules for both, including drive letters and percent-encoding.
-                match tauri::Url::from_file_path(&boot_path) {
-                    Ok(u) => tauri::WindowUrl::External(u),
-                    Err(_) => tauri::WindowUrl::App("index.html".into()),
+            // resolution silently fell back to http://127.0.0.1:80 -- the bare
+            // "127.0.0.1 refused to connect" page the operator actually saw.
+            //
+            // On WebKitGTK that workaround is not merely unnecessary, it is fatal:
+            // WindowUrl::External panics inside WindowManager::prepare_window, so
+            // the process dies before a window exists. The embedded asset served
+            // over tauri://localhost is the idiomatic path and works, which is why
+            // this never surfaced while the launcher was Windows-only.
+            #[cfg(target_os = "windows")]
+            let boot_target = {
+                let boot_path = std::env::temp_dir().join("kbb_boot.html");
+                if std::fs::write(&boot_path, LOADING_HTML).is_ok() {
+                    // from_file_path, not format!("file:///{}"), so drive letters
+                    // and percent-encoding follow the platform's own rules.
+                    match tauri::Url::from_file_path(&boot_path) {
+                        Ok(u) => tauri::WindowUrl::External(u),
+                        Err(_) => tauri::WindowUrl::App("index.html".into()),
+                    }
+                } else {
+                    tauri::WindowUrl::App("index.html".into())
                 }
-            } else {
-                tauri::WindowUrl::App("index.html".into())
             };
+
+            #[cfg(not(target_os = "windows"))]
+            let boot_target = tauri::WindowUrl::App("index.html".into());
             let window = tauri::WindowBuilder::new(app, "main", boot_target)
             .title("Knowledge Base Command Console")
             .inner_size(1280.0, 800.0)
