@@ -232,3 +232,23 @@ def test_batch_continuations_are_not_broken_by_comments(launchers):
                 f"  {line}\n  {lines[i + 1]}\n"
                 "cmd.exe will consume it as an argument and break the command"
             )
+
+
+def test_the_guest_cannot_write_to_its_own_image(launchers):
+    """snapshot=on is what actually makes the sandbox amnesic.
+
+    The root filesystem is mounted rw, so without snapshot=on the guest writes
+    straight through to kbb_guest.img on the stick: state survives reboots, and a
+    compromised guest can permanently change what the stick boots next time. This
+    was observed rather than theorised -- a single headless boot moved the image's
+    mtime. With snapshot=on QEMU puts every write in a host temp overlay and
+    discards it at exit.
+    """
+    for name, body in launchers.items():
+        img_lines = [ln for ln in body.splitlines() if "kbb_guest.img" in ln and "-drive" in ln]
+        assert img_lines, f"{name} does not attach the guest image as a drive"
+        for ln in img_lines:
+            assert "snapshot=on" in ln, (
+                f"{name} attaches the guest image without snapshot=on, so the "
+                f"sandbox persists state and is not amnesic:\n  {ln.strip()}"
+            )
