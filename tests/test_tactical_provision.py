@@ -388,6 +388,12 @@ def test_portal_resolves_the_library_directory(tmp_path, monkeypatch):
     """
     import types
 
+    # portal() imports the web stack; without it this cannot be exercised at
+    # all, and an ImportError here would report as a failure of bucket
+    # resolution rather than a missing optional dependency.
+    pytest.importorskip('httpx')
+    pytest.importorskip('fastapi')
+
     (tmp_path / cli.LIBRARY_DIR).mkdir()
     captured = {}
 
