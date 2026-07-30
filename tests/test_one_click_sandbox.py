@@ -205,31 +205,34 @@ def test_nothing_is_fetched_from_the_host_or_the_network(launchers):
         )
 
 
-def test_no_vvfat_drive_is_attached(launchers):
-    """vvfat aborts QEMU outright on a populated stick, so it must not be emitted.
+def test_the_archive_reaches_the_guest_read_only(launchers):
+    """vvfat is usable, but only against a small root -- and never writable.
 
-    Attaching the archive with ``fat:32:ro:`` was intended to give the guest its
-    content without requiring Administrator. It does not work: QEMU exits with
-    "Too many entries in root directory" before booting anything, and the
-    ``fat:32:`` prefix does NOT lift that limit -- QEMU's own warning says its
-    FAT32 vvfat support is untested. A launcher carrying that drive is not a
-    launcher with a missing feature, it is a launcher that fails to start.
+    Attaching the drive was abandoned once because QEMU aborted with "Too many
+    entries in root directory" before booting. That limit is about root-directory
+    *entries*, not size: the identical command against a three-entry directory
+    produces only QEMU's harmless "FAT32 has not been tested" warning. Content is
+    therefore moved under library/ by _reorganise_for_sandbox, leaving a root
+    QEMU can present.
 
-    So the sandbox currently boots without archive content. That is a real gap and
-    it is tracked as one; it is not papered over by emitting a drive that breaks
-    the one click this whole mode exists for.
+    readonly=on is not decoration either. Without it QEMU refuses the node
+    outright ("Block node is read-only"), and vvfat's write path is where the
+    driver is genuinely unreliable -- a sandbox must not be able to alter the
+    archive it was given.
     """
     for name, body in launchers.items():
-        # Strip comments: the scripts explain in prose why vvfat is absent, and a
-        # substring guard that reads the explanation fails on the very comment
-        # documenting the fix.
-        code = "\n".join(
-            ln for ln in body.splitlines()
-            if not ln.lstrip().startswith(("#", "::", "REM ", "rem "))
-        )
-        assert "fat:" not in code, (
-            f"{name} attaches a vvfat drive; QEMU will exit before booting"
-        )
+        vv = [ln for ln in body.splitlines()
+              if "fat:" in ln and not ln.lstrip().startswith(("#", "::"))]
+        assert vv, f"{name} does not attach the archive; the library will be empty"
+        for ln in vv:
+            assert "fat:32:ro:" in ln, (
+                f"{name} attaches the archive writable through vvfat's unreliable "
+                f"write path: {ln.strip()}"
+            )
+            assert "readonly=on" in ln, (
+                f"{name} omits readonly=on; QEMU rejects the node with "
+                f'"Block node is read-only": {ln.strip()}'
+            )
 
 
 def test_batch_continuations_are_not_broken_by_comments(launchers):

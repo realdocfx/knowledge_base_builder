@@ -339,3 +339,74 @@ def test_install_guest_image_is_a_noop_without_a_source(tmp_path):
     root.mkdir()
     cli._install_guest_image(root, None)
     assert not list(root.iterdir())
+
+
+def test_reorganise_moves_content_but_not_infrastructure(tmp_path):
+    """Runtime files stay at the root; content goes one level down."""
+    for name in (".kb_env", "qemu", "boot"):
+        (tmp_path / name).mkdir()
+    (tmp_path / "kbb_guest.img").write_bytes(b"img")
+    (tmp_path / "start_sandbox.bat").write_text("x")
+    for name in ("Some_Book", "wikipedia_en.zimaa", "Another Book"):
+        (tmp_path / name).mkdir() if "." not in name else (tmp_path / name).write_bytes(b"z")
+
+    moved = cli._reorganise_for_sandbox(tmp_path)
+    assert moved == 3, f"expected 3 content entries moved, got {moved}"
+
+    lib = tmp_path / cli.LIBRARY_DIR
+    for name in ("Some_Book", "wikipedia_en.zimaa", "Another Book"):
+        assert (lib / name).exists(), f"{name} was not moved into library/"
+    for name in (".kb_env", "qemu", "boot", "kbb_guest.img", "start_sandbox.bat"):
+        assert (tmp_path / name).exists(), f"{name} must stay at the root"
+
+
+def test_reorganise_is_idempotent(tmp_path):
+    (tmp_path / "Book").mkdir()
+    assert cli._reorganise_for_sandbox(tmp_path) == 1
+    assert cli._reorganise_for_sandbox(tmp_path) == 0, (
+        "a second run moved something; re-provisioning would keep nesting"
+    )
+
+
+def test_reorganise_leaves_the_root_small_enough_for_vvfat(tmp_path):
+    """The whole point: QEMU's root-directory limit."""
+    for i in range(300):
+        (tmp_path / f"A_Long_Content_Directory_Name_{i:03d}").mkdir()
+    cli._reorganise_for_sandbox(tmp_path)
+    assert len(list(tmp_path.iterdir())) < 20, (
+        "root still has too many entries; QEMU will abort with "
+        "'Too many entries in root directory'"
+    )
+
+
+def test_portal_resolves_the_library_directory(tmp_path, monkeypatch):
+    """Host-native and in-guest modes must agree on where content lives.
+
+    Moving content under library/ for vvfat's sake would otherwise leave the
+    host-native portal serving an empty bucket -- the reorganisation would
+    "work" for the sandbox and silently break the mode that already worked.
+    """
+    import types
+
+    (tmp_path / cli.LIBRARY_DIR).mkdir()
+    captured = {}
+
+    fake_app = types.SimpleNamespace(state=types.SimpleNamespace())
+    monkeypatch.setitem(
+        __import__("sys").modules, "uvicorn",
+        types.SimpleNamespace(run=lambda *a, **k: captured.update(ran=True)),
+    )
+    import knowledge_base_builder.web as web
+    monkeypatch.setattr(web, "app", fake_app, raising=False)
+    monkeypatch.setattr(cli, "_write_token_file", lambda *a, **k: None, raising=False)
+
+    try:
+        cli.portal(str(tmp_path), host="127.0.0.1", port=8099,
+                   no_browser=True, sandbox_assets=False)
+    except SystemExit:
+        pass
+
+    assert fake_app.state.bucket_root.endswith(cli.LIBRARY_DIR), (
+        f"portal served {fake_app.state.bucket_root!r} rather than the library "
+        "directory; the host mode would show an empty archive"
+    )

@@ -671,7 +671,17 @@ def portal(
         )
         raise typer.Exit(1) from exc
 
-    portal_app.state.bucket_root = str(Path(path).resolve())
+    # Content lives under library/ on drives provisioned for the sandbox, because
+    # QEMU's vvfat cannot present a drive with hundreds of root entries. Resolving
+    # it here rather than in each launcher means the host-native mode and the
+    # in-guest mode agree by construction: moving the content must not quietly
+    # leave one of them serving an empty bucket.
+    _requested = Path(path).resolve()
+    _library = _requested / LIBRARY_DIR
+    if _library.is_dir():
+        console.print(f"[cyan]Serving library/ ({_library})[/cyan]")
+        _requested = _library
+    portal_app.state.bucket_root = str(_requested)
 
     if sandbox_assets:
         # The guest's initramfs cannot present a token, so /sandbox/* has to be
@@ -1720,6 +1730,76 @@ def _install_guest_image(root: Path, source: Optional[str] = None) -> None:
     console.print("[bold green]Guest image installed.[/bold green]")
 
 
+# Everything the stick needs to *run*, as opposed to the content it carries.
+# These stay at the drive root; content moves under LIBRARY_DIR so the root the
+# guest sees stays small.
+SANDBOX_INFRA_NAMES = frozenset({
+    ".kb_env", ".kb_state", ".ia_state", "qemu", "boot", "EFI", "docs",
+    "kbb_guest.img", "vmlinuz-kbb", "initramfs-kbb",
+    "start_sandbox.bat", "start_sandbox.sh", "Launch_KBB.exe",
+    "System Volume Information", "$RECYCLE.BIN",
+})
+
+LIBRARY_DIR = "library"
+
+
+def _reorganise_for_sandbox(root: Path, dry_run: bool = False) -> int:
+    """Move content under ``library/`` so QEMU's vvfat can present the drive.
+
+    QEMU synthesises the guest-visible FAT volume with a FAT16-style root
+    directory, and long filenames consume several 8.3 slots each. A drive with a
+    few hundred content entries at the root overruns it, and QEMU aborts before
+    booting anything::
+
+        Too many entries in root directory
+        Could not read directory D:
+
+    ``fat:32:`` does not lift that -- measured, not assumed: the identical command
+    against a three-entry directory produces only QEMU's harmless "FAT32 has not
+    been tested" warning. What fixes it is a small root. With content one level
+    down the guest sees a handful of root entries, and the subdirectory beneath
+    holds as many as it likes.
+
+    This is a rename within a single volume, so no data is copied and no partial
+    write is possible however large the archive. Idempotent: a drive already
+    organised this way reports zero moves.
+
+    Returns the number of entries moved.
+    """
+    library = root / LIBRARY_DIR
+    movable = [
+        entry for entry in root.iterdir()
+        if entry.name not in SANDBOX_INFRA_NAMES
+        and entry.name != LIBRARY_DIR
+        and not entry.name.endswith(".part")
+    ]
+    if not movable:
+        console.print("[green]Drive root is already sandbox-ready.[/green]")
+        return 0
+
+    console.print(
+        f"[cyan]Moving {len(movable)} entries under {LIBRARY_DIR}/[/cyan] "
+        "(rename within the volume; no data is copied)"
+    )
+    if dry_run:
+        for entry in movable[:10]:
+            console.print(f"  would move: {entry.name}")
+        return len(movable)
+
+    library.mkdir(exist_ok=True)
+    moved = 0
+    for entry in movable:
+        try:
+            entry.rename(library / entry.name)
+            moved += 1
+        except OSError as exc:
+            # Report and continue. One locked file must not abandon the drive
+            # half-reorganised with no account of what happened.
+            console.print(f"[yellow]  skipped {entry.name}: {exc}[/yellow]")
+    console.print(f"[bold green]Moved {moved}/{len(movable)} entries.[/bold green]")
+    return moved
+
+
 def _write_sandbox_launchers(root: Path, port: int = 8080) -> None:
     r"""Generate the one-click Mode C launchers.
 
@@ -1794,6 +1874,7 @@ def _write_sandbox_launchers(root: Path, port: int = 8080) -> None:
         '    -kernel "%USB%vmlinuz-kbb" -initrd "%USB%initramfs-kbb" ^',
         f'    -append "{cmdline}" ^',
         '    -drive file="%USB%kbb_guest.img",format=raw,if=virtio,snapshot=on ^',
+        '    -drive file=fat:32:ro:"%USB:~0,-1%",format=raw,if=virtio,readonly=on ^',
         "    -device virtio-vga ^",
         "    -device virtio-keyboard-pci -device virtio-tablet-pci ^",
         "    -full-screen -display sdl,grab-mod=rctrl",
@@ -1820,6 +1901,7 @@ def _write_sandbox_launchers(root: Path, port: int = 8080) -> None:
         '    -kernel "$USB/vmlinuz-kbb" -initrd "$USB/initramfs-kbb" \\',
         f'    -append "{cmdline}" \\',
         '    -drive file="$USB/kbb_guest.img",format=raw,if=virtio,snapshot=on \\',
+        '    -drive file=fat:32:ro:"$USB",format=raw,if=virtio,readonly=on \\',
         "    -device virtio-vga \\",
         "    -device virtio-keyboard-pci -device virtio-tablet-pci \\",
         "    -full-screen -display sdl,grab-mod=rctrl",
@@ -1979,6 +2061,16 @@ def _guest_init_files() -> Dict[str, str]:
         '        || kbb_log "no archive attached; UI will start without content"\n'
         '\n'
         '    # The portal, from the guest image if the stick did not supply one.\n'
+        '    # Content lives under library/ so the drive root stays small enough for\n'
+        '    # QEMU vvfat to present it at all. Fall back to the mount point itself\n'
+        '    # for drives provisioned before that layout existed.\n'
+        '    if [ -d "$KBB_DATA/library" ]; then\n'
+        '        KBB_BUCKET="$KBB_DATA/library"\n'
+        '    else\n'
+        '        KBB_BUCKET="$KBB_DATA"\n'
+        '    fi\n'
+        '    kbb_log "bucket: $KBB_BUCKET"\n'
+        '\n'
         '    KBB_PY=""\n'
         '    for cand in "$KBB_DATA/.kb_env/python-linux/bin/python3" /usr/bin/python3; do\n'
         '        [ -x "$cand" ] && KBB_PY="$cand" && break\n'
@@ -1992,7 +2084,7 @@ def _guest_init_files() -> Dict[str, str]:
         '\n'
         '    if [ -n "$KBB_PY" ]; then\n'
         '        kbb_log "portal python: $KBB_PY"\n'
-        '        "$KBB_PY" -m knowledge_base_builder.cli portal "$KBB_DATA" \\\n'
+        '        "$KBB_PY" -m knowledge_base_builder.cli portal "$KBB_BUCKET" \\\n'
         '            --port "$KBB_PORT" --no-browser >/dev/console 2>&1 &\n'
         '    else\n'
         '        kbb_log "no python found; UI will show its offline screen"\n'

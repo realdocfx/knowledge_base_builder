@@ -273,3 +273,20 @@ def test_the_kiosk_survives_a_read_only_root(rootfs):
         "if the remount did not happen the kiosk has nowhere to write and fails "
         "with no diagnostic; it must fall back to tmpfs"
     )
+
+
+def test_the_kiosk_serves_the_library_directory(rootfs):
+    """Content lives under library/ so vvfat can present the drive at all.
+
+    QEMU aborts with "Too many entries in root directory" on a drive with a few
+    hundred content entries at the root, so the archive is one level down. The
+    kiosk must point the portal there, and must still work on a drive laid out
+    the old way.
+    """
+    svc = _read(rootfs, "etc/init.d/kbb-kiosk")
+    assert "library" in svc, "the kiosk never looks for the library directory"
+    assert "KBB_BUCKET" in svc, "the bucket path is not derived at all"
+    assert 'portal "$KBB_BUCKET"' in svc, (
+        "the portal is still started against the mount point rather than the "
+        "resolved bucket"
+    )
