@@ -53,6 +53,14 @@ web = [
     "fastapi>=0.100.0",
     "uvicorn[standard]>=0.23.0",
     "httpx>=0.24.0",
+]
+# Xapian is deliberately NOT in [web]. `xapian-bindings` on PyPI is an unrelated
+# stub at 0.0.x, so ">=1.4.0" cannot be satisfied from an index and
+# `pip install knowledge-base-builder[web]` fails outright -- the portal is not
+# optional, so that made the package uninstallable for its main use. Local search
+# is SQLite FTS5 and needs none of this; real Xapian bindings come from the
+# distro package or the wheels built by .github/workflows/build-xapian-wheels.yml.
+xapian = [
     "xapian-bindings>=1.4.0",
 ]
 dev = [
