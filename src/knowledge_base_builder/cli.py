@@ -1742,6 +1742,33 @@ SANDBOX_INFRA_NAMES = frozenset({
 
 LIBRARY_DIR = "library"
 
+# QEMU's vvfat refuses any file larger than this, anywhere in the exposed tree,
+# and fails the whole drive when it finds one:
+#
+#     File D:/wikipedia_fr_all_maxi_2026-05.zimaa is larger than 2GB
+#     Could not read directory D:
+#
+# This is stricter than FAT32's own 4 GiB limit, which is what FAT32_CHUNK_LIMIT
+# was sized against. ZIM slices cut at 3900 MiB are therefore valid on the stick
+# but invisible to the sandbox: delivering them needs slices below this value.
+VVFAT_MAX_FILE_BYTES = 2 * 1024 * 1024 * 1024
+
+# vvfat also caps entries in the directory it is pointed at (a FAT16-style root;
+# long names burn several 8.3 slots each). Both limits were measured against the
+# real drive, and satisfying one does not satisfy the other:
+#
+#   root = D:\            -> "Too many entries in root directory"  (283 entries)
+#   root = D:\  reorganised -> "File kbb_guest.img is larger than 2GB"
+#   root = D:\library     -> "Too many entries in root directory"  (273 entries)
+#
+# So a usable vvfat view needs a directory with few entries AND no file above
+# VVFAT_MAX_FILE_BYTES beneath it. The document library can meet that with one
+# more level of nesting; ZIM slices cut at FAT32_CHUNK_LIMIT (3900 MiB) cannot,
+# and would have to be re-sliced below 2 GiB. Until then no vvfat drive is
+# emitted: one that aborts QEMU is worse than none, because it breaks the single
+# click this mode exists for.
+VVFAT_MAX_ROOT_ENTRIES = 100
+
 
 def _reorganise_for_sandbox(root: Path, dry_run: bool = False) -> int:
     """Move content under ``library/`` so QEMU's vvfat can present the drive.
@@ -1874,7 +1901,6 @@ def _write_sandbox_launchers(root: Path, port: int = 8080) -> None:
         '    -kernel "%USB%vmlinuz-kbb" -initrd "%USB%initramfs-kbb" ^',
         f'    -append "{cmdline}" ^',
         '    -drive file="%USB%kbb_guest.img",format=raw,if=virtio,snapshot=on ^',
-        '    -drive file=fat:32:ro:"%USB:~0,-1%",format=raw,if=virtio,readonly=on ^',
         "    -device virtio-vga ^",
         "    -device virtio-keyboard-pci -device virtio-tablet-pci ^",
         "    -full-screen -display sdl,grab-mod=rctrl",
@@ -1901,7 +1927,6 @@ def _write_sandbox_launchers(root: Path, port: int = 8080) -> None:
         '    -kernel "$USB/vmlinuz-kbb" -initrd "$USB/initramfs-kbb" \\',
         f'    -append "{cmdline}" \\',
         '    -drive file="$USB/kbb_guest.img",format=raw,if=virtio,snapshot=on \\',
-        '    -drive file=fat:32:ro:"$USB",format=raw,if=virtio,readonly=on \\',
         "    -device virtio-vga \\",
         "    -device virtio-keyboard-pci -device virtio-tablet-pci \\",
         "    -full-screen -display sdl,grab-mod=rctrl",

@@ -205,34 +205,32 @@ def test_nothing_is_fetched_from_the_host_or_the_network(launchers):
         )
 
 
-def test_the_archive_reaches_the_guest_read_only(launchers):
-    """vvfat is usable, but only against a small root -- and never writable.
+def test_no_vvfat_drive_until_it_can_actually_work(launchers):
+    """vvfat must not be emitted while it aborts QEMU.
 
-    Attaching the drive was abandoned once because QEMU aborted with "Too many
-    entries in root directory" before booting. That limit is about root-directory
-    *entries*, not size: the identical command against a three-entry directory
-    produces only QEMU's harmless "FAT32 has not been tested" warning. Content is
-    therefore moved under library/ by _reorganise_for_sandbox, leaving a root
-    QEMU can present.
+    Two independent limits were measured against the real drive, and satisfying
+    one does not satisfy the other:
 
-    readonly=on is not decoration either. Without it QEMU refuses the node
-    outright ("Block node is read-only"), and vvfat's write path is where the
-    driver is genuinely unreliable -- a sandbox must not be able to alter the
-    archive it was given.
+    * a FAT16-style root-entry cap -- 283 entries at the drive root gave "Too
+      many entries in root directory", and moving them under library/ simply
+      moved the failure there;
+    * a hard 2 GB per-file ceiling, anywhere beneath the exposed directory --
+      "File kbb_guest.img is larger than 2GB" fails the whole drive.
+
+    ZIM slices are cut at FAT32_CHUNK_LIMIT (3900 MiB) for FAT32's own 4 GiB
+    limit, so they clear the medium and not the driver. Until they are re-sliced
+    below VVFAT_MAX_FILE_BYTES, a vvfat drive makes QEMU exit before booting --
+    which is strictly worse than an empty library, because it breaks the one
+    click this mode exists for.
     """
     for name, body in launchers.items():
-        vv = [ln for ln in body.splitlines()
-              if "fat:" in ln and not ln.lstrip().startswith(("#", "::"))]
-        assert vv, f"{name} does not attach the archive; the library will be empty"
-        for ln in vv:
-            assert "fat:32:ro:" in ln, (
-                f"{name} attaches the archive writable through vvfat's unreliable "
-                f"write path: {ln.strip()}"
-            )
-            assert "readonly=on" in ln, (
-                f"{name} omits readonly=on; QEMU rejects the node with "
-                f'"Block node is read-only": {ln.strip()}'
-            )
+        code = chr(10).join(
+            ln for ln in body.splitlines()
+            if not ln.lstrip().startswith(("#", "::", "REM ", "rem "))
+        )
+        assert "fat:" not in code, (
+            f"{name} attaches a vvfat drive; QEMU will exit before booting"
+        )
 
 
 def test_batch_continuations_are_not_broken_by_comments(launchers):
