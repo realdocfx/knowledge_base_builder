@@ -197,6 +197,18 @@ fn main() {
         .clone()
         .unwrap_or_else(|| format!("http://127.0.0.1:{}", port));
 
+    // The port the readiness probe must poll. When attaching, the portal is on
+    // whatever KBB_PORTAL_URL names -- NOT the port we allocated for a portal we
+    // did not start. Polling `port` in attach mode watches a socket nobody is
+    // listening on, so every probe fails, the 120s budget expires and the UI
+    // reports "portal backend did not respond" while the portal is serving
+    // normally a few hundred milliseconds away.
+    let probe_port: u16 = external_portal
+        .as_deref()
+        .and_then(|u| u.rsplit(':').next())
+        .and_then(|p| p.trim_end_matches('/').parse().ok())
+        .unwrap_or(port);
+
     tauri::Builder::default()
         .setup(move |app| {
             // Publish the portal URL and a queueing stub BEFORE the page's scripts
@@ -259,12 +271,13 @@ fn main() {
             // never on a bare socket, so ERR_CONNECTION_REFUSED cannot surface.
             let win = window.clone();
             let url = target_url.clone();
+            let probe_port = probe_port;
             thread::spawn(move || {
                 const MAX_PROBES: u32 = 240; // 240 * 500ms = 120s hard budget
                 let started = std::time::Instant::now();
                 for attempt in 1..=MAX_PROBES {
                     let elapsed = started.elapsed().as_secs();
-                    let ready = probe_http_ok(port, "/");
+                    let ready = probe_http_ok(probe_port, "/");
                     if ready {
                         let _ = win.eval(&format!(
                             "window.__kbbBoot(3,'Console ready',{},{},{});",

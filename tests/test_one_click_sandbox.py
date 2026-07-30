@@ -271,3 +271,26 @@ def test_the_guest_cannot_write_to_its_own_image(launchers):
                 f"{name} attaches the guest image without snapshot=on, so the "
                 f"sandbox persists state and is not amnesic:\n  {ln.strip()}"
             )
+
+
+def test_the_launcher_probes_the_port_it_will_navigate_to():
+    """In attach mode the readiness probe must follow KBB_PORTAL_URL.
+
+    The launcher allocates a free port for the portal it would have spawned. When
+    something else owns the portal it navigates to KBB_PORTAL_URL but was still
+    probing that unused allocated port -- so every probe failed, the 120s budget
+    expired, and the UI reported "portal backend did not respond" while the
+    portal was serving normally. The guest boot log said KBB-PORTAL-OK at the
+    same moment the screen said startup failed.
+    """
+    import pathlib
+
+    src = pathlib.Path(__file__).resolve().parent.parent / "launcher" / "src" / "main.rs"
+    text = src.read_text(encoding="utf-8")
+    assert "probe_http_ok(probe_port" in text, (
+        "the readiness probe still polls the locally allocated port, which "
+        "nothing listens on when attaching to an external portal"
+    )
+    assert "external_portal" in text.split("let probe_port")[1][:400], (
+        "probe_port is not derived from KBB_PORTAL_URL"
+    )
