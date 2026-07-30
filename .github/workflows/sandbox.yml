@@ -414,7 +414,7 @@ jobs:
           sudo apt-get install -y -qq qemu-system-x86
 
       - name: Boot the guest and wait for the UI
-        timeout-minutes: 12
+        timeout-minutes: 15
         run: |
           set -eux
           # virtio-vga gives the guest a DRM node. cage is a DRM compositor, so
@@ -428,7 +428,7 @@ jobs:
           # from a GPU problem. This invocation has to stay in step with the
           # generated launchers -- a CI boot that differs from the field boot
           # proves nothing about the field.
-          timeout 420 qemu-system-x86_64 \
+          timeout 540 qemu-system-x86_64 \
             -M q35 -m 3072 -smp 2 -no-reboot \
             -kernel vmlinuz-kbb -initrd initramfs-kbb \
             -drive file=kbb_guest.img,format=raw,if=virtio \
@@ -459,7 +459,22 @@ jobs:
             grep -a "KBB-" boot.log || true
             exit 1
           }
-          echo "Tauri UI is running inside the VM"
+          # ...and the portal must have finished starting, not merely begun.
+          # "Waiting for application startup" is uvicorn's *first* line; a boot
+          # that stops there has a UI pointed at a socket nobody is listening on.
+          grep -qa "Application startup complete" boot.log || {
+            echo "::error::the portal never finished starting"
+            grep -aiE "uvicorn|portal|Traceback|Errno" boot.log | tail -20
+            exit 1
+          }
+          # ...and it must actually answer. The guest curls its own portal and
+          # echoes the status, because a listening socket is not a working app.
+          grep -qa "KBB-PORTAL-OK" boot.log || {
+            echo "::error::the portal is listening but did not serve a page"
+            grep -a "KBB-PORTAL" boot.log || true
+            exit 1
+          }
+          echo "Tauri UI running and portal serving inside the VM"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         if: always()

@@ -179,50 +179,49 @@ def test_write_sandbox_launchers(tmp_path):
 
     bat_text = bat.read_text(encoding="utf-8")
     assert r"qemu\win\qemu-system-x86_64.exe" in bat_text
-    assert r"boot\vmlinuz-lts" in bat_text
-    assert r"boot\initramfs-lts" in bat_text
+    assert "vmlinuz-kbb" in bat_text
+    assert "initramfs-kbb" in bat_text
     assert "kbb_mode=qemu" in bat_text
 
     sh_text = sh.read_text(encoding="utf-8")
-    assert "boot/vmlinuz-lts" in sh_text
-    assert "boot/initramfs-lts" in sh_text
+    assert "vmlinuz-kbb" in sh_text
+    assert "initramfs-kbb" in sh_text
     assert "kbb_mode=qemu" in sh_text
 
 
-def test_sandbox_launcher_attaches_no_writable_medium(tmp_path):
-    """No vvfat, and no block device at all.
+def test_sandbox_launcher_needs_no_privileges(tmp_path):
+    """One click means no consent dialog, and the archive stays read-only.
 
-    The vvfat prohibition still stands: that driver has a hard root-directory
-    entry limit and cannot present a populated stick.
+    The vvfat prohibition that used to live here has been narrowed rather than
+    dropped. ``fat:rw:`` remains forbidden -- vvfat's write path is where it is
+    genuinely unreliable, and the archive must not be mutable from inside a
+    sandbox in any case. ``fat:32:ro:`` is how the stick's content reaches the
+    guest: the root-directory entry limit that broke the earlier attempt is a
+    FAT16 limit, and every file is already chunked below 4 GiB for FAT32.
 
-    What replaced it has changed, though. Raw ``PhysicalDriveN`` passthrough
-    solved the vvfat limit but needed Administrator, and the UAC dialog it raised
-    is a second action by the operator -- which "one click, no additional input"
-    excludes. The guest now takes its overlay and packages over HTTP from the
-    host (Alpine netboot's own mechanism), so no medium is attached at all. That
-    is strictly stronger than ``readonly=on``: there is nothing to write to, so
-    the guest is amnesic by construction rather than by flag.
+    Raw ``PhysicalDriveN`` passthrough is what forced Administrator, and with it
+    the UAC prompt. The guest now boots a plain image file, which needs nothing.
     """
     cli._write_sandbox_launchers(tmp_path)
 
     for name in ("start_sandbox.bat", "start_sandbox.sh"):
         raw = (tmp_path / name).read_text(encoding="utf-8")
-        # Strip comments before matching. These scripts explain in prose why they
-        # do NOT use sudo or vvfat, and a substring guard that reads the prose
-        # fails on the very comment documenting the fix -- which teaches the
-        # reader to ignore the guard. Assert on what executes.
+        # Strip comments before matching: these scripts explain in prose why they
+        # avoid sudo and raw devices, and a substring guard that reads the prose
+        # fails on the comment documenting the fix.
         text = "\n".join(
             ln for ln in raw.splitlines()
             if not ln.lstrip().startswith(("#", "::", "REM ", "rem "))
         )
-        assert "fat:ro:" not in text and "fat:rw:" not in text, (
-            f"{name} uses the vvfat driver, which cannot present a populated stick"
-        )
-        assert "-drive" not in text, (
-            f"{name} attaches a block device; the guest is meant to have no medium"
+        assert "fat:rw:" not in text, (
+            f"{name} mounts the archive writable through vvfat's unreliable write "
+            "path, and a sandbox must not be able to alter the archive"
         )
         assert "PhysicalDrive" not in text and "sudo" not in text, (
             f"{name} needs elevation, so the operator must consent to a prompt"
+        )
+        assert "kbb_guest.img" in text, (
+            f"{name} does not boot the self-contained guest image"
         )
 
 

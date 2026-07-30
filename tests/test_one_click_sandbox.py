@@ -169,3 +169,46 @@ def test_guest_has_input_devices(launchers):
         assert "tablet" in body or "mouse" in body, (
             f"{name} attaches no pointer device"
         )
+
+
+# ---------------------------------------------------------------------------
+# Self-contained: everything on the stick, nothing from the host or a network
+# ---------------------------------------------------------------------------
+def test_boots_the_prebuilt_guest_image(launchers):
+    """The guest is a finished filesystem on the stick, not something assembled."""
+    for name, body in launchers.items():
+        assert "kbb_guest.img" in body, (
+            f"{name} does not boot the guest image; the netboot path it replaced "
+            "needed a repository at boot and could not be trusted offline"
+        )
+        assert "vmlinuz-kbb" in body and "initramfs-kbb" in body, (
+            f"{name} boots a kernel/initramfs that does not match the image"
+        )
+
+
+def test_nothing_is_fetched_from_the_host_or_the_network(launchers):
+    """No host portal, no HTTP, no repository -- the stick carries it all."""
+    for name, body in launchers.items():
+        code = "\n".join(
+            ln for ln in body.splitlines()
+            if not ln.lstrip().startswith(("#", "::", "REM ", "rem "))
+        )
+        assert "10.0.2.2" not in code, (
+            f"{name} points the guest at the host over the NAT gateway; the portal "
+            "must run inside the guest"
+        )
+        assert "apkovl=" not in code and "alpine_repo=" not in code, (
+            f"{name} still asks the guest to install itself at boot"
+        )
+        assert "--sandbox-assets" not in code, (
+            f"{name} starts a host-side portal to serve the guest"
+        )
+
+
+def test_the_archive_is_attached_to_the_guest(launchers):
+    """A UI with no content is not usable. The stick's data must reach the guest."""
+    for name, body in launchers.items():
+        assert body.count("-drive") >= 2, (
+            f"{name} attaches only the guest image; the archive never reaches the "
+            "portal, so the UI comes up empty"
+        )

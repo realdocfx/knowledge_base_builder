@@ -1679,79 +1679,65 @@ def _provision_qemu_runtime(root: Path, platforms: Optional[List[str]] = None,
 def _write_sandbox_launchers(root: Path, port: int = 8080) -> None:
     r"""Generate the one-click Mode C launchers.
 
-    Design note -- why there is no raw-device passthrough here.
+    Everything the guest needs is on the stick: a finished Alpine filesystem
+    (``kbb_guest.img``) with cage, WebKitGTK, Python, KBB and the Tauri UI already
+    installed. Nothing is fetched from the host and nothing from a network. The
+    portal runs *inside* the guest, so the sandbox contains the server as well as
+    the operator.
 
-    The previous launcher self-elevated so it could hand QEMU
-    ``\\.\PhysicalDriveN``, because QEMU's vvfat driver cannot present a FAT32
-    volume with a populated root directory. Elevation means a UAC dialog, and a
-    dialog is a second action by the operator, which the requirement excludes.
-    Suppressing it is not possible on a machine the stick has never been plugged
-    into -- and a stick that only starts where it was provisioned is not a
-    portable stick.
+    Two design notes worth keeping, because both were arrived at the hard way.
 
-    So the guest gets its overlay, its package repository and its UI binary the
-    way Alpine netboot is actually designed to get them: over HTTP from
-    ``10.0.2.2``, the host as seen through QEMU's user-mode NAT. That address is
-    the host, never the internet, so an air-gapped machine serves it fine. No
-    block device is attached at all -- nothing needs privileges, and the guest is
-    purely amnesic because it has no writable medium to persist to.
+    **No elevation.** An earlier launcher self-elevated to hand QEMU
+    ``\\.\PhysicalDriveN``, since QEMU's vvfat cannot present a FAT32 volume with
+    a populated root directory. A UAC dialog is a second action by the operator,
+    which "one click, no additional input" excludes, and it cannot be suppressed
+    on a machine the stick has never been plugged into. The guest image is a plain
+    file, so it needs no privileges at all.
 
-    The trade-off is explicit and belongs in the reader's head: the portal
-    process runs on the *host*. The guest reaches it through exactly one TCP port
-    on the NAT gateway (``restrict=on`` blocks every other destination, including
-    the internet) and has no other route to the host. Operator actions are fully
-    confined by cage; the server itself is not VM-isolated.
+    **The archive still has to reach the guest.** It is attached as a second
+    read-only drive in vvfat's FAT32 mode. The root-directory entry limit that
+    broke the earlier attempt is a FAT16 limit; ``fat:32:`` does not have it, and
+    read-only avoids the write path where vvfat is genuinely unreliable. Every
+    file on the stick is already chunked below 4 GiB for FAT32 compatibility, so
+    nothing exceeds what the driver can address.
     """
-    # virtio-vga is not decoration. cage is a DRM compositor: with -nodefaults
-    # and no GPU device the guest has no framebuffer, cage exits immediately, and
-    # the sandbox shows nothing however correct the overlay is.
     cmdline = (
+        "root=/dev/vda rootfstype=ext4 rw "
         "console=tty0 "
-        "modules=loop,squashfs,sd-mod,virtio_blk,virtio_pci,virtio_net "
-        "ip=dhcp "
-        f"apkovl=http://10.0.2.2:{port}/sandbox/apkovl.tar.gz "
-        f"alpine_repo=http://10.0.2.2:{port}/sandbox/apks "
-        f"kbb_mode=qemu kbb_portal=http://10.0.2.2:{port}"
+        f"kbb_mode=qemu kbb_port={port}"
     )
-
 
     win_lines = [
         "@echo off",
         "SETLOCAL EnableDelayedExpansion",
-        ":: KBB Tactical QEMU Sandbox -- one click, no prompts.",
-        ":: No elevation: the guest has no block device, so no raw handle is",
-        ":: needed. See _write_sandbox_launchers() for the reasoning.",
+        ":: KBB Tactical Sandbox -- one click, no prompts, nothing off the stick.",
+        ":: No elevation: the guest boots a plain image file, not a raw device.",
         'SET "USB=%~dp0"',
         'SET "QEMU=%USB%qemu\\win\\qemu-system-x86_64.exe"',
         'SET "FW=%USB%qemu\\win\\share"',
         'IF NOT EXIST "%QEMU%" (',
         "    echo [!] QEMU missing. Run: kb-builder portable %USB% --with-qemu",
-        "    timeout /t 10 >nul",
-        "    exit /b 1",
-        ")",
-        ":: Bring the portal up first: the guest fetches its overlay from it.",
-        'start "" /B "%USB%.kb_env\\python\\pythonw.exe" -m knowledge_base_builder.cli '
-        f'portal "%USB%" --port {port} --no-browser --sandbox-assets',
-        ":: Wait on readiness rather than sleeping a guessed interval.",
-        'powershell -NoProfile -Command "$sw=[Diagnostics.Stopwatch]::StartNew();'
-        "while($sw.Elapsed.TotalSeconds -lt 90){try{"
-        f"(New-Object Net.Sockets.TcpClient('127.0.0.1',{port})).Close();exit 0"
-        '}catch{Start-Sleep -Milliseconds 400}};exit 1"',
-        "IF ERRORLEVEL 1 (",
-        "    echo [!] Portal did not become ready in 90s.",
         "    timeout /t 15 >nul",
         "    exit /b 1",
         ")",
+        'IF NOT EXIST "%USB%kbb_guest.img" (',
+        "    echo [!] Guest image missing. Run: kb-builder portable %USB% --with-guest-image",
+        "    timeout /t 15 >nul",
+        "    exit /b 1",
+        ")",
+        ":: -full-screen covers the host desktop for as long as the sandbox runs.",
+        ":: virtio-vga gives the guest a DRM node (cage is a DRM compositor and",
+        ":: exits instantly without one); the input devices are equally required --",
+        ":: wlroots aborts with \"no input devices\" and takes cage down with it.",
         '"%QEMU%" -L "%FW%" -nodefaults -M q35 -m 3072 -smp 2 ^',
-        '    -kernel "%USB%boot\\vmlinuz-lts" -initrd "%USB%boot\\initramfs-lts" ^',
+        '    -kernel "%USB%vmlinuz-kbb" -initrd "%USB%initramfs-kbb" ^',
         f'    -append "{cmdline}" ^',
+        '    -drive file="%USB%kbb_guest.img",format=raw,if=virtio ^',
+        ":: The archive, read-only. fat:32: has no FAT16 root-entry limit, and the",
+        ":: read-only path avoids where vvfat is actually unreliable.",
+        '    -drive file=fat:32:ro:"%USB:~0,-1%",format=raw,if=virtio ^',
         "    -device virtio-vga ^",
-        "    -device virtio-tablet-pci -device virtio-keyboard-pci ^",
-        # restrict=on is load-bearing: QEMU drops every packet not destined
-        # for the one forwarded port, so the guest cannot reach the host LAN
-        # or the internet even where the host has both.
-        f"    -netdev user,id=net0,restrict=on,guestfwd=tcp:10.0.2.2:{port}-cmd:nc 127.0.0.1 {port} ^",
-        '    -device virtio-net-pci,netdev=net0,romfile="" ^',
+        "    -device virtio-keyboard-pci -device virtio-tablet-pci ^",
         "    -full-screen -display sdl,grab-mod=rctrl",
     ]
     bat = root / "start_sandbox.bat"
@@ -1760,8 +1746,8 @@ def _write_sandbox_launchers(root: Path, port: int = 8080) -> None:
 
     posix_lines = [
         "#!/bin/sh",
-        "# KBB Tactical QEMU Sandbox -- one click, no prompts (Linux/macOS).",
-        "# No sudo: the guest has no block device, so no raw handle is needed.",
+        "# KBB Tactical Sandbox -- one click, nothing off the stick (Linux/macOS).",
+        "# No sudo: the guest boots a plain image file, not a raw device.",
         "set -eu",
         'USB="$(cd "$(dirname "$0")" && pwd)"',
         'case "$(uname -s)" in',
@@ -1771,23 +1757,14 @@ def _write_sandbox_launchers(root: Path, port: int = 8080) -> None:
         "esac",
         'QEMU="$USB/qemu/$PLAT/qemu-system-x86_64"',
         '[ -x "$QEMU" ] || { echo "[!] QEMU missing: $QEMU"; exit 1; }',
-        'PY="$USB/.kb_env/python-linux/bin/python3"',
-        '[ -x "$PY" ] || PY="$(command -v python3 || true)"',
-        '[ -n "$PY" ] || { echo "[!] No Python for the portal"; exit 1; }',
-        f'"$PY" -m knowledge_base_builder.cli portal "$USB" --port {port} '
-        "--no-browser --sandbox-assets &",
-        "i=0",
-        f"while ! nc -z 127.0.0.1 {port} 2>/dev/null; do",
-        '    i=$((i+1)); [ "$i" -gt 225 ] && { echo "[!] portal did not start"; exit 1; }',
-        "    sleep 0.4",
-        "done",
+        '[ -f "$USB/kbb_guest.img" ] || { echo "[!] Guest image missing"; exit 1; }',
         'exec "$QEMU" -L "$USB/qemu/$PLAT/share" -nodefaults -M q35 -m 3072 -smp 2 \\',
-        '    -kernel "$USB/boot/vmlinuz-lts" -initrd "$USB/boot/initramfs-lts" \\',
+        '    -kernel "$USB/vmlinuz-kbb" -initrd "$USB/initramfs-kbb" \\',
         f'    -append "{cmdline}" \\',
+        '    -drive file="$USB/kbb_guest.img",format=raw,if=virtio \\',
+        '    -drive file=fat:32:ro:"$USB",format=raw,if=virtio \\',
         "    -device virtio-vga \\",
-        "    -device virtio-tablet-pci -device virtio-keyboard-pci \\",
-        f"    -netdev user,id=net0,restrict=on,guestfwd=tcp:10.0.2.2:{port}-cmd:nc 127.0.0.1 {port} \\",
-        '    -device virtio-net-pci,netdev=net0,romfile="" \\',
+        "    -device virtio-keyboard-pci -device virtio-tablet-pci \\",
         "    -full-screen -display sdl,grab-mod=rctrl",
     ]
     sh = root / "start_sandbox.sh"
@@ -1795,7 +1772,7 @@ def _write_sandbox_launchers(root: Path, port: int = 8080) -> None:
     sh.chmod(0o755)
 
     console.print(
-        "[bold green]QEMU sandbox launchers generated (no elevation required).[/bold green]"
+        "[bold green]Sandbox launchers generated (self-contained, no elevation).[/bold green]"
     )
 
 
@@ -1809,12 +1786,15 @@ def _write_sandbox_launchers(root: Path, port: int = 8080) -> None:
 # ("no input devices") describes the udev view, not the kernel's.
 #
 # `mdev` must NOT be here. Alpine ships either mdev or udev, never both: two
-# device managers race over /dev, and the one that loses leaves libinput reading a
-# database nobody populated. `setup-devd udev` removes mdev for this reason.
+# device managers race over /dev, and the one that loses leaves libinput reading
+# a database nobody populated. `setup-devd udev` removes mdev for this reason.
+#
+# `networking` is what brings `lo` up. Its absence is not a networking problem --
+# it means the guest cannot reach its own portal, and the symptom is a bind
+# failing with "[Errno 99] address not available", which reads like a port
+# conflict.
 GUEST_RUNLEVELS = {
     "sysinit": ("devfs", "dmesg", "udev", "udev-trigger", "udev-settle", "hwdrivers"),
-    # `networking` is what brings `lo` up. Its absence is not a networking
-    # problem -- it means the guest cannot reach its own portal.
     "boot": ("modules", "sysctl", "hostname", "bootmisc", "syslog", "networking"),
     "default": ("dbus", "seatd", "local", "kbb-kiosk"),
 }
@@ -1971,6 +1951,15 @@ def _guest_init_files() -> Dict[str, str]:
         '            # node or an unresolved library looks identical to success until\n'
         '            # something waits and checks.\n'
         '            sleep 12\n'
+        '            # Prove the portal SERVES rather than merely listens. A\n'
+        '            # uvicorn that accepts connections and 500s on every request\n'
+        '            # is indistinguishable from a healthy one at the socket level.\n'
+        '            if wget -q -O /dev/null "http://127.0.0.1:$KBB_PORT/" 2>/dev/null; then\n'
+        '                kbb_log "KBB-PORTAL-OK served /"\n'
+        '            else\n'
+        '                kbb_log "KBB-PORTAL-FAIL could not fetch /"\n'
+        '            fi\n'
+        '\n'
         '            if kill -0 "$cage_pid" 2>/dev/null; then\n'
         '                kbb_log "KBB-UI-ALIVE pid=$cage_pid"\n'
         '            else\n'

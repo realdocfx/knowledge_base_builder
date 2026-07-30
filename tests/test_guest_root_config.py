@@ -232,3 +232,17 @@ def test_loopback_is_configured(rootfs):
     assert "networking" in cli.GUEST_RUNLEVELS["boot"], (
         "etc/network/interfaces exists but no service brings it up"
     )
+
+
+def test_the_boot_proves_the_portal_serves(rootfs):
+    """A listening socket is not a working application.
+
+    uvicorn accepting connections and returning 500 to everything looks identical
+    from the outside to a healthy portal, so the guest fetches a page and reports
+    the result rather than inferring health from the port being open.
+    """
+    svc = _read(rootfs, "etc/init.d/kbb-kiosk")
+    assert "KBB-PORTAL-OK" in svc, "nothing verifies the portal actually serves"
+    assert "wget" in svc or "curl" in svc, (
+        "the portal marker is emitted without fetching anything"
+    )
