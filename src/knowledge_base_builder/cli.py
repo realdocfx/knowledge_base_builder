@@ -115,6 +115,13 @@ GUEST_WORLD = (
     "eudev",
     "dbus",
     # The head.
+    # device-mapper concatenates the archive slices back into one device.
+    # QEMU's vvfat cannot carry a file above 2 GB, but a raw virtio-blk attach has
+    # no size limit at all -- measured: a 4,089,446,400-byte slice appears in the
+    # guest at full size. So slices are attached as block devices and joined with
+    # dm-linear, which is a mapping rather than a copy: no space, no time, no
+    # second copy of a 51 GB archive.
+    "device-mapper",
     "cage",           # single-surface Wayland kiosk: no taskbar, no switcher
     "seatd",          # cage needs a seat manager to claim the DRM device
     "webkit2gtk",     # Tauri's renderer on Linux

@@ -58,7 +58,7 @@ DEFAULT_CHECKS = [
 ]
 
 
-def boot(stick: Path, port: int) -> subprocess.Popen:
+def boot(stick: Path, port: int, extra_drives=()) -> subprocess.Popen:
     qemu = stick / "qemu" / "win" / "qemu-system-x86_64.exe"
     if not qemu.is_file():
         qemu = Path("qemu-system-x86_64")
@@ -73,6 +73,15 @@ def boot(stick: Path, port: int) -> subprocess.Popen:
         "-display", "none",
         "-serial", f"tcp:127.0.0.1:{port},server,nowait",
     ]
+    # virtio-scsi rather than one virtio-blk per file: a single controller
+    # addresses many disks, where virtio-blk would exhaust PCI slots long before
+    # a multi-slice archive is fully attached.
+    # virtio-blk, not virtio-scsi: the guest initramfs is built with the `virtio`
+    # feature, which carries virtio_blk but not virtio_scsi or sd_mod, so SCSI
+    # disks are attached by QEMU and simply never appear in the guest.
+    for n, path in enumerate(extra_drives):
+        args += ["-drive",
+                 f"file={path},format=raw,if=virtio,readonly=on,index={n + 1}"]
     env = dict(os.environ, MSYS2_ARG_CONV_EXCL="*")
     return subprocess.Popen(args, env=env,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -111,6 +120,8 @@ def main() -> int:
     ap.add_argument("--cmd", action="append", help="command to run (repeatable)")
     ap.add_argument("--port", type=int, default=45454)
     ap.add_argument("--boot-wait", type=float, default=45.0)
+    ap.add_argument("--extra-drive", action="append", default=[],
+                    help="host file to attach as a raw read-only disk")
     args = ap.parse_args()
 
     stick = Path(args.stick)
@@ -118,7 +129,7 @@ def main() -> int:
         if not (stick / needed).is_file():
             raise SystemExit(f"{stick / needed} not found")
 
-    proc = boot(stick, args.port)
+    proc = boot(stick, args.port, args.extra_drive)
     try:
         sock = connect(args.port)
         transcript = [drain(sock, args.boot_wait)]
