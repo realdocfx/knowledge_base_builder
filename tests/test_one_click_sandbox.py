@@ -212,3 +212,23 @@ def test_the_archive_is_attached_to_the_guest(launchers):
             f"{name} attaches only the guest image; the archive never reaches the "
             "portal, so the UI comes up empty"
         )
+
+
+def test_batch_continuations_are_not_broken_by_comments(launchers):
+    """A `::` line between `^`-continued lines breaks the command in cmd.exe.
+
+    The caret continues the line, so the comment is consumed as an argument and
+    everything after it becomes separate, invalid commands. The script still
+    "looks right" when read, which is why this needs a guard rather than a
+    careful author -- it was caught only by reading the generated file.
+    """
+    body = _primary(launchers)
+    lines = body.splitlines()
+    for i, line in enumerate(lines[:-1]):
+        if line.rstrip().endswith("^"):
+            nxt = lines[i + 1].lstrip()
+            assert not nxt.startswith("::"), (
+                f"line {i + 2} is a comment inside a caret continuation:\n"
+                f"  {line}\n  {lines[i + 1]}\n"
+                "cmd.exe will consume it as an argument and break the command"
+            )
