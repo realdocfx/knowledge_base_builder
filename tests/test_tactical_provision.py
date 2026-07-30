@@ -293,3 +293,49 @@ def test_sandbox_launchers_idempotent(tmp_path):
 
     assert bat1 == bat2
     assert sh1 == sh2
+
+
+# --------------------------------------------------------------------------
+# Guest image installation
+# --------------------------------------------------------------------------
+def test_install_guest_image_rejects_an_incomplete_source(tmp_path):
+    """A partial source must fail loudly rather than half-provision the stick.
+
+    Copying two of the three files leaves a stick that boots a kernel against a
+    filesystem it does not match -- which fails deep inside the guest, long after
+    the point where the cause is visible.
+    """
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "kbb_guest.img").write_bytes(b"image")
+    root = tmp_path / "stick"
+    root.mkdir()
+
+    with pytest.raises(FileNotFoundError) as exc:
+        cli._install_guest_image(root, str(src))
+    assert "vmlinuz-kbb" in str(exc.value)
+
+
+def test_install_guest_image_copies_all_three_files(tmp_path):
+    src = tmp_path / "src"
+    src.mkdir()
+    for name in cli.GUEST_IMAGE_FILES:
+        (src / name).write_bytes(name.encode())
+    root = tmp_path / "stick"
+    root.mkdir()
+
+    cli._install_guest_image(root, str(src))
+
+    for name in cli.GUEST_IMAGE_FILES:
+        assert (root / name).is_file(), f"{name} not installed"
+        assert (root / name).read_bytes() == name.encode()
+    # No .part left behind: an interrupted copy must not masquerade as an image.
+    assert not list(root.glob("*.part")), "temporary copy files were left on the stick"
+
+
+def test_install_guest_image_is_a_noop_without_a_source(tmp_path):
+    """Provisioning without an image must not fail the whole run."""
+    root = tmp_path / "stick"
+    root.mkdir()
+    cli._install_guest_image(root, None)
+    assert not list(root.iterdir())

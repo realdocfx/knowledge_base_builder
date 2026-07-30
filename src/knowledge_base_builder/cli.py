@@ -1676,6 +1676,50 @@ def _provision_qemu_runtime(root: Path, platforms: Optional[List[str]] = None,
     return qemu_root
 
 
+GUEST_IMAGE_FILES = ("kbb_guest.img", "vmlinuz-kbb", "initramfs-kbb")
+
+
+def _install_guest_image(root: Path, source: Optional[str] = None) -> None:
+    """Place the prebuilt guest image at the drive root.
+
+    The image is a finished Alpine filesystem with cage, WebKitGTK, Python, KBB
+    and the Tauri UI already installed. It cannot be built here: assembling it
+    needs `apk`, and linking the UI needs a musl toolchain, neither of which
+    exists on a Windows workstation. It is built and boot-tested by
+    .github/workflows/sandbox.yml and consumed as an artefact, which is also why
+    the stick needs no network at run time -- everything was resolved and
+    verified before it ever reached the medium.
+
+    ``source`` is a directory holding the three files (a downloaded artefact).
+    """
+    if source is None:
+        console.print(
+            "[yellow]No guest image source given.[/yellow] Download the "
+            "'kbb-guest-image' artefact from the sandbox workflow and pass its "
+            "directory with --guest-image-from."
+        )
+        return
+
+    src = Path(source)
+    missing = [f for f in GUEST_IMAGE_FILES if not (src / f).is_file()]
+    if missing:
+        raise FileNotFoundError(
+            f"guest image source {src} is missing {missing}. Expected the three "
+            f"files produced by the sandbox workflow: {list(GUEST_IMAGE_FILES)}"
+        )
+
+    for name in GUEST_IMAGE_FILES:
+        target = root / name
+        # Copy via a .part file and rename, so an interrupted copy never leaves a
+        # truncated image that QEMU would boot into something incoherent.
+        part = root / f"{name}.part"
+        console.print(f"[cyan]Installing {name}...[/cyan]")
+        shutil.copy2(src / name, part)
+        part.replace(target)
+
+    console.print("[bold green]Guest image installed.[/bold green]")
+
+
 def _write_sandbox_launchers(root: Path, port: int = 8080) -> None:
     r"""Generate the one-click Mode C launchers.
 
@@ -2236,6 +2280,12 @@ def portable(
         "--with-qemu",
         help="Provision embedded QEMU sandbox (Mode C): portable QEMU binaries for win/lin/mac + sandbox launchers",
     ),
+    guest_image_from: Optional[str] = typer.Option(
+        None,
+        "--guest-image-from",
+        help="Directory holding the prebuilt guest image (kbb_guest.img, "
+             "vmlinuz-kbb, initramfs-kbb) from the sandbox workflow artefact",
+    ),
 ):
     """Provision a self-contained, zero-install runtime on a portable drive.
 
@@ -2324,6 +2374,7 @@ def portable(
 
         if with_qemu:
             _provision_qemu_runtime(root, None, bundle_path, allow_insecure_network)
+            _install_guest_image(root, guest_image_from)
             _write_sandbox_launchers(root)
 
     except Exception as e:
