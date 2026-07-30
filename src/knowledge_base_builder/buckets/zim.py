@@ -28,7 +28,24 @@ class ZimBucket(BaseBucket):
     ZIM_MAGIC_NUMBER = 72173914
     STATE_DIR = ".kb_state"
     CHUNK_SIZE = 8192
-    FAT32_CHUNK_LIMIT = 3900 * 1024 * 1024
+    # Slice size is set by the strictest consumer, not by the filesystem alone.
+    #
+    # 3900 MiB was sized against FAT32's own 4 GiB per-file limit. But the slices
+    # must also pass through QEMU's vvfat driver to reach the sandbox, and vvfat
+    # rejects any file over 0x7fffffff and fails the WHOLE drive on finding one:
+    #
+    #     File D:/wikipedia_fr_all_maxi_2026-05.zimaa is larger than 2GB
+    #     Could not read directory D:
+    #
+    # A 3900 MiB slice is therefore valid on the medium and invisible to the
+    # guest. 1900 MiB clears both, with headroom so a slice landing on the
+    # boundary cannot take the drive down.
+    #
+    # This costs nothing functionally: .zimaa/.zimab is libzim's own native split
+    # format and it follows the sequence itself, so more slices is bookkeeping
+    # rather than behaviour. It is also why the guest needs no device-mapper
+    # reassembly -- libzim already does that job.
+    FAT32_CHUNK_LIMIT = 1900 * 1024 * 1024
     # How often resume state is checkpointed during a transfer. Each checkpoint is
     # a read, parse, re-serialise, fsync and atomic rename, so cadence is a direct
     # trade between resume granularity and write amplification on flash media.

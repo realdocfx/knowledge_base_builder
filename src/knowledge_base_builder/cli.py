@@ -656,6 +656,69 @@ def serve(
 
 
 @app.command()
+def resplit(
+    path: str = typer.Argument(..., help="Drive or directory holding the archives"),
+    archive: Optional[str] = typer.Option(
+        None, "--archive", help="Base name, e.g. wikipedia_fr_all_maxi_2026-05.zim"
+    ),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Report, change nothing"),
+):
+    """Re-cut split ZIM archives so the QEMU sandbox can read them.
+
+    Slices cut before QEMU's vvfat ceiling was known are 3900 MiB. Those are
+    valid on FAT32 and fatal to the guest: vvfat rejects any file above 2 GiB and
+    fails the whole drive, so the sandbox aborts before booting rather than
+    skipping the archive.
+
+    The rewrite is byte-identical -- libzim's split format is a plain byte stream
+    cut at arbitrary offsets -- and the originals are removed only after every
+    replacement slice is written and flushed.
+    """
+    from .resplit import DEFAULT_MAX_BYTES, existing_slices, resplit_archive
+
+    root = Path(path)
+    if not root.is_dir():
+        console.print(f"[bold red]{root} is not a directory[/bold red]")
+        raise typer.Exit(1)
+
+    if archive:
+        stems = [archive]
+    else:
+        stems = sorted({p.name[:-2] for p in root.glob("*.zim??")})
+    if not stems:
+        console.print("[yellow]No split archives found.[/yellow]")
+        return
+
+    for stem in stems:
+        slices = existing_slices(root, stem)
+        oversized = [p for p in slices if p.stat().st_size > DEFAULT_MAX_BYTES]
+        total = sum(p.stat().st_size for p in slices)
+        if not oversized:
+            console.print(f"[green]{stem}: {len(slices)} slices, all within limit[/green]")
+            continue
+        console.print(
+            f"[cyan]{stem}[/cyan]: {len(oversized)}/{len(slices)} slices exceed "
+            f"{DEFAULT_MAX_BYTES // (1024 * 1024)} MiB "
+            f"({total / (1024 ** 3):.1f} GiB total)"
+        )
+        if dry_run:
+            continue
+        # Space check: the replacement set is written before the originals are
+        # removed, so the drive needs room for both at once.
+        free = shutil.disk_usage(root).free
+        if free < total:
+            console.print(
+                f"[bold red]Need {total / (1024 ** 3):.1f} GiB free to rewrite "
+                f"{stem} safely; {free / (1024 ** 3):.1f} GiB available.[/bold red] "
+                "The originals are kept until the rewrite completes, so both sets "
+                "must fit."
+            )
+            raise typer.Exit(1)
+        written = resplit_archive(root, stem)
+        console.print(f"[bold green]{stem}: rewritten as {written} slices.[/bold green]")
+
+
+@app.command()
 def portal(
     path: str = typer.Argument(..., help="Path to the bucket/drive to expose"),
     host: str = typer.Option("127.0.0.1", "--host", "-h", help="Bind address"),
