@@ -1738,12 +1738,19 @@ def _write_sandbox_launchers(root: Path, port: int = 8080) -> None:
     on a machine the stick has never been plugged into. The guest image is a plain
     file, so it needs no privileges at all.
 
-    **The archive still has to reach the guest.** It is attached as a second
-    read-only drive in vvfat's FAT32 mode. The root-directory entry limit that
-    broke the earlier attempt is a FAT16 limit; ``fat:32:`` does not have it, and
-    read-only avoids the write path where vvfat is genuinely unreliable. Every
-    file on the stick is already chunked below 4 GiB for FAT32 compatibility, so
-    nothing exceeds what the driver can address.
+    **The archive does not reach the guest yet, and that is a known gap.**
+    Attaching it as a second read-only vvfat drive was tried and does not work:
+    QEMU aborts with "Too many entries in root directory" before booting anything,
+    on a stick with a few hundred top-level entries. ``fat:32:`` does *not* lift
+    that limit -- QEMU's own warning is that its FAT32 vvfat support is untested.
+    A launcher carrying that drive does not merely lack content, it fails to
+    start, so the drive is not emitted.
+
+    The sandbox therefore comes up with the UI and portal running and an empty
+    library. Closing this needs a data path that is neither vvfat nor raw-device
+    passthrough (which would reintroduce the UAC prompt) -- most likely a second
+    image built at provisioning time, or restructuring the stick so the exposed
+    directory has few root entries.
     """
     cmdline = (
         "root=/dev/vda rootfstype=ext4 rw "
@@ -1773,8 +1780,12 @@ def _write_sandbox_launchers(root: Path, port: int = 8080) -> None:
         ":: root is mounted rw against the real image: state survives reboots and",
         ":: a compromised guest can permanently alter what the stick boots next.",
         ":: With it, every write lands in a host temp overlay, discarded on exit.",
-        ":: The second drive is the archive, read-only. fat:32: has no FAT16",
-        ":: root-entry limit, and read-only avoids where vvfat is unreliable.",
+        ":: NOTE: the archive is not attached. QEMU's vvfat driver aborts with",
+        ":: \"Too many entries in root directory\" on a populated stick, and",
+        ":: fat:32: does NOT lift that limit -- QEMU itself warns FAT32 vvfat is",
+        ":: untested. Leaving the drive in made QEMU exit before booting, so the",
+        ":: sandbox starts without archive content until a workable data path",
+        ":: exists. The UI and portal come up; the library will be empty.",
         ":: -full-screen covers the host desktop for as long as the sandbox runs.",
         ":: virtio-vga gives the guest a DRM node (cage is a DRM compositor and",
         ":: exits instantly without one); the input devices are equally required --",
@@ -1783,7 +1794,6 @@ def _write_sandbox_launchers(root: Path, port: int = 8080) -> None:
         '    -kernel "%USB%vmlinuz-kbb" -initrd "%USB%initramfs-kbb" ^',
         f'    -append "{cmdline}" ^',
         '    -drive file="%USB%kbb_guest.img",format=raw,if=virtio,snapshot=on ^',
-        '    -drive file=fat:32:ro:"%USB:~0,-1%",format=raw,if=virtio ^',
         "    -device virtio-vga ^",
         "    -device virtio-keyboard-pci -device virtio-tablet-pci ^",
         "    -full-screen -display sdl,grab-mod=rctrl",
@@ -1810,7 +1820,6 @@ def _write_sandbox_launchers(root: Path, port: int = 8080) -> None:
         '    -kernel "$USB/vmlinuz-kbb" -initrd "$USB/initramfs-kbb" \\',
         f'    -append "{cmdline}" \\',
         '    -drive file="$USB/kbb_guest.img",format=raw,if=virtio,snapshot=on \\',
-        '    -drive file=fat:32:ro:"$USB",format=raw,if=virtio \\',
         "    -device virtio-vga \\",
         "    -device virtio-keyboard-pci -device virtio-tablet-pci \\",
         "    -full-screen -display sdl,grab-mod=rctrl",

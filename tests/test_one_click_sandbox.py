@@ -205,12 +205,30 @@ def test_nothing_is_fetched_from_the_host_or_the_network(launchers):
         )
 
 
-def test_the_archive_is_attached_to_the_guest(launchers):
-    """A UI with no content is not usable. The stick's data must reach the guest."""
+def test_no_vvfat_drive_is_attached(launchers):
+    """vvfat aborts QEMU outright on a populated stick, so it must not be emitted.
+
+    Attaching the archive with ``fat:32:ro:`` was intended to give the guest its
+    content without requiring Administrator. It does not work: QEMU exits with
+    "Too many entries in root directory" before booting anything, and the
+    ``fat:32:`` prefix does NOT lift that limit -- QEMU's own warning says its
+    FAT32 vvfat support is untested. A launcher carrying that drive is not a
+    launcher with a missing feature, it is a launcher that fails to start.
+
+    So the sandbox currently boots without archive content. That is a real gap and
+    it is tracked as one; it is not papered over by emitting a drive that breaks
+    the one click this whole mode exists for.
+    """
     for name, body in launchers.items():
-        assert body.count("-drive") >= 2, (
-            f"{name} attaches only the guest image; the archive never reaches the "
-            "portal, so the UI comes up empty"
+        # Strip comments: the scripts explain in prose why vvfat is absent, and a
+        # substring guard that reads the explanation fails on the very comment
+        # documenting the fix.
+        code = "\n".join(
+            ln for ln in body.splitlines()
+            if not ln.lstrip().startswith(("#", "::", "REM ", "rem "))
+        )
+        assert "fat:" not in code, (
+            f"{name} attaches a vvfat drive; QEMU will exit before booting"
         )
 
 
