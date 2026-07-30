@@ -1852,7 +1852,17 @@ def _write_sandbox_launchers(root: Path, port: int = 8080) -> None:
 # conflict.
 GUEST_RUNLEVELS = {
     "sysinit": ("devfs", "dmesg", "udev", "udev-trigger", "udev-settle", "hwdrivers"),
-    "boot": ("modules", "sysctl", "hostname", "bootmisc", "syslog", "networking"),
+    # `root` remounts / read-write and must come first. The initramfs mounts the
+    # root read-only regardless of `rw` on the kernel cmdline, and nothing else
+    # undoes that: the portal then cannot write its state and dies before
+    # printing a single line, which looks exactly like a portal that never
+    # started. Confirmed from inside the guest --
+    # "/bin/sh: can't create /tmp/p.log: Read-only file system".
+    #
+    # This does not weaken the sandbox: the drive is attached snapshot=on, so
+    # every write goes to a host-side temporary overlay and is discarded on exit.
+    "boot": ("root", "modules", "sysctl", "hostname", "bootmisc", "syslog",
+             "networking"),
     "default": ("dbus", "seatd", "local", "kbb-kiosk"),
 }
 
@@ -1943,6 +1953,17 @@ def _guest_init_files() -> Dict[str, str]:
         '    KBB_PORT="${KBB_PORT:-8080}"\n'
         '    KBB_DATA="${KBB_DATA:-/media/kbb}"\n'
         '    KBB_UI="/usr/local/bin/launch_kbb"\n'
+        '\n'
+        '    # The initramfs mounts / read-only and the `root` service remounts it\n'
+        '    # rw during boot. Do not rely on that alone: if the remount did not\n'
+        '    # happen, the portal cannot write its state and exits without printing\n'
+        '    # anything, which is indistinguishable from never having started.\n'
+        '    if ! touch /tmp/.kbb-write-test 2>/dev/null; then\n'
+        '        kbb_log "root is read-only; mounting tmpfs on /tmp and /var"\n'
+        '        mount -t tmpfs -o size=256m tmpfs /tmp 2>/dev/null\n'
+        '        mount -t tmpfs -o size=256m tmpfs /var 2>/dev/null\n'
+        '    fi\n'
+        '    rm -f /tmp/.kbb-write-test\n'
         '\n'
         '    # The stick, when one is attached. The UI comes up regardless: it shows\n'
         '    # its own boot screen while it probes for the portal, so a missing or\n'

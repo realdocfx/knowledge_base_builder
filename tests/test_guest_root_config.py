@@ -246,3 +246,30 @@ def test_the_boot_proves_the_portal_serves(rootfs):
     assert "wget" in svc or "curl" in svc, (
         "the portal marker is emitted without fetching anything"
     )
+
+
+def test_the_root_is_made_writable():
+    """A read-only root kills the portal silently.
+
+    The initramfs mounts / read-only regardless of `rw` on the kernel cmdline.
+    Alpine's `root` service remounts it, and without that service the portal
+    cannot write its state and exits before printing anything -- which looks
+    identical to a portal that never started. Confirmed from inside the guest:
+    "can't create /tmp/p.log: Read-only file system".
+    """
+    boot = cli.GUEST_RUNLEVELS["boot"]
+    assert "root" in boot, (
+        "nothing remounts / read-write; the portal will die silently"
+    )
+    assert boot.index("root") == 0, (
+        f"`root` must run before anything that writes, got {boot}"
+    )
+
+
+def test_the_kiosk_survives_a_read_only_root(rootfs):
+    """The kiosk must not depend on the remount having succeeded."""
+    svc = _read(rootfs, "etc/init.d/kbb-kiosk")
+    assert "tmpfs" in svc, (
+        "if the remount did not happen the kiosk has nowhere to write and fails "
+        "with no diagnostic; it must fall back to tmpfs"
+    )

@@ -244,6 +244,11 @@ fn main() {
             .center()
             .initialization_script(&init)
             .disable_file_drop_handler() // Prevents drag-and-drop vector exploits
+            // No decorations. GTK draws client-side decorations by default, so
+            // under cage the operator got a title bar with a working close
+            // button -- a way out of a kiosk that is supposed to have none.
+            // On Windows the window is hosted normally and this is cosmetic.
+            .decorations(false)
             .build()?;
 
             // Probe the backend NATIVELY. A webview fetch to the portal is
