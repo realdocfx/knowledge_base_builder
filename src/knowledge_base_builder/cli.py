@@ -747,7 +747,9 @@ def portal(
     # in-guest mode agree by construction: moving the content must not quietly
     # leave one of them serving an empty bucket.
     _requested = Path(path).resolve()
-    _library = _requested / LIBRARY_DIR
+    _library = _requested / LIBRARY_DIR / ARCHIVE_SUBDIR
+    if not _library.is_dir():
+        _library = _requested / LIBRARY_DIR
     if _library.is_dir():
         console.print(f"[cyan]Serving library/ ({_library})[/cyan]")
         _requested = _library
@@ -1812,6 +1814,18 @@ SANDBOX_INFRA_NAMES = frozenset({
 
 LIBRARY_DIR = "library"
 
+# Content sits one level below the directory vvfat is pointed at.
+#
+# vvfat's entry cap applies to the ROOT of the exposed tree only -- measured: 300
+# entries inside a subdirectory pass, the same 300 at the root do not. So the
+# guest is given `library/` (one entry) and the archive lives in
+# `library/archive/`, where its several hundred entries cost nothing.
+#
+# The exposed root also cannot be the drive root, whatever its entry count: vvfat
+# rejects any file above 2 GiB anywhere beneath it, and kbb_guest.img is 3 GiB.
+# library/ excludes it by construction.
+ARCHIVE_SUBDIR = "archive"
+
 # QEMU's vvfat refuses any file larger than this, anywhere in the exposed tree,
 # and fails the whole drive when it finds one:
 #
@@ -1839,6 +1853,19 @@ VVFAT_MAX_FILE_BYTES = 2 * 1024 * 1024 * 1024
 # click this mode exists for.
 VVFAT_MAX_ROOT_ENTRIES = 100
 
+# ...and a third limit that ends the approach. vvfat synthesises a fixed-size
+# virtual volume, and there is no option to enlarge it:
+#
+#     Directory does not fit in FAT32 (capacity 516.06 MB)
+#
+# So even with a small exposed root and every slice under 2 GiB -- both of which
+# were achieved -- vvfat cannot present a 130 GB archive. It is not a tuning
+# problem. No vvfat drive is emitted, and the remaining routes are a block-device
+# attach per slice (raw virtio-blk has no size limit; whether libzim will read a
+# block device is untested, and stat() reports st_size 0 for one) or raw
+# passthrough, which reintroduces the UAC prompt.
+VVFAT_MAX_VOLUME_BYTES = 516 * 1024 * 1024
+
 
 def _reorganise_for_sandbox(root: Path, dry_run: bool = False) -> int:
     """Move content under ``library/`` so QEMU's vvfat can present the drive.
@@ -1863,7 +1890,7 @@ def _reorganise_for_sandbox(root: Path, dry_run: bool = False) -> int:
 
     Returns the number of entries moved.
     """
-    library = root / LIBRARY_DIR
+    library = root / LIBRARY_DIR / ARCHIVE_SUBDIR
     movable = [
         entry for entry in root.iterdir()
         if entry.name not in SANDBOX_INFRA_NAMES
@@ -1875,7 +1902,7 @@ def _reorganise_for_sandbox(root: Path, dry_run: bool = False) -> int:
         return 0
 
     console.print(
-        f"[cyan]Moving {len(movable)} entries under {LIBRARY_DIR}/[/cyan] "
+        f"[cyan]Moving {len(movable)} entries under {LIBRARY_DIR}/{ARCHIVE_SUBDIR}/[/cyan] "
         "(rename within the volume; no data is copied)"
     )
     if dry_run:
@@ -1883,7 +1910,7 @@ def _reorganise_for_sandbox(root: Path, dry_run: bool = False) -> int:
             console.print(f"  would move: {entry.name}")
         return len(movable)
 
-    library.mkdir(exist_ok=True)
+    library.mkdir(parents=True, exist_ok=True)
     moved = 0
     for entry in movable:
         try:

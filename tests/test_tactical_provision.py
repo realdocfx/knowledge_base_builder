@@ -353,9 +353,11 @@ def test_reorganise_moves_content_but_not_infrastructure(tmp_path):
     moved = cli._reorganise_for_sandbox(tmp_path)
     assert moved == 3, f"expected 3 content entries moved, got {moved}"
 
-    lib = tmp_path / cli.LIBRARY_DIR
+    lib = tmp_path / cli.LIBRARY_DIR / cli.ARCHIVE_SUBDIR
     for name in ("Some_Book", "wikipedia_en.zimaa", "Another Book"):
-        assert (lib / name).exists(), f"{name} was not moved into library/"
+        assert (lib / name).exists(), (
+            f"{name} was not moved into {cli.LIBRARY_DIR}/{cli.ARCHIVE_SUBDIR}/"
+        )
     for name in (".kb_env", "qemu", "boot", "kbb_guest.img", "start_sandbox.bat"):
         assert (tmp_path / name).exists(), f"{name} must stay at the root"
 
@@ -415,4 +417,21 @@ def test_portal_resolves_the_library_directory(tmp_path, monkeypatch):
     assert fake_app.state.bucket_root.endswith(cli.LIBRARY_DIR), (
         f"portal served {fake_app.state.bucket_root!r} rather than the library "
         "directory; the host mode would show an empty archive"
+    )
+
+
+def test_reorganise_nests_content_below_the_vvfat_root(tmp_path):
+    """vvfat caps entries in the exposed root only, so content goes one deeper."""
+    for i in range(300):
+        (tmp_path / f"Content_Directory_{i:03d}").mkdir()
+    cli._reorganise_for_sandbox(tmp_path)
+
+    exposed = tmp_path / cli.LIBRARY_DIR
+    assert exposed.is_dir()
+    assert len(list(exposed.iterdir())) < 20, (
+        f"{cli.LIBRARY_DIR}/ is what vvfat is pointed at; it has "
+        f"{len(list(exposed.iterdir()))} root entries and QEMU will refuse it"
+    )
+    assert len(list((exposed / cli.ARCHIVE_SUBDIR).iterdir())) == 300, (
+        "content did not land in the nested archive directory"
     )

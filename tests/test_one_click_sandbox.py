@@ -205,23 +205,22 @@ def test_nothing_is_fetched_from_the_host_or_the_network(launchers):
         )
 
 
-def test_no_vvfat_drive_until_it_can_actually_work(launchers):
-    """vvfat must not be emitted while it aborts QEMU.
+def test_no_vvfat_drive_is_emitted(launchers):
+    """vvfat cannot carry this archive, and a drive that aborts QEMU is worse
+    than an empty library -- it breaks the single click the mode exists for.
 
-    Two independent limits were measured against the real drive, and satisfying
-    one does not satisfy the other:
+    Three limits were measured against the real drive, in the order they were
+    hit. The first two were solved and the third is not solvable:
 
-    * a FAT16-style root-entry cap -- 283 entries at the drive root gave "Too
-      many entries in root directory", and moving them under library/ simply
-      moved the failure there;
-    * a hard 2 GB per-file ceiling, anywhere beneath the exposed directory --
-      "File kbb_guest.img is larger than 2GB" fails the whole drive.
+    * root-entry cap -- fixed by nesting content under ``library/archive/``
+      (300 entries inside a subdirectory pass; the same 300 at the root do not);
+    * 2 GiB per file -- fixed by re-cutting slices at 1900 MiB, which libzim
+      reassembles natively;
+    * **total volume capacity ~516 MB**, fixed by the driver with no option to
+      raise it: ``Directory does not fit in FAT32 (capacity 516.06 MB)``.
 
-    ZIM slices are cut at FAT32_CHUNK_LIMIT (3900 MiB) for FAT32's own 4 GiB
-    limit, so they clear the medium and not the driver. Until they are re-sliced
-    below VVFAT_MAX_FILE_BYTES, a vvfat drive makes QEMU exit before booting --
-    which is strictly worse than an empty library, because it breaks the one
-    click this mode exists for.
+    A 130 GB archive will never fit in a 516 MB synthesised volume, so this is
+    not a tuning problem and no configuration of vvfat resolves it.
     """
     for name, body in launchers.items():
         code = chr(10).join(
