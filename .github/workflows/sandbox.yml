@@ -29,7 +29,11 @@ on:
       # pyproject matters here: the guest image pip-installs KBB, so a broken
       # dependency set breaks the image even with cli.py untouched.
       - 'pyproject.toml'
-      - 'src/knowledge_base_builder/cli.py'
+      # The whole package, not just cli.py. The guest image pip-installs KBB, so
+      # a change anywhere in it can break the sandbox -- the state-directory fix
+      # touched buckets/, archive_index.py and web.py and triggered nothing,
+      # leaving the one job that would have caught a regression unrun.
+      - 'src/knowledge_base_builder/**'
       - 'launcher/**'
       - '.github/workflows/sandbox.yml'
       - 'tests/test_sandbox_head.py'
