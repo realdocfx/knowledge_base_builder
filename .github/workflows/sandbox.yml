@@ -367,9 +367,20 @@ jobs:
           # mkinitfs runs inside the guest root so the modules it embeds match the
           # kernel that will boot. Without the virtio feature the initramfs cannot
           # see /dev/vda and the kernel panics with no root.
+          # depmod first. `apk add --root` installs the kernel modules but never
+          # builds modules.dep, and without it modprobe fails for EVERY module --
+          # which surfaced as "overlay unavailable" and would equally have broken
+          # anything else loaded at runtime. mkinitfs reads that same dependency
+          # graph, so this has to come first.
+          docker run --rm -v "$PWD/rootfs:/rootfs" alpine:3.20 \
+            chroot /rootfs /sbin/depmod -a "$KVER"
           docker run --rm -v "$PWD/rootfs:/rootfs" alpine:3.20 \
             chroot /rootfs /sbin/mkinitfs -F "base virtio ext4 overlayfs kms dri" \
               -o "/boot/initramfs-kbb" "$KVER"
+          # Prove overlay resolves now, rather than discovering it does not from a
+          # warning three minutes into a boot.
+          docker run --rm -v "$PWD/rootfs:/rootfs" alpine:3.20 \
+            chroot /rootfs /sbin/modprobe --dry-run --show-depends overlay
           sudo ls -lh rootfs/boot/
 
       - name: Package the image
