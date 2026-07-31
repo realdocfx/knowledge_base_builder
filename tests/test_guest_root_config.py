@@ -345,3 +345,23 @@ def test_the_interpreter_is_chosen_by_capability_not_by_path(rootfs):
     assert "-c" in probe_region, (
         "nothing actually executes the candidate to find out whether it works"
     )
+
+
+def test_cage_uses_the_software_renderer(rootfs):
+    """A VM has no GPU; cage must render on the CPU without fighting Mesa.
+
+    The GL path fails with "Unable to create the wlroots renderer" because a
+    current Mesa refuses LIBGL_ALWAYS_SOFTWARE once EGL has opened the virtio-gpu
+    device. WLR_RENDERER=pixman is wlroots' pure-software renderer and never
+    touches EGL, so the fight does not happen.
+    """
+    svc = _read(rootfs, "etc/init.d/kbb-kiosk")
+    assert "WLR_RENDERER=pixman" in svc, (
+        "cage is left on the GL renderer, which cannot initialise in a GPU-less "
+        "VM -- it exits and the UI never paints"
+    )
+    # Check the export, not a mention: the comment explains why it is absent.
+    assert "export LIBGL_ALWAYS_SOFTWARE" not in svc, (
+        "LIBGL_ALWAYS_SOFTWARE is exported; current Mesa rejects it against the "
+        "virtio-gpu device and cage fails to create its renderer"
+    )
