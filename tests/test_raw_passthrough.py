@@ -331,12 +331,12 @@ def test_runtime_is_cached_before_the_volume_is_dismounted(launchers):
     """
     bat = launchers["start_sandbox.bat"]
     code = _code(bat)
-    assert "mountvol" in code, (
-        "the volume is never dismounted, so raw device reads block and the guest "
+    assert "Remove-PartitionAccessPath" in code, (
+        "the volume is never detached, so raw device reads block and the guest "
         "hangs before enumerating any disk"
     )
     cache = code.index("CACHE")
-    dismount = code.index("mountvol")
+    dismount = code.index("Remove-PartitionAccessPath")
     assert cache < dismount, (
         "the runtime is cached after the volume is dismounted, by which time the "
         "files it copies are unreachable"
@@ -347,13 +347,17 @@ def test_the_volume_is_restored_afterwards(launchers):
     """Taking D: away is acceptable for the session, not permanently."""
     bat = launchers["start_sandbox.bat"]
     code = _code(bat)
-    assert code.count("mountvol") >= 2, (
-        "the drive letter is removed and never restored; D: would stay missing "
-        "after the sandbox exits"
+    assert "Remove-PartitionAccessPath" in code, "the drive letter is never removed"
+    assert "Add-PartitionAccessPath" in code, (
+        "the drive letter is removed and never restored; the stick would stay "
+        "missing after the sandbox exits"
     )
-    assert "VOLID" in code or "/L" in code, (
-        "no volume identity is captured before dismounting, so nothing can put "
-        "the drive letter back"
+    # `mountvol /P` is specifically forbidden: it also marks the volume NOT
+    # MOUNTABLE, and that survives unplugging. A stick detached that way does not
+    # return when replugged -- which is exactly what happened in the field.
+    assert "/P" not in code, (
+        "mountvol /P marks the volume unmountable; the stick will not come back "
+        "on replug and the operator is left hunting volume GUIDs"
     )
 
 
@@ -365,14 +369,14 @@ def test_a_failed_dismount_aborts_rather_than_hanging(launchers):
     dismount converts a silent hang into a sentence the operator can act on.
     """
     code = _code(launchers["start_sandbox.bat"])
-    idx = code.index("mountvol %DRV% /P")
-    after = code[idx:idx + 600]
+    idx = code.index("Remove-PartitionAccessPath")
+    after = code[idx:idx + 900]
     assert "ERRORLEVEL" in after, (
         "the dismount result is never checked; a locked volume would hand the "
         "guest a device whose probe never returns"
     )
     assert "exit /b 1" in after, "a failed dismount does not abort"
-    assert "mountvol %DRV% %VOLID%" in after, (
-        "the drive letter is not restored on the abort path, leaving the volume "
+    assert "Add-PartitionAccessPath" in after, (
+        "the drive letter is not restored on the abort path, leaving the stick "
         "missing after a failure"
     )
