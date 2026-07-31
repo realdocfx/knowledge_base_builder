@@ -209,14 +209,17 @@ jobs:
   #
   # Mode C delivers each ZIM slice as a file-backed SCSI disk -- zero-copy, no
   # admin. The catch, proven in the guest: libzim sizes a file with fstat(), a
-  # block device reports st_size == 0, so libzim rejects it as "too small to
-  # contain a header" even though the bytes are right there. kbb-blkfuse bridges
-  # the gap by presenting each block device as a regular file of its true size.
+  # block device reports st_size==0, so libzim rejects it as "too small to
+  # contain a header" even though the bytes are readable. kbb_blkfuse presents
+  # each block device as a regular file of its true size (BLKGETSIZE64).
   #
-  # This job replicates the exact chain -- block device -> FUSE-sized file ->
-  # libzim mmap + split-archive sequence -- against a real generated ZIM. If
-  # libzim's mmap does not work through FUSE, the whole approach is dead and this
-  # fails here in two minutes rather than after a guest rebuild and a stick copy.
+  # This job reproduces the exact chain against a generated 6000-entry ZIM:
+  # loop block device (st_size==0) -> kbb_blkfuse (correct size) -> libzim mmap
+  # + split sequence -> real article read. Split into isolated steps so a failure
+  # names one layer: the split is proven byte-exact by md5 before FUSE is
+  # involved; a single non-split ZIM proves size+mmap alone; then the split case.
+  # If mmap-over-FUSE does not work, this fails in two minutes rather than after
+  # a guest rebuild and a stick copy.
   # ---------------------------------------------------------------------------
   fuse-zim:
     name: libzim reads a block device via FUSE
@@ -233,107 +236,65 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq build-essential pkg-config fuse3 libfuse3-dev
           pip install libzim
-          # allow_other so a reader in another context can see the files, matching
-          # how the guest runs kiwix and the FUSE mount under different services.
           echo user_allow_other | sudo tee -a /etc/fuse.conf
 
       - name: Compile kbb-blkfuse
         run: |
           set -eux
-          cc -O2 -Wall guest/kbb_blkfuse.c -o kbb-blkfuse \
-            $(pkg-config fuse3 --cflags --libs)
-          ./kbb-blkfuse 2>&1 | head -1 || true   # prints usage, exit 2
+          cc -O2 -Wall guest/kbb_blkfuse.c -o kbb-blkfuse $(pkg-config fuse3 --cflags --libs)
 
-      - name: Generate a real ZIM and split it byte-exactly
+      - name: Generate a ZIM and split it byte-exactly
         run: |
           set -eux
-          python3 - <<'PY'
-          from libzim.writer import Creator, Item, StringProvider, Hint
-
-          class Page(Item):
-              def __init__(self, path, title, content):
-                  super().__init__()
-                  self._p, self._t, self._c = path, title, content
-              def get_path(self): return self._p
-              def get_title(self): return self._t
-              def get_mimetype(self): return "text/html"
-              def get_contentprovider(self): return StringProvider(self._c)
-              def get_hints(self): return {Hint.FRONT_ARTICLE: True}
-
-          with Creator("test.zim").config_indexing(True, "eng") as c:
-              c.set_mainpath("index")
-              c.add_item(Page("index", "Home", "<html><body>home</body></html>"))
-              for i in range(6000):
-                  body = "<html><body>" + (f"page {i} " * 300) + "</body></html>"
-                  c.add_item(Page(f"page{i}", f"Page {i}", body))
-          print("generated test.zim")
-          PY
+          python3 guest/ci/make_test_zim.py test.zim
           ls -l test.zim
           ORIG=$(md5sum test.zim | cut -d' ' -f1)
-          # Split like the stick does: a 512-aligned cut, remainder in the tail.
           SZ=$(stat -c%s test.zim)
-          HALF=$(( (SZ/2/512)*512 ))
-          dd if=test.zim of=test.zimaa bs=4M iflag=count_bytes count=$HALF 2>/dev/null
-          dd if=test.zim of=test.zimab bs=4M iflag=skip_bytes skip=$HALF 2>/dev/null
-          # Prove the split is byte-exact BEFORE involving FUSE, so a later failure
-          # can only be FUSE, not the split.
+          HALF=$(( (SZ / 2 / 512) * 512 ))
+          dd if=test.zim of=test.zimaa bs=4M iflag=count_bytes count=$HALF status=none
+          dd if=test.zim of=test.zimab bs=4M iflag=skip_bytes skip=$HALF status=none
           REJOIN=$(cat test.zimaa test.zimab | md5sum | cut -d' ' -f1)
           echo "orig=$ORIG rejoin=$REJOIN"
           test "$ORIG" = "$REJOIN"
-          ls -l test.zim test.zimaa test.zimab
+          ls -l test.zimaa test.zimab
 
-      - name: Prove single-file FUSE read (isolates size+mmap from split)
+      - name: Single-file FUSE read (isolates size+mmap)
         run: |
           set -eux
           LW=$(sudo losetup --show -f -r test.zim)
           sudo chmod a+r "$LW"
-          test "$(stat -c%s $LW)" = "0"          # block device: st_size 0
-          printf 'test.zim %s
-' "$LW" > m1.txt
+          test "$(stat -c%s "$LW")" = "0"
+          printf 'test.zim %s\n' "$LW" > m1.txt
           mkdir -p mnt1
           sudo ./kbb-blkfuse mnt1 m1.txt -f -o allow_other,ro &
           for i in $(seq 1 20); do [ -e mnt1/test.zim ] && break; sleep 0.5; done
           stat -c '%n %s' mnt1/test.zim
           test "$(stat -c%s mnt1/test.zim)" -gt 0
-          python3 - <<'PY'
-          from libzim.reader import Archive
-          a = Archive("mnt1/test.zim")
-          assert a.entry_count > 3000, a.entry_count
-          data = bytes(a.get_entry_by_path("page5999").get_item().content)
-          assert b"page 5999" in data
-          print("SINGLE-FUSE-OK", a.entry_count)
-          PY
+          python3 guest/ci/read_zim.py mnt1/test.zim SINGLE-FUSE
           sudo umount mnt1 || true
           sudo losetup -d "$LW" || true
 
-      - name: Prove split FUSE read (the guest scenario)
+      - name: Split FUSE read (the guest scenario)
         run: |
           set -eux
           LA=$(sudo losetup --show -f -r test.zimaa)
           LB=$(sudo losetup --show -f -r test.zimab)
           sudo chmod a+r "$LA" "$LB"
           echo "$LA $LB" > loops.txt
-          printf 'test.zimaa %s
-test.zimab %s
-' "$LA" "$LB" > m2.txt
+          printf 'test.zimaa %s\n' "$LA" > m2.txt
+          printf 'test.zimab %s\n' "$LB" >> m2.txt
           mkdir -p mnt2
           sudo ./kbb-blkfuse mnt2 m2.txt -f -o allow_other,ro &
           for i in $(seq 1 20); do [ -e mnt2/test.zimaa ] && break; sleep 0.5; done
           stat -c '%n %s' mnt2/test.zimaa mnt2/test.zimab
-          python3 - <<'PY'
-          from libzim.reader import Archive
-          a = Archive("mnt2/test.zimaa")
-          assert a.entry_count > 3000, a.entry_count
-          data = bytes(a.get_entry_by_path("page5999").get_item().content)
-          assert b"page 5999" in data
-          print("SPLIT-FUSE-OK", a.entry_count)
-          PY
+          python3 guest/ci/read_zim.py mnt2/test.zimaa SPLIT-FUSE
           sudo umount mnt2 || true
 
       - name: Release loop devices
         if: always()
         run: |
           for d in $(cat loops.txt 2>/dev/null); do sudo losetup -d "$d" || true; done
+
 
 
   # ---------------------------------------------------------------------------
