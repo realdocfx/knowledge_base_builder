@@ -348,3 +348,38 @@ def test_the_launcher_never_alters_host_volume_state(launchers):
                 "not reconfigure host storage: a mistake there costs the operator "
                 "their drive, not just their sandbox."
             )
+
+
+def test_raw_device_uses_direct_unbuffered_io(launchers):
+    """A raw device must bypass the host cache manager and use a worker thread.
+
+    Symptom: QEMU's own window went "Not Responding" and the guest froze at the
+    same instruction every run -- immediately after the virtio keyboard, which is
+    when the guest first probes block devices. The hang is in QEMU's main loop on
+    the host, not in the guest, which is why stderr stayed empty: nothing was
+    refused, the read simply never returned.
+
+    Two settings address that directly and change nothing outside the process:
+
+    * ``cache=none`` opens the device with FILE_FLAG_NO_BUFFERING, so reads go
+      straight to the device instead of through the Windows cache manager, which
+      is the component that stalls on a handle to a volume the OS also has
+      mounted.
+    * ``aio=threads`` moves the I/O off the main loop, so a slow read degrades
+      into a slow boot rather than a frozen UI.
+
+    Neither touches the host's mount table -- the mistake this replaces.
+    """
+    for name, body in launchers.items():
+        raw = [ln for ln in _code(body).splitlines()
+               if "-drive" in ln and "kbb_guest.img" not in ln]
+        assert raw, f"{name} attaches no raw archive device"
+        for ln in raw:
+            assert "cache=none" in ln, (
+                f"{name} lets the host cache manager mediate raw device reads, "
+                f"which is where QEMU hung: {ln.strip()}"
+            )
+            assert "aio=threads" in ln, (
+                f"{name} does raw device I/O on the main loop, so a stalled read "
+                f"freezes QEMU itself rather than just slowing the boot: {ln.strip()}"
+            )
