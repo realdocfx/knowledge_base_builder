@@ -379,8 +379,13 @@ jobs:
               -o "/boot/initramfs-kbb" "$KVER"
           # Prove overlay resolves now, rather than discovering it does not from a
           # warning three minutes into a boot.
+          #
+          # -S is required: modprobe defaults to `uname -r`, which inside the
+          # container is the RUNNER's kernel. Without it the check reports
+          # "Module overlay not found in /lib/modules/6.17.0-azure" -- a true
+          # statement about the wrong machine.
           docker run --rm -v "$PWD/rootfs:/rootfs" alpine:3.20 \
-            chroot /rootfs /sbin/modprobe --dry-run --show-depends overlay
+            chroot /rootfs /sbin/modprobe -S "$KVER" --dry-run --show-depends overlay
           sudo ls -lh rootfs/boot/
 
       - name: Package the image
