@@ -21,9 +21,20 @@
  * real size, mmaps it, and follows the .zimaa/.zimab split sequence exactly as
  * it would for files on disk. Nothing is copied.
  *
- * The manifest is one "<name> <device>" per line, e.g.
- *     wikipedia_en_all_nopic_2026-06.zimaa /dev/sda
- *     wikipedia_en_all_nopic_2026-06.zimab /dev/sdb
+ * The manifest is one "<name> <device> <size>" per line, e.g.
+ *     wikipedia_en_all_nopic_2026-06.zimaa /dev/sda 1992294400
+ *     wikipedia_en_all_nopic_2026-06.zimab /dev/sdb 1737841231
+ *
+ * The size is load-bearing and must be the TRUE file size, not the device size.
+ * Block devices are 512-granular; ZIM slices are not. QEMU pads a file-backed
+ * disk up to the next 512-byte sector, so the device is a few bytes LARGER than
+ * the slice, with zero padding at the tail. libzim reads a ZIM's trailing MD5
+ * checksum at exactly (size - 16): if we reported the padded device size, that
+ * offset lands in the zero padding and libzim declares "Zim file(s) is of bad
+ * size or corrupted". So getattr reports the manifest size -- the real file size
+ * the launcher recorded from the stick -- and reads are clamped to it, hiding
+ * the padding entirely. Proven necessary in CI, where a single unaligned ZIM
+ * fails without it.
  *
  * Read-only by construction: no create/write/unlink/truncate is implemented, so
  * the archive cannot be altered from inside the sandbox.
@@ -55,8 +66,9 @@ struct kbb_entry {
 static struct kbb_entry g_entries[KBB_MAX_ENTRIES];
 static int g_count = 0;
 
-/* Resolve a block device's true size. This is the whole point: fstat() returns
- * 0 for a block device, so we must ask the driver via ioctl. */
+/* The block device's raw size via ioctl (fstat returns 0 for a block device).
+ * Used only to sanity-check that the device can actually supply the manifest
+ * size -- the size we REPORT comes from the manifest, not from here. */
 static off_t kbb_dev_size(const char *dev)
 {
     int fd = open(dev, O_RDONLY);
@@ -132,6 +144,15 @@ static int kbb_read(const char *path, char *buf, size_t size, off_t offset,
     struct kbb_entry *e = kbb_lookup(path);
     if (!e)
         return -ENOENT;
+    /* Clamp to the true file size so the device's trailing 512-byte padding is
+     * never visible. A read starting at or past the real end returns EOF; one
+     * that straddles the boundary is shortened to stop exactly at it. Without
+     * this, libzim reads the padding as if it were archive bytes and fails the
+     * checksum. */
+    if (offset >= e->size)
+        return 0;
+    if ((off_t)(offset + size) > e->size)
+        size = (size_t)(e->size - offset);
     int fd = open(e->dev, O_RDONLY);
     if (fd < 0)
         return -errno;
@@ -166,21 +187,33 @@ static int kbb_load_manifest(const char *manifest)
     char line[600];
     while (fgets(line, sizeof(line), f) && g_count < KBB_MAX_ENTRIES) {
         char name[256], dev[256];
-        if (sscanf(line, "%255s %255s", name, dev) != 2)
+        long long msize = 0;
+        int fields = sscanf(line, "%255s %255s %lld", name, dev, &msize);
+        if (fields < 2 || name[0] == '#')
             continue;
-        if (name[0] == '#')
+        off_t dev_size = kbb_dev_size(dev);
+        if (dev_size <= 0) {
+            fprintf(stderr, "kbb-blkfuse: skipping %s (%s: no device)\n", name, dev);
             continue;
-        off_t size = kbb_dev_size(dev);
-        if (size <= 0) {
-            fprintf(stderr, "kbb-blkfuse: skipping %s (%s: no size)\n", name, dev);
+        }
+        /* The manifest size is authoritative. Fall back to the device size only
+         * when the manifest omitted it (fields < 3), which is correct just for
+         * 512-aligned slices; the launcher always records the true size. */
+        off_t size = (fields >= 3 && msize > 0) ? (off_t)msize : dev_size;
+        if (size > dev_size) {
+            /* The device cannot supply this many bytes -- the slice was recorded
+             * larger than the disk backing it. Reading past the device would
+             * corrupt the archive silently, so refuse this entry loudly. */
+            fprintf(stderr, "kbb-blkfuse: skipping %s (size %lld > device %lld)\n",
+                    name, (long long)size, (long long)dev_size);
             continue;
         }
         struct kbb_entry *e = &g_entries[g_count++];
         snprintf(e->name, sizeof(e->name), "%s", name);
         snprintf(e->dev, sizeof(e->dev), "%s", dev);
         e->size = size;
-        fprintf(stderr, "kbb-blkfuse: %s -> %s (%lld bytes)\n",
-                name, dev, (long long)size);
+        fprintf(stderr, "kbb-blkfuse: %s -> %s (%lld bytes, device %lld)\n",
+                name, dev, (long long)size, (long long)dev_size);
     }
     fclose(f);
     return g_count;

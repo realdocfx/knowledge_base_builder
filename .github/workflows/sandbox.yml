@@ -261,15 +261,25 @@ jobs:
       - name: Single-file FUSE read (isolates size+mmap)
         run: |
           set -eux
-          LW=$(sudo losetup --show -f -r test.zim)
+          # Replicate QEMU exactly: a file-backed disk is padded UP to the next
+          # 512-byte sector. Record the TRUE size for the manifest; back the loop
+          # device with a padded copy so it is >= true size (losetup alone would
+          # truncate a non-aligned tail and lose the checksum -- the failure this
+          # step exists to prevent).
+          TRUE=$(stat -c%s test.zim)
+          cp test.zim single.dev
+          truncate -s $(( (TRUE + 511) / 512 * 512 )) single.dev
+          LW=$(sudo losetup --show -f -r single.dev)
           sudo chmod a+r "$LW"
-          test "$(stat -c%s "$LW")" = "0"
-          printf 'test.zim %s\n' "$LW" > m1.txt
+          echo "$LW" > loops.txt
+          test "$(stat -c%s "$LW")" = "0"        # block device: st_size 0
+          printf 'test.zim %s %s\n' "$LW" "$TRUE" > m1.txt
+          cat m1.txt
           mkdir -p mnt1
           sudo ./kbb-blkfuse mnt1 m1.txt -f -o allow_other,ro &
           for i in $(seq 1 20); do [ -e mnt1/test.zim ] && break; sleep 0.5; done
-          stat -c '%n %s' mnt1/test.zim
-          test "$(stat -c%s mnt1/test.zim)" -gt 0
+          echo "true=$TRUE  fuse-reported=$(stat -c%s mnt1/test.zim)"
+          test "$(stat -c%s mnt1/test.zim)" = "$TRUE"   # NOT the padded device size
           python3 guest/ci/read_zim.py mnt1/test.zim SINGLE-FUSE
           sudo umount mnt1 || true
           sudo losetup -d "$LW" || true
@@ -277,16 +287,23 @@ jobs:
       - name: Split FUSE read (the guest scenario)
         run: |
           set -eux
-          LA=$(sudo losetup --show -f -r test.zimaa)
-          LB=$(sudo losetup --show -f -r test.zimab)
+          SA=$(stat -c%s test.zimaa)
+          SB=$(stat -c%s test.zimab)
+          cp test.zimaa a.dev; cp test.zimab b.dev
+          truncate -s $(( (SA + 511) / 512 * 512 )) a.dev
+          truncate -s $(( (SB + 511) / 512 * 512 )) b.dev
+          LA=$(sudo losetup --show -f -r a.dev)
+          LB=$(sudo losetup --show -f -r b.dev)
           sudo chmod a+r "$LA" "$LB"
           echo "$LA $LB" > loops.txt
-          printf 'test.zimaa %s\n' "$LA" > m2.txt
-          printf 'test.zimab %s\n' "$LB" >> m2.txt
+          printf 'test.zimaa %s %s\n' "$LA" "$SA" > m2.txt
+          printf 'test.zimab %s %s\n' "$LB" "$SB" >> m2.txt
+          cat m2.txt
           mkdir -p mnt2
           sudo ./kbb-blkfuse mnt2 m2.txt -f -o allow_other,ro &
           for i in $(seq 1 20); do [ -e mnt2/test.zimaa ] && break; sleep 0.5; done
           stat -c '%n %s' mnt2/test.zimaa mnt2/test.zimab
+          test "$(stat -c%s mnt2/test.zimaa)" = "$SA"
           python3 guest/ci/read_zim.py mnt2/test.zimaa SPLIT-FUSE
           sudo umount mnt2 || true
 
