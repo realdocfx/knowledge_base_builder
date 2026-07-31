@@ -554,6 +554,12 @@ jobs:
 
           mkdir -p content/library/archive
           echo 'PASSTHROUGH-CANARY' > content/library/archive/canary.txt
+          # A prebuilt index, because a real stick has one. Without it this job
+          # only ever exercised the build-from-scratch path, which is why it
+          # passed while the field failed: the guest was silently re-indexing
+          # 119 GB every boot and never answered inside the readiness budget.
+          mkdir -p content/library/archive/.kb_state
+          echo 'prebuilt-index-stand-in' > content/library/archive/.kb_state/archive_index.db
           # A directory alongside it, so the bucket resolution is choosing between
           # real alternatives rather than matching the only thing present.
           mkdir -p content/library/archive/Some_Book
@@ -618,7 +624,14 @@ jobs:
             grep -a "portal state" archive.log || true
             exit 1
           }
-          echo "archive mounted, bucket resolved, state redirected, portal serving"
+          # ...and the prebuilt index must have been ADOPTED, not rebuilt. This is
+          # the assertion whose absence let the field failure through.
+          grep -qa "state seeded" archive.log || {
+            echo "::error::the archive's existing index was not seeded into tmpfs"
+            grep -a "seed\|prebuilt" archive.log || true
+            exit 1
+          }
+          echo "archive mounted, bucket resolved, index seeded, portal serving"
 
       - name: Assert the guest cannot write to the archive
         run: |

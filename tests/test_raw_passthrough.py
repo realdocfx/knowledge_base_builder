@@ -203,3 +203,30 @@ def test_portal_state_lives_outside_the_read_only_archive():
     assert "lowerdir" not in svc, (
         "the overlay is still wired; it was replaced, not supplemented"
     )
+
+
+def test_existing_state_is_seeded_into_the_writable_copy():
+    """A prebuilt index on the stick must be used, not rebuilt from scratch.
+
+    Redirecting state to tmpfs made it *empty*, so the portal re-indexed the whole
+    archive on every boot -- 119 GB across 303 entries, read over emulated I/O
+    from a USB stick. That cannot finish inside the readiness budget, and the UI
+    reports "portal backend did not respond" while the portal is alive and
+    indexing. CI missed it because the synthetic archive is 512 MB with two files.
+
+    The archive already carries a computed index. It is an INPUT: copied into the
+    writable state directory at start, then updated there. Read-only safety and
+    amnesia are both preserved -- the copy costs seconds, the rebuild costs hours.
+    """
+    svc = cli._guest_init_files()["etc/init.d/kbb-kiosk"]
+    assert "kb_state" in svc, (
+        "the kiosk never looks for an existing index on the archive, so the "
+        "portal rebuilds it from scratch on every boot"
+    )
+    seed = [ln for ln in svc.splitlines() if "cp " in ln and "KBB_STATE_DIR" in ln]
+    assert seed, "nothing copies the existing state into the writable directory"
+    # Ordering matters: seeding after the portal starts is useless.
+    assert svc.index("KBB_STATE_DIR") < svc.index("knowledge_base_builder.cli portal"), (
+        "state is seeded after the portal is launched, so the portal still starts "
+        "against an empty index"
+    )
