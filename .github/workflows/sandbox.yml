@@ -706,7 +706,9 @@ jobs:
             -append "root=/dev/vda rootfstype=ext4 rw console=ttyS0 kbb_mode=qemu" \
             -device virtio-vga \
             -device virtio-keyboard-pci -device virtio-tablet-pci \
-            -display none -serial stdio \n            -monitor unix:qmp.sock,server,nowait \n            2>&1 | tee archive.log || true
+            -display none -serial stdio \r
+            -monitor unix:qmp.sock,server,nowait \r
+            2>&1 | tee archive.log || true
           echo "--- tail ---"; tail -40 archive.log
 
       - name: Assert the archive was mounted and served
