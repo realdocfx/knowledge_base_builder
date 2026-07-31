@@ -225,8 +225,18 @@ def test_existing_state_is_seeded_into_the_writable_copy():
     )
     seed = [ln for ln in svc.splitlines() if "cp " in ln and "KBB_STATE_DIR" in ln]
     assert seed, "nothing copies the existing state into the writable directory"
-    # Ordering matters: seeding after the portal starts is useless.
-    assert svc.index("KBB_STATE_DIR") < svc.index("knowledge_base_builder.cli portal"), (
-        "state is seeded after the portal is launched, so the portal still starts "
+    # Ordering, against the variable the seed actually reads. The first version
+    # of this checked KBB_STATE_DIR < portal, which was true while the seed still
+    # ran BEFORE $KBB_BUCKET was resolved -- so it copied from "/.kb_state",
+    # found nothing, and logged "no prebuilt index" while passing the test.
+    bucket_resolved = svc.index("for cand in")
+    seed_uses_bucket = svc.index("KBB_BUCKET/.kb_state")
+    portal_starts = svc.index("knowledge_base_builder.cli portal")
+    assert bucket_resolved < seed_uses_bucket, (
+        "the seed reads $KBB_BUCKET before anything assigns it, so it looks for "
+        "/.kb_state and silently finds nothing"
+    )
+    assert seed_uses_bucket < portal_starts, (
+        "state is seeded after the portal launches, so the portal still starts "
         "against an empty index"
     )
