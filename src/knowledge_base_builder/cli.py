@@ -2036,7 +2036,7 @@ def _write_sandbox_launchers(root: Path, port: int = 8080) -> None:
         "    -device virtio-vga ^",
         "    -device virtio-keyboard-pci -device virtio-tablet-pci ^",
         r'    -serial file:"%TEMP%\kbb_sandbox.log" ^',
-        '    -full-screen -display sdl,grab-mod=rctrl 2>"%TEMP%\kbb_qemu.log"',
+        r'    -full-screen -display sdl,grab-mod=rctrl 2>"%TEMP%\kbb_qemu.log"',
     ]
     bat = root / "start_sandbox.bat"
     bat.write_bytes(("\r\n".join(win_lines) + "\r\n").encode("utf-8"))
@@ -2093,7 +2093,7 @@ def _write_sandbox_launchers(root: Path, port: int = 8080) -> None:
         "    -device virtio-vga \\",
         "    -device virtio-keyboard-pci -device virtio-tablet-pci \\",
         '    -serial file:"${TMPDIR:-/tmp}/kbb_sandbox.log" \\',
-        '    -full-screen -display sdl,grab-mod=rctrl 2>"${TMPDIR:-/tmp}/kbb_qemu.log"',
+        r'    -full-screen -display sdl,grab-mod=rctrl 2>"${TMPDIR:-/tmp}/kbb_qemu.log"',
     ]
     sh = root / "start_sandbox.sh"
     sh.write_bytes(("\n".join(posix_lines) + "\n").encode("utf-8"))
@@ -2299,9 +2299,23 @@ def _guest_init_files() -> Dict[str, str]:
         '        kbb_log "no prebuilt index on the archive; the portal will build one"\n'
         '    fi\n'
         '\n'
+        '    # Choose the interpreter that can RUN the portal, not the first one\n'
+        '    # that exists. The stick carries .kb_env/python-linux with KBB but no\n'
+        '    # web stack; selecting it on existence alone killed the portal with\n'
+        '    # "Missing web dependencies" while the guest image\'s own python3 --\n'
+        '    # built and verified in CI with fastapi and uvicorn -- sat unused. The\n'
+        '    # UI then said "portal backend did not respond", which is true and\n'
+        '    # useless. A stick provisioned at any point in the past may carry an\n'
+        '    # interpreter that cannot serve, so ask rather than assume.\n'
         '    KBB_PY=""\n'
-        '    for cand in "$KBB_DATA/.kb_env/python-linux/bin/python3" /usr/bin/python3; do\n'
-        '        [ -x "$cand" ] && KBB_PY="$cand" && break\n'
+        '    for cand in /usr/bin/python3 "$KBB_DATA/.kb_env/python-linux/bin/python3"; do\n'
+        '        [ -x "$cand" ] || continue\n'
+        '        if "$cand" -c "import knowledge_base_builder, fastapi, uvicorn" 2>/dev/null; then\n'
+        '            KBB_PY="$cand"\n'
+        '            kbb_log "portal python: $KBB_PY (web stack present)"\n'
+        '            break\n'
+        '        fi\n'
+        '        kbb_log "skipping $cand: cannot import the portal web stack"\n'
         '    done\n'
         '    # The UI attaches to this portal instead of starting its own, so the\n'
         '    # token has to be published where the UI looks for it. /api/* is\n'

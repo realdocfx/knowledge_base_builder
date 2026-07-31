@@ -317,3 +317,31 @@ def test_the_ui_is_configured_for_software_rendering(rootfs):
             f"{var} is not exported; WebKitGTK will take a GPU path the guest "
             "cannot satisfy and the window will never paint"
         )
+
+
+def test_the_interpreter_is_chosen_by_capability_not_by_path(rootfs):
+    """Picking the first interpreter that EXISTS is not the same as one that works.
+
+    The kiosk preferred the stick's .kb_env/python-linux, which carries KBB but
+    not the web stack. The portal died instantly with
+
+        Missing web dependencies. Run: pip install -e .
+
+    while the guest image's own /usr/bin/python3 -- built and verified in CI with
+    knowledge_base_builder, fastapi and uvicorn -- sat unused, second in the list.
+    The UI then reported "portal backend did not respond", which is true and
+    tells the operator nothing.
+
+    Existence is the wrong test. Each candidate must be asked whether it can
+    import what the portal needs, because a stick provisioned at any point in the
+    past may carry an interpreter that cannot.
+    """
+    svc = _read(rootfs, "etc/init.d/kbb-kiosk")
+    probe_region = svc[svc.index("KBB_PY="):svc.index("KBB_PY=") + 1200]
+    assert "import" in probe_region and "fastapi" in probe_region, (
+        "candidates are accepted on existence alone; an interpreter without the "
+        "web stack is selected and the portal dies at startup"
+    )
+    assert "-c" in probe_region, (
+        "nothing actually executes the candidate to find out whether it works"
+    )
