@@ -368,7 +368,7 @@ jobs:
           # kernel that will boot. Without the virtio feature the initramfs cannot
           # see /dev/vda and the kernel panics with no root.
           docker run --rm -v "$PWD/rootfs:/rootfs" alpine:3.20 \
-            chroot /rootfs /sbin/mkinitfs -F "base virtio ext4 kms dri" \
+            chroot /rootfs /sbin/mkinitfs -F "base virtio ext4 overlayfs kms dri" \
               -o "/boot/initramfs-kbb" "$KVER"
           sudo ls -lh rootfs/boot/
 
