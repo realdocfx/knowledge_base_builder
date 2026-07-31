@@ -240,3 +240,58 @@ def test_existing_state_is_seeded_into_the_writable_copy():
         "state is seeded after the portal launches, so the portal still starts "
         "against an empty index"
     )
+
+
+def test_the_launcher_records_the_guest_console(launchers):
+    """A sandbox that hangs must leave something to read.
+
+    The launcher ran with no serial output at all: when the guest stalled, the
+    only evidence available was that a qemu process existed. Diagnosis required
+    re-running by hand with a different command line -- which is not something an
+    operator in the field can do, and not something reproducible.
+
+    `-serial file:` costs nothing, opens no window (so the fullscreen kiosk is
+    unaffected) and captures the same console CI reads. It must NOT write to the
+    stick: the guest is reading that disk raw, and writing to the volume while
+    QEMU reads the device underneath it is exactly the inconsistency the
+    read-only passthrough exists to avoid.
+    """
+    for name, body in launchers.items():
+        code = _code(body)
+        assert "-serial" in code, (
+            f"{name} captures no guest console; a hang leaves nothing to diagnose"
+        )
+        serial = [ln for ln in code.splitlines() if "-serial" in ln][0]
+        assert "file:" in serial, (
+            f"{name} does not write the console to a file: {serial.strip()}"
+        )
+        assert "stdio" not in serial, (
+            f"{name} uses stdio, which opens a console window over the kiosk"
+        )
+        assert "%USB%" not in serial and "$USB" not in serial, (
+            f"{name} logs onto the stick while the guest reads that disk raw: "
+            f"{serial.strip()}"
+        )
+
+
+def test_the_console_is_routed_to_the_recorder(launchers):
+    """A log file nothing writes to is worse than no log.
+
+    Linux sends output to every `console=` on the cmdline and makes the LAST one
+    /dev/console, which is where the kiosk writes its markers. With only
+    console=tty0 the serial file is created and stays empty, which reads as "the
+    guest said nothing" rather than "nobody was listening".
+    """
+    for name, body in launchers.items():
+        append = [ln for ln in body.splitlines() if "-append" in ln]
+        assert append, f"{name} has no kernel cmdline"
+        cmdline = append[0]
+        assert "console=ttyS0" in cmdline, (
+            f"{name} never routes the console to the serial port, so the log file "
+            f"stays empty: {cmdline.strip()}"
+        )
+        consoles = [t for t in cmdline.split() if t.startswith("console=")]
+        assert consoles[-1].startswith("console=ttyS0"), (
+            f"serial is not the last console=, so /dev/console is the VGA and the "
+            f"kiosk markers never reach the file: {consoles}"
+        )

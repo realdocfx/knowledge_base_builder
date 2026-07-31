@@ -1960,7 +1960,12 @@ def _write_sandbox_launchers(root: Path, port: int = 8080) -> None:
     """
     cmdline = (
         "root=/dev/vda rootfstype=ext4 rw "
-        "console=tty0 "
+        # Both consoles, serial LAST. Linux sends kernel output to every console=
+        # listed and makes the last one /dev/console, which is where the kiosk
+        # writes its markers -- so the flight recorder actually records. With only
+        # console=tty0 the serial file is created and stays empty, which is worse
+        # than no log: it looks like the guest said nothing.
+        "console=tty0 console=ttyS0 "
         f"kbb_mode=qemu kbb_port={port}"
     )
 
@@ -2014,6 +2019,11 @@ def _write_sandbox_launchers(root: Path, port: int = 8080) -> None:
         ":: virtio-vga gives the guest a DRM node -- cage is a DRM compositor and",
         ":: exits instantly without one. The input devices are equally required:",
         ":: wlroots aborts with \"no input devices\" and takes cage down with it.",
+        ":: Flight recorder. Writes the guest console to a file -- no window, so",
+        ":: the kiosk is unaffected, and the same output CI reads. Deliberately",
+        ":: NOT on the stick: the guest reads that disk raw, and writing to the",
+        ":: volume while QEMU reads the device underneath is the inconsistency the",
+        ":: read-only passthrough exists to avoid.",
         '"%QEMU%" -L "%FW%" -nodefaults -M q35 -m 3072 -smp 2 ^',
         '    -kernel "%USB%vmlinuz-kbb" -initrd "%USB%initramfs-kbb" ^',
         f'    -append "{cmdline}" ^',
@@ -2021,6 +2031,7 @@ def _write_sandbox_launchers(root: Path, port: int = 8080) -> None:
         '    -drive file=%RAW%,format=raw,if=virtio,readonly=on ^',
         "    -device virtio-vga ^",
         "    -device virtio-keyboard-pci -device virtio-tablet-pci ^",
+        r'    -serial file:"%TEMP%\kbb_sandbox.log" ^',
         "    -full-screen -display sdl,grab-mod=rctrl",
     ]
     bat = root / "start_sandbox.bat"
@@ -2077,6 +2088,7 @@ def _write_sandbox_launchers(root: Path, port: int = 8080) -> None:
         '    -drive file="$RAWDISK",format=raw,if=virtio,readonly=on \\',
         "    -device virtio-vga \\",
         "    -device virtio-keyboard-pci -device virtio-tablet-pci \\",
+        '    -serial file:"${TMPDIR:-/tmp}/kbb_sandbox.log" \\',
         "    -full-screen -display sdl,grab-mod=rctrl",
     ]
     sh = root / "start_sandbox.sh"
