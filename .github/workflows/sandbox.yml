@@ -603,7 +603,15 @@ jobs:
             grep -a "KBB-" archive.log | tail -20
             exit 1
           }
-          echo "archive mounted, bucket resolved, portal serving"
+          # ...and the portal's state must be OUTSIDE the read-only archive.
+          # Writing into the bucket is what killed startup with Errno 30, and a
+          # run that served could still regress here if the redirection were lost.
+          grep -qa "portal state: /tmp" archive.log || {
+            echo "::error::portal state is not redirected off the archive"
+            grep -a "portal state" archive.log || true
+            exit 1
+          }
+          echo "archive mounted, bucket resolved, state redirected, portal serving"
 
       - name: Assert the guest cannot write to the archive
         run: |

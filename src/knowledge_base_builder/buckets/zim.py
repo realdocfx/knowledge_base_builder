@@ -18,6 +18,7 @@ from datetime import datetime
 
 from ..base import BaseBucket
 from ..presentation import _physical_zim_path
+from .usb import resolve_state_dir
 
 logger = logging.getLogger(__name__)
 
@@ -56,9 +57,9 @@ class ZimBucket(BaseBucket):
     # less wear.
     STATE_FLUSH_INTERVAL = 100 * 1024 * 1024
 
-    def __init__(self, target_path: str):
+    def __init__(self, target_path: str, state_dir: str = None):
         super().__init__(target_path)
-        self.state_dir = self.root / self.STATE_DIR
+        self.state_dir = resolve_state_dir(self.root, state_dir)
         self.state_file = self.state_dir / "sync_state.json"
 
     def initialize(self) -> bool:

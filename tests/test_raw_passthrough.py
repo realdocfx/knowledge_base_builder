@@ -172,66 +172,34 @@ def test_the_guest_finds_the_nested_archive():
     )
 
 
-def test_the_archive_is_writable_to_the_portal_without_being_writable_on_disk():
-    """The portal writes state into its bucket; the medium must stay read-only.
+def test_portal_state_lives_outside_the_read_only_archive():
+    """The portal must not be asked to write into a read-only medium.
 
-    Mounting the passed-through archive read-only is the entire safety argument
-    for handing a sandbox a physical disk -- and it made the portal fail at
-    startup:
+    It wrote .kb_state into the bucket, which cannot work when the archive is
+    mounted read-only -- and it is read-only on purpose, because that is the
+    entire safety argument for handing a VM a physical disk. Startup died with
+    "Errno 30 Read-only file system".
 
-        OSError: [Errno 30] Read-only file system:
-        '/media/kbb/library/archive/.kb_state'
-
-    Relaxing the mount would trade that safety away. An overlay resolves it
-    instead: the archive is the read-only lower layer, a tmpfs is the upper, so
-    the portal sees a writable filesystem while every write lands in RAM and is
-    gone at power-off. That is the same amnesic property the guest image already
-    has via snapshot=on.
+    An overlay was tried first and is the wrong shape of fix: it makes a
+    read-only thing *look* writable, depends on a kernel module that may be
+    absent or refused, and per the kernel's own documentation an overlay above a
+    vfat lower is exactly the fragile case. Telling the portal where to write
+    removes the requirement instead of working around it -- no privileges, no
+    kernel features, and testable without a VM.
     """
     svc = cli._guest_init_files()["etc/init.d/kbb-kiosk"]
-    assert "overlay" in svc, (
-        "no overlay: the portal cannot create .kb_state on a read-only archive "
-        "and dies during application startup"
+    assert "KBB_STATE_DIR" in svc, (
+        "the kiosk never redirects portal state, so it would write into the "
+        "read-only archive and die at startup"
     )
-    assert "lowerdir=" in svc and "upperdir=" in svc, (
-        "overlay is mentioned but not configured with a lower/upper pair"
+    state = next(
+        ln.split("=", 1)[1].strip()
+        for ln in svc.splitlines() if "export KBB_STATE_DIR=" in ln
     )
-    # The lower layer must still be the read-only mount.
-    lower = [ln for ln in svc.splitlines() if "lowerdir=" in ln]
-    assert lower, "no overlay mount line"
-    assert any("tmp" in ln for ln in lower), (
-        "the upper layer is not in tmpfs, so writes would land somewhere "
-        "persistent -- possibly on the archive itself"
+    assert state.startswith("/tmp"), (
+        f"portal state at {state!r} is not on the writable tmpfs; on the archive "
+        "it fails, and anywhere persistent it breaks the amnesic guarantee"
     )
-
-
-def test_overlay_failure_is_reported_not_silent():
-    """If the overlay cannot be created the operator must learn why."""
-    svc = cli._guest_init_files()["etc/init.d/kbb-kiosk"]
-    idx = svc.find("lowerdir=")
-    assert idx > 0
-    following = svc[idx:idx + 800]
-    assert "kbb_log" in following, (
-        "the overlay mount has no diagnostic path; a failure would surface much "
-        "later as an unexplained portal crash"
-    )
-
-
-def test_the_overlay_mount_points_are_distinct():
-    """The device mount and the bucket mount must not be the same path.
-
-    Overlaying a directory onto itself is not a mount, and an undefined lower
-    path silently becomes an empty string -- the mount then targets "" and fails
-    in a way that reads like a missing device rather than a scripting error.
-    """
-    svc = cli._guest_init_files()["etc/init.d/kbb-kiosk"]
-    assert any(ln.strip().startswith("KBB_RO=") for ln in svc.splitlines()), (
-        "KBB_RO is referenced but never assigned; the read-only mount would "
-        "target an empty path"
-    )
-    ro = next(ln.split("=", 1)[1].strip()
-              for ln in svc.splitlines() if ln.strip().startswith("KBB_RO="))
-    assert ro and ro != "$KBB_DATA", (
-        f"the device and the bucket share a mount point ({ro}); the overlay would "
-        "have itself as its own lower layer"
+    assert "lowerdir" not in svc, (
+        "the overlay is still wired; it was replaced, not supplemented"
     )

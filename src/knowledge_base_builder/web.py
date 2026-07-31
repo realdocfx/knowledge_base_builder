@@ -646,6 +646,10 @@ async def lifespan(_app: FastAPI):
     root = Path(bucket_root).resolve()
     if not root.exists():
         root.mkdir(parents=True, exist_ok=True)
+    # state_dir comes from KBB_STATE_DIR when set (resolve_state_dir handles the
+    # precedence). The sandbox points it at tmpfs because the archive is mounted
+    # read-only there on purpose; without this the portal dies at startup with
+    # "Errno 30 Read-only file system: .../.kb_state".
     BUCKET = UsbBucket(str(root))
     BUCKET.initialize()
 
