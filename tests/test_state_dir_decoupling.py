@@ -115,3 +115,80 @@ def test_fts_index_follows_the_state_dir(tmp_path):
     assert str(state) in str(fts), (
         "the FTS index would still be written under the content root"
     )
+
+
+# ---------------------------------------------------------------------------
+# Every consumer, not just the buckets
+# ---------------------------------------------------------------------------
+def test_the_search_index_honours_the_state_dir(tmp_path, monkeypatch):
+    """archive_index computed its own .kb_state and ignored the buckets entirely.
+
+    Fixing the buckets alone left this one writing into the content root, so the
+    portal still crashed on a read-only archive -- with a traceback that pointed
+    at a module the earlier audit never looked at:
+
+        File "knowledge_base_builder/archive_index.py", line 263, in _ensure_schema
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        OSError: [Errno 30] Read-only file system: '.../.kb_state'
+
+    One resolver, every consumer -- otherwise the next read-only medium finds the
+    next module that grew its own copy.
+    """
+    from knowledge_base_builder import archive_index
+
+    content = tmp_path / "ro"
+    content.mkdir()
+    state = tmp_path / "state"
+    monkeypatch.setenv("KBB_STATE_DIR", str(state))
+
+    idx = archive_index.ArchiveIndex(str(content))
+
+    assert str(state) in str(idx.db_path), (
+        f"index db at {idx.db_path}, which is inside the content root; a "
+        "read-only archive still raises Errno 30"
+    )
+
+
+def test_the_audit_log_honours_the_state_dir(tmp_path, monkeypatch):
+    """The audit log is append-only state and must not require a writable bucket."""
+    from knowledge_base_builder import audit
+
+    content = tmp_path / "ro"
+    content.mkdir()
+    state = tmp_path / "state"
+    monkeypatch.setenv("KBB_STATE_DIR", str(state))
+
+    log = audit.AuditLog.for_root(content) if hasattr(audit.AuditLog, "for_root") \
+        else audit.AuditLog(content)
+    assert str(state) in str(log.state_dir), (
+        f"audit state at {log.state_dir}; a read-only bucket cannot be audited"
+    )
+
+
+def test_only_one_resolver_defines_where_state_lives():
+    """A second hardcoded '.kb_state' is how this bug survived the first fix."""
+    import pathlib
+    import re
+
+    src_root = pathlib.Path(__file__).resolve().parent.parent / "src"
+    offenders = []
+    for path in src_root.rglob("*.py"):
+        lines = path.read_text(encoding="utf-8").splitlines()
+        for n, line in enumerate(lines, 1):
+            if not (re.search(r'/\s*"\.kb_state"', line)
+                    or re.search(r"/\s*'\.kb_state'", line)):
+                continue
+            # Some sites address ANOTHER drive's state as data -- cloning a target
+            # drive, staging a download onto it. Redirecting those would copy or
+            # write the wrong thing, so they are exempt *explicitly*: the marker
+            # forces the reason to be written down where the next reader will see
+            # it, rather than the guard being quietly loosened.
+            window = chr(10).join(lines[max(0, n - 7):n])
+            if "state-path-exempt" in window:
+                continue
+            offenders.append(f"{path.name}:{n}")
+    assert not offenders, (
+        f"{offenders} build a state path directly instead of using "
+        "resolve_state_dir(); each one is a module that will break on the next "
+        "read-only medium"
+    )

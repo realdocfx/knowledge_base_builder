@@ -18,7 +18,7 @@ from datetime import datetime
 
 from ..base import BaseBucket
 from ..presentation import _physical_zim_path
-from .usb import resolve_state_dir
+from ..state_paths import resolve_state_dir
 
 logger = logging.getLogger(__name__)
 

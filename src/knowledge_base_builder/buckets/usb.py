@@ -6,31 +6,8 @@ from typing import Dict, Any
 from datetime import datetime
 
 from ..base import BaseBucket
+from ..state_paths import resolve_state_dir
 
-
-def resolve_state_dir(root, state_dir=None):
-    """Where a bucket keeps its mutable state.
-
-    Precedence: explicit argument, then ``KBB_STATE_DIR``, then ``<root>/.kb_state``.
-
-    The default keeps every existing drive exactly as it was. The other two exist
-    because anchoring state inside the content root makes the portal unable to
-    serve from a read-only medium at all -- a write-protected stick, an optical
-    disc, a read-only share, or the QEMU sandbox, where the archive is mounted
-    read-only on purpose. The environment variable is what lets the guest redirect
-    state without threading a path through every construction site; the explicit
-    argument wins over it so a stray variable cannot silently redirect a caller
-    that asked for something specific.
-    """
-    import os
-    from pathlib import Path
-
-    if state_dir:
-        return Path(state_dir)
-    env = os.environ.get("KBB_STATE_DIR")
-    if env and env.strip():
-        return Path(env)
-    return Path(root) / ".kb_state"
 
 
 class UsbBucket(BaseBucket):

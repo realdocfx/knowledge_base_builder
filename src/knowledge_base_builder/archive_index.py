@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 from .os_utils import local_path_for
+from .state_paths import resolve_state_dir
 
 try:  # optional; PDF body extraction degrades gracefully without it
     from pypdf import PdfReader
@@ -239,7 +240,7 @@ class ArchiveIndex:
 
     def __init__(self, root: Union[str, Path]):
         self.root = Path(root)
-        self.db_path = self.root / ".kb_state" / "archive_index.db"
+        self.db_path = resolve_state_dir(self.root) / "archive_index.db"
         self._ensure_schema()
 
     # ---- connection / schema ------------------------------------------

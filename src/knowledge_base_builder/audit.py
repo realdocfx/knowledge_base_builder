@@ -37,6 +37,7 @@ nothing here is constrained by an external file format.
 """
 
 from __future__ import annotations
+from .state_paths import resolve_state_dir
 
 import getpass
 import hashlib
@@ -114,7 +115,7 @@ class AuditLog:
 
     def __init__(self, root: Union[str, Path]):
         self.root = Path(root)
-        self.state_dir = self.root / ".kb_state"
+        self.state_dir = resolve_state_dir(self.root)
         self.path = self.state_dir / LOG_NAME
         # Serialises sequence allocation AND the append itself: two threads that
         # interleave would otherwise produce records chained to the same

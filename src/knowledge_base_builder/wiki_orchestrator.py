@@ -336,7 +336,11 @@ class ZimDownloader:
 
         # If the staging bucket extracted an FTS index, migrate it to the final
         # bucket so the portal can search the finalized ZIM.
+        # state-path-exempt: a download stages the index onto the TARGET
+        # DRIVE, which must survive a reboot. Honouring KBB_STATE_DIR here
+        # would put it on tmpfs and lose it, forcing a re-download.
         stage_fts_dir = stage_dir / ".kb_state" / "wiki_fts" / identifier
+        # state-path-exempt: same -- the drive's own index.
         final_fts_dir = final_dir / ".kb_state" / "wiki_fts" / identifier
         if stage_fts_dir.exists():
             final_fts_dir.parent.mkdir(parents=True, exist_ok=True)

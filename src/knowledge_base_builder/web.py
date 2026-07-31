@@ -43,6 +43,7 @@ from .archive_index import ArchiveIndex
 from . import audit, cloning
 from .buckets.usb import UsbBucket
 from .presentation import _physical_zim_path, discover_archives
+from .state_paths import resolve_state_dir
 
 
 app = FastAPI(
@@ -413,7 +414,7 @@ KIWIX_CLIENT: Optional[httpx.AsyncClient] = None
 
 def _wiki_fts_path(root: Path, book_name: str) -> Optional[Path]:
     """Return the path to an extracted Xapian FTS index, if it exists."""
-    p = root / ".kb_state" / "wiki_fts" / book_name / "xapian"
+    p = resolve_state_dir(root) / "wiki_fts" / book_name / "xapian"
     return p if p.exists() else None
 
 

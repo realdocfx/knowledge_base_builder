@@ -231,6 +231,11 @@ def _write_manifest(dst: Path, src: Path, mode: str, files: Dict[str, Dict[str, 
     copy can be checked later, independently of the process that made it.
     """
     try:
+        # state-path-exempt: this is the DESTINATION DRIVE's own state
+        # directory, not this process's. Routing it through
+        # resolve_state_dir would honour KBB_STATE_DIR and clone the
+        # running instance's scratch state onto the target instead of
+        # the drive's.
         state_dir = dst / ".kb_state"
         state_dir.mkdir(parents=True, exist_ok=True)
         payload = {
@@ -275,6 +280,7 @@ def clone(
         # Make the index self-contained before it is enumerated, so the copy
         # carries every committed transaction rather than only those already
         # folded out of the WAL.
+        # state-path-exempt: the SOURCE DRIVE's state, for the same reason.
         _checkpoint_sqlite_wal(src / ".kb_state")
 
         audit.record(
