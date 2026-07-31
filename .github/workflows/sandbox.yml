@@ -589,7 +589,10 @@ jobs:
             exit 1
           fi
           # The device was found and mounted.
-          grep -qa "archive mounted at" archive.log || {
+          # Matches "archive mounted read-only at ..." -- the wording changed with
+          # the overlay removal and this assertion did not follow it, failing a run
+          # in which the archive had in fact mounted.
+          grep -qa "archive mounted" archive.log || {
             echo "::error::the passed-through disk was never mounted"
             grep -a "KBB\]" archive.log | head -20
             exit 1
