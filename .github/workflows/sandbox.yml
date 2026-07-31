@@ -485,3 +485,126 @@ jobs:
           name: guest-boot-log
           path: boot.log
           retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # The archive actually reaching the guest.
+  #
+  # Every other job proves the UI starts. None of them proves the operator can
+  # read anything, and that is the part the last three attempts got wrong: vvfat
+  # was reported as working after clearing one of its three limits, twice.
+  #
+  # This builds a *partitioned* disk laid out like the stick -- MBR, one FAT32
+  # partition, content under library/archive/ -- and passes it through exactly as
+  # the launcher does: whole disk, read-only, second virtio drive. The guest has
+  # to find the partition itself, mount it read-only, resolve the nested bucket
+  # and serve a file from it. A synthetic disk is honest here: what is being
+  # tested is the guest's handling of a passed-through device, and 130 GB of real
+  # ZIM would test the same code paths no differently.
+  # ---------------------------------------------------------------------------
+  archive-passthrough:
+    name: archive reaches the guest
+    runs-on: ubuntu-latest
+    needs: [guest-image]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: kbb-guest-image
+
+      - name: Tooling
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-system-x86 dosfstools mtools fdisk
+
+      - name: Build a partitioned stand-in for the stick
+        run: |
+          set -eux
+          # 512 MiB is ample: the point is the layout and the passthrough, not
+          # the volume. An MBR with one FAT32 partition is what the real stick
+          # presents, and it is what makes the guest look at vdb1 rather than vdb.
+          dd if=/dev/zero of=stick.img bs=1M count=512 status=none
+          printf 'label: dos\n1 : start=2048, type=c\n' | sfdisk stick.img
+          # Format the partition in isolation, then splice it back at its offset:
+          # mkfs.vfat cannot address a partition inside an image file, and doing
+          # this by hand keeps the job free of loop devices and privileges.
+          OFFSET=$((2048 * 512))
+          dd if=/dev/zero of=part.img bs=1M count=511 status=none
+          mkfs.vfat -F 32 -n KBBDATA part.img
+
+          mkdir -p content/library/archive
+          echo 'PASSTHROUGH-CANARY' > content/library/archive/canary.txt
+          # A directory alongside it, so the bucket resolution is choosing between
+          # real alternatives rather than matching the only thing present.
+          mkdir -p content/library/archive/Some_Book
+          echo 'chapter one' > content/library/archive/Some_Book/index.txt
+          mcopy -i part.img -s content/library ::/
+
+          dd if=part.img of=stick.img bs=512 seek=2048 conv=notrunc status=none
+          sfdisk -l stick.img
+
+      - name: Boot with the disk passed through read-only
+        timeout-minutes: 15
+        run: |
+          set -eux
+          # Second drive = whole disk with its partition table, readonly=on --
+          # byte for byte what start_sandbox.bat passes as \\.\PhysicalDriveN.
+          timeout 600 qemu-system-x86_64 \
+            -M q35 -m 3072 -smp 2 -no-reboot \
+            -kernel vmlinuz-kbb -initrd initramfs-kbb \
+            -drive file=kbb_guest.img,format=raw,if=virtio,snapshot=on \
+            -drive file=stick.img,format=raw,if=virtio,readonly=on \
+            -append "root=/dev/vda rootfstype=ext4 rw console=ttyS0 kbb_mode=qemu" \
+            -device virtio-vga \
+            -device virtio-keyboard-pci -device virtio-tablet-pci \
+            -display none -serial stdio \
+            2>&1 | tee archive.log || true
+          echo "--- tail ---"; tail -40 archive.log
+
+      - name: Assert the archive was mounted and served
+        run: |
+          set -eux
+          if grep -qiE "emergency|init not found|Kernel panic" archive.log; then
+            echo "::error::guest did not reach userspace"
+            exit 1
+          fi
+          # The device was found and mounted.
+          grep -qa "archive mounted at" archive.log || {
+            echo "::error::the passed-through disk was never mounted"
+            grep -a "KBB\]" archive.log | head -20
+            exit 1
+          }
+          # The nested bucket was resolved, not the mount point.
+          grep -qa "bucket: /media/kbb/library/archive" archive.log || {
+            echo "::error::bucket resolved to the wrong directory"
+            grep -a "bucket:" archive.log || true
+            exit 1
+          }
+          # ...and the portal served, which is the only proof the operator would
+          # actually see content.
+          grep -qa "KBB-PORTAL-OK" archive.log || {
+            echo "::error::portal did not serve with the archive attached"
+            grep -a "KBB-" archive.log | tail -20
+            exit 1
+          }
+          echo "archive mounted, bucket resolved, portal serving"
+
+      - name: Assert the guest cannot write to the archive
+        run: |
+          set -eux
+          # readonly=on is the entire safety argument for handing a sandbox a
+          # physical disk. If the guest could write, a stray write would corrupt
+          # the host's filesystem rather than one file.
+          if grep -qaiE "vdb1.*read-write|mounted.*vdb1.*rw," archive.log; then
+            echo "::error::archive was mounted writable"
+            exit 1
+          fi
+          grep -qa "ro,noatime\|(ro" archive.log || echo "note: mount flags not echoed"
+          echo "archive is read-only to the guest"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        if: always()
+        with:
+          name: archive-boot-log
+          path: archive.log
+          retention-days: 7

@@ -70,13 +70,27 @@ def _primary(launchers: dict) -> str:
 # ---------------------------------------------------------------------------
 # One click
 # ---------------------------------------------------------------------------
-def test_no_elevation_prompt(launchers):
+def test_elevation_happens_once_and_says_why(launchers):
+    """The no-prompt requirement was traded, deliberately, for the archive.
+
+    This guard used to assert the opposite. Removing the prompt was right while a
+    privilege-free data path looked possible; QEMU's vvfat turned out to cap the
+    synthesised volume at ~516 MB, so a 130 GB archive cannot pass through it at
+    any setting. The remaining route reads the physical device, which needs
+    Administrator.
+
+    What must not regress is *how* the prompt behaves: raised once, before
+    anything else happens, with the reason stated. A consent dialog that appears
+    with no explanation teaches operators to approve dialogs.
+    """
     body = _primary(launchers)
-    for token in ("RunAs", "net session", "requestedExecutionLevel"):
-        assert token not in body, (
-            f"{token!r} makes Windows raise a UAC dialog; the operator has to "
-            "consent, which is a second action"
-        )
+    assert "RunAs" in body, "no elevation path; the archive would be unreachable"
+    assert body.count("RunAs") == 1, (
+        "elevation is requested more than once; the operator should see one prompt"
+    )
+    assert re.search(r"archive|read-only", body, re.I), (
+        "the operator is asked to elevate with no stated reason"
+    )
 
 
 def test_no_keypress_needed(launchers):
@@ -111,11 +125,17 @@ def test_guest_has_a_framebuffer(launchers):
     )
 
 
-def test_no_admin_only_data_path(launchers):
+def test_the_data_path_is_the_physical_device(launchers):
+    """vvfat cannot carry this archive; the block device can.
+
+    Three vvfat limits were measured: root-directory entries (solvable by
+    nesting), 2 GiB per file (solvable by re-slicing), and a fixed ~516 MB
+    synthesised volume (not solvable at all). Passthrough has no ceiling because
+    the guest's own kernel reads the partition.
+    """
     body = _primary(launchers)
-    assert "PhysicalDrive" not in body, (
-        "raw PhysicalDrive passthrough requires Administrator on Windows, which "
-        "is precisely what forces the UAC prompt"
+    assert "PhysicalDrive" in body, (
+        "no physical device attached, so the guest boots with an empty library"
     )
 
 

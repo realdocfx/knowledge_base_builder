@@ -189,40 +189,35 @@ def test_write_sandbox_launchers(tmp_path):
     assert "kbb_mode=qemu" in sh_text
 
 
-def test_sandbox_launcher_needs_no_privileges(tmp_path):
-    """One click means no consent dialog, and the archive stays read-only.
+def test_sandbox_launcher_passes_the_device_through_read_only(tmp_path):
+    """The archive reaches the guest as a device, and the guest cannot write it.
 
-    The vvfat prohibition that used to live here has been narrowed rather than
-    dropped. ``fat:rw:`` remains forbidden -- vvfat's write path is where it is
-    genuinely unreliable, and the archive must not be mutable from inside a
-    sandbox in any case. ``fat:32:ro:`` is how the stick's content reaches the
-    guest: the root-directory entry limit that broke the earlier attempt is a
-    FAT16 limit, and every file is already chunked below 4 GiB for FAT32.
-
-    Raw ``PhysicalDriveN`` passthrough is what forced Administrator, and with it
-    the UAC prompt. The guest now boots a plain image file, which needs nothing.
+    vvfat is gone -- it cannot present a volume larger than ~516 MB -- so the
+    stick's physical disk is attached instead. `readonly=on` is the whole safety
+    argument for doing that: a raw write behind a mounted host volume corrupts
+    the filesystem rather than a file.
     """
     cli._write_sandbox_launchers(tmp_path)
 
     for name in ("start_sandbox.bat", "start_sandbox.sh"):
         raw = (tmp_path / name).read_text(encoding="utf-8")
-        # Strip comments before matching: these scripts explain in prose why they
-        # avoid sudo and raw devices, and a substring guard that reads the prose
-        # fails on the comment documenting the fix.
-        text = "\n".join(
+        text = chr(10).join(
             ln for ln in raw.splitlines()
             if not ln.lstrip().startswith(("#", "::", "REM ", "rem "))
         )
-        assert "fat:rw:" not in text, (
-            f"{name} mounts the archive writable through vvfat's unreliable write "
-            "path, and a sandbox must not be able to alter the archive"
+        assert "fat:" not in text, (
+            f"{name} still attaches vvfat, which aborts QEMU on this archive"
         )
-        assert "PhysicalDrive" not in text and "sudo" not in text, (
-            f"{name} needs elevation, so the operator must consent to a prompt"
-        )
-        assert "kbb_guest.img" in text, (
-            f"{name} does not boot the self-contained guest image"
-        )
+        device_lines = [
+            ln for ln in text.splitlines()
+            if "-drive" in ln and ("RAW" in ln or "PhysicalDrive" in ln)
+        ]
+        assert device_lines, f"{name} attaches no archive device"
+        for ln in device_lines:
+            assert "readonly=on" in ln, (
+                f"{name} passes the disk through writable: {ln.strip()}"
+            )
+        assert "kbb_guest.img" in text, f"{name} does not boot the guest image"
 
 
 def test_sandbox_launcher_detects_platform(tmp_path):

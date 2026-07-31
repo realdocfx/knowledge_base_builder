@@ -1927,34 +1927,36 @@ def _reorganise_for_sandbox(root: Path, dry_run: bool = False) -> int:
 def _write_sandbox_launchers(root: Path, port: int = 8080) -> None:
     r"""Generate the one-click Mode C launchers.
 
-    Everything the guest needs is on the stick: a finished Alpine filesystem
-    (``kbb_guest.img``) with cage, WebKitGTK, Python, KBB and the Tauri UI already
-    installed. Nothing is fetched from the host and nothing from a network. The
-    portal runs *inside* the guest, so the sandbox contains the server as well as
-    the operator.
+    The guest boots ``kbb_guest.img`` -- a finished Alpine filesystem with cage,
+    WebKitGTK, Python, KBB and the Tauri UI already installed -- and reads the
+    archive from the stick's own block device, passed through raw.
 
-    Two design notes worth keeping, because both were arrived at the hard way.
+    **Why raw passthrough, given it costs a consent dialog.**
 
-    **No elevation.** An earlier launcher self-elevated to hand QEMU
-    ``\\.\PhysicalDriveN``, since QEMU's vvfat cannot present a FAT32 volume with
-    a populated root directory. A UAC dialog is a second action by the operator,
-    which "one click, no additional input" excludes, and it cannot be suppressed
-    on a machine the stick has never been plugged into. The guest image is a plain
-    file, so it needs no privileges at all.
+    The privilege-free route was QEMU's vvfat, and it failed on three measured
+    limits. Two were solved: the root-directory entry cap (content nests under
+    ``library/archive/``) and the 2 GiB per-file ceiling (slices re-cut at
+    1900 MiB). The third ends it -- vvfat synthesises a fixed volume and reports
+    ``Directory does not fit in FAT32 (capacity 516.06 MB)``, with no option to
+    enlarge it. A 130 GB archive will not fit in 516 MB at any setting.
 
-    **The archive does not reach the guest yet, and that is a known gap.**
-    Attaching it as a second read-only vvfat drive was tried and does not work:
-    QEMU aborts with "Too many entries in root directory" before booting anything,
-    on a stick with a few hundred top-level entries. ``fat:32:`` does *not* lift
-    that limit -- QEMU's own warning is that its FAT32 vvfat support is untested.
-    A launcher carrying that drive does not merely lack content, it fails to
-    start, so the drive is not emitted.
+    Passthrough has no such ceiling. QEMU hands the guest the disk, the guest's
+    own kernel reads the FAT32 partition, and total size, file count and per-file
+    size all stop being QEMU's business. The cost is Administrator on Windows and
+    root elsewhere: one dialog, once per launch, and the launcher says why before
+    raising it. A consent prompt with no stated reason teaches people to click
+    through prompts.
 
-    The sandbox therefore comes up with the UI and portal running and an empty
-    library. Closing this needs a data path that is neither vvfat nor raw-device
-    passthrough (which would reintroduce the UAC prompt) -- most likely a second
-    image built at provisioning time, or restructuring the stick so the exposed
-    directory has few root entries.
+    **Two invariants the operator is entitled to.**
+
+    The device is *resolved*, never hardcoded -- a fixed ``PhysicalDrive1`` is
+    correct on the machine it was written on and hands the guest an unrelated disk
+    on the next one. And the passthrough is read-only at both ends: ``readonly=on``
+    on the drive, ``-o ro`` on the guest mount. A stray write to a raw device
+    behind a mounted host volume corrupts the filesystem rather than a file.
+
+    The host-native path (``Launch_KBB.exe``) is untouched and still needs no
+    privileges: it reads the volume the host has already mounted.
     """
     cmdline = (
         "root=/dev/vda rootfstype=ext4 rw "
@@ -1965,9 +1967,24 @@ def _write_sandbox_launchers(root: Path, port: int = 8080) -> None:
     win_lines = [
         "@echo off",
         "SETLOCAL EnableDelayedExpansion",
-        ":: KBB Tactical Sandbox -- one click, no prompts, nothing off the stick.",
-        ":: No elevation: the guest boots a plain image file, not a raw device.",
+        "title KBB Tactical Sandbox",
+        ":: ---------------------------------------------------------------",
+        ":: Raw block passthrough gives the guest the archive. Reading a",
+        ":: physical device requires Administrator on Windows, so this asks",
+        ":: once. The disk is attached READ-ONLY: the sandbox cannot alter",
+        ":: the stick. QEMU's privilege-free vvfat driver was tried first and",
+        ":: cannot carry an archive this large -- it synthesises a fixed",
+        ":: ~516 MB volume.",
+        ":: ---------------------------------------------------------------",
+        "net session >nul 2>&1",
+        "IF ERRORLEVEL 1 (",
+        "    echo [KBB] The sandbox needs Administrator to read the archive",
+        "    echo [KBB] device read-only. Approving the prompt starts KBB.",
+        "    powershell -NoProfile -Command \"Start-Process -FilePath '%~f0' -Verb RunAs\"",
+        "    exit /b",
+        ")",
         'SET "USB=%~dp0"',
+        'SET "DRV=%~d0"',
         'SET "QEMU=%USB%qemu\\win\\qemu-system-x86_64.exe"',
         'SET "FW=%USB%qemu\\win\\share"',
         'IF NOT EXIST "%QEMU%" (',
@@ -1976,28 +1993,32 @@ def _write_sandbox_launchers(root: Path, port: int = 8080) -> None:
         "    exit /b 1",
         ")",
         'IF NOT EXIST "%USB%kbb_guest.img" (',
-        "    echo [!] Guest image missing. Run: kb-builder portable %USB% --with-guest-image",
+        "    echo [!] Guest image missing. Run: kb-builder portable %USB% --guest-image-from DIR",
         "    timeout /t 15 >nul",
         "    exit /b 1",
         ")",
-        ":: snapshot=on is what makes the sandbox amnesic. Without it the guest",
-        ":: root is mounted rw against the real image: state survives reboots and",
-        ":: a compromised guest can permanently alter what the stick boots next.",
-        ":: With it, every write lands in a host temp overlay, discarded on exit.",
-        ":: NOTE: the archive is not attached. QEMU's vvfat driver aborts with",
-        ":: \"Too many entries in root directory\" on a populated stick, and",
-        ":: fat:32: does NOT lift that limit -- QEMU itself warns FAT32 vvfat is",
-        ":: untested. Leaving the drive in made QEMU exit before booting, so the",
-        ":: sandbox starts without archive content until a workable data path",
-        ":: exists. The UI and portal come up; the library will be empty.",
-        ":: -full-screen covers the host desktop for as long as the sandbox runs.",
-        ":: virtio-vga gives the guest a DRM node (cage is a DRM compositor and",
-        ":: exits instantly without one); the input devices are equally required --",
+        ":: Resolve the physical disk backing this drive letter. \\\\.\\X: would be",
+        ":: simpler but the host holds a lock on the mounted volume;",
+        ":: \\\\.\\PhysicalDriveN reads underneath it. Never hardcoded: a fixed",
+        ":: number is correct here and someone else's disk elsewhere.",
+        "FOR /F %%i IN ('powershell -NoProfile -Command \"(Get-Partition -DriveLetter %DRV:~0,1%).DiskNumber\"') DO SET DISKNUM=%%i",
+        'IF "%DISKNUM%"=="" (',
+        "    echo [!] Could not resolve the physical disk for %DRV%.",
+        "    echo [!] Refusing to guess: the wrong disk number would hand the",
+        "    echo [!] sandbox an unrelated device.",
+        "    timeout /t 20 >nul",
+        "    exit /b 1",
+        ")",
+        'SET "RAW=\\\\.\\PhysicalDrive%DISKNUM%"',
+        "echo [KBB] Archive device: %RAW% (read-only)",
+        ":: virtio-vga gives the guest a DRM node -- cage is a DRM compositor and",
+        ":: exits instantly without one. The input devices are equally required:",
         ":: wlroots aborts with \"no input devices\" and takes cage down with it.",
         '"%QEMU%" -L "%FW%" -nodefaults -M q35 -m 3072 -smp 2 ^',
         '    -kernel "%USB%vmlinuz-kbb" -initrd "%USB%initramfs-kbb" ^',
         f'    -append "{cmdline}" ^',
         '    -drive file="%USB%kbb_guest.img",format=raw,if=virtio,snapshot=on ^',
+        '    -drive file=%RAW%,format=raw,if=virtio,readonly=on ^',
         "    -device virtio-vga ^",
         "    -device virtio-keyboard-pci -device virtio-tablet-pci ^",
         "    -full-screen -display sdl,grab-mod=rctrl",
@@ -2008,8 +2029,12 @@ def _write_sandbox_launchers(root: Path, port: int = 8080) -> None:
 
     posix_lines = [
         "#!/bin/sh",
-        "# KBB Tactical Sandbox -- one click, nothing off the stick (Linux/macOS).",
-        "# No sudo: the guest boots a plain image file, not a raw device.",
+        "# KBB Tactical Sandbox (Linux/macOS).",
+        "#",
+        "# Raw block passthrough gives the guest the archive read-only. Reading a",
+        "# block device needs root, so this re-executes under sudo and says so.",
+        "# QEMU's privilege-free vvfat driver cannot carry an archive this large:",
+        "# it synthesises a fixed ~516 MB volume.",
         "set -eu",
         'USB="$(cd "$(dirname "$0")" && pwd)"',
         'case "$(uname -s)" in',
@@ -2020,10 +2045,36 @@ def _write_sandbox_launchers(root: Path, port: int = 8080) -> None:
         'QEMU="$USB/qemu/$PLAT/qemu-system-x86_64"',
         '[ -x "$QEMU" ] || { echo "[!] QEMU missing: $QEMU"; exit 1; }',
         '[ -f "$USB/kbb_guest.img" ] || { echo "[!] Guest image missing"; exit 1; }',
+        "",
+        "# Resolve the block device backing this mount point. Never hardcoded.",
+        'RAWDEV=""',
+        "if command -v findmnt >/dev/null 2>&1; then",
+        '    RAWDEV="$(findmnt -no SOURCE --target "$USB" 2>/dev/null || true)"',
+        "elif command -v diskutil >/dev/null 2>&1; then",
+        '    RAWDEV="$(diskutil info "$USB" 2>/dev/null | awk \'/Device Node/{print $NF}\')"',
+        "fi",
+        'if [ -z "$RAWDEV" ] || [ ! -e "$RAWDEV" ]; then',
+        '    echo "[!] Could not resolve the block device for $USB."',
+        '    echo "[!] Refusing to guess: the wrong device would hand the sandbox"',
+        '    echo "[!] an unrelated disk."',
+        "    exit 1",
+        "fi",
+        "",
+        '# Whole disk, not the partition: the guest reads the partition table and',
+        "# mounts the first partition itself, which matches the Windows path.",
+        'RAWDISK="$(echo "$RAWDEV" | sed -E \'s/(p?[0-9]+)$//\')"',
+        '[ -e "$RAWDISK" ] || RAWDISK="$RAWDEV"',
+        "",
+        'if [ "$(id -u)" -ne 0 ]; then',
+        '    echo "[KBB] The sandbox needs root to read $RAWDISK read-only."',
+        '    exec sudo -- "$0" "$@"',
+        "fi",
+        'echo "[KBB] Archive device: $RAWDISK (read-only)"',
         'exec "$QEMU" -L "$USB/qemu/$PLAT/share" -nodefaults -M q35 -m 3072 -smp 2 \\',
         '    -kernel "$USB/vmlinuz-kbb" -initrd "$USB/initramfs-kbb" \\',
         f'    -append "{cmdline}" \\',
         '    -drive file="$USB/kbb_guest.img",format=raw,if=virtio,snapshot=on \\',
+        '    -drive file="$RAWDISK",format=raw,if=virtio,readonly=on \\',
         "    -device virtio-vga \\",
         "    -device virtio-keyboard-pci -device virtio-tablet-pci \\",
         "    -full-screen -display sdl,grab-mod=rctrl",
@@ -2033,38 +2084,32 @@ def _write_sandbox_launchers(root: Path, port: int = 8080) -> None:
     sh.chmod(0o755)
 
     console.print(
-        "[bold green]Sandbox launchers generated (self-contained, no elevation).[/bold green]"
+        "[bold green]Sandbox launchers generated (raw archive passthrough, read-only).[/bold green]"
     )
 
 
 # Services the guest needs, by runlevel.
 #
+# `root` remounts / read-write and must come first. The initramfs mounts the root
+# read-only regardless of `rw` on the kernel cmdline, and nothing else undoes
+# that: the portal then cannot write its state and dies before printing a single
+# line, which looks exactly like a portal that never started.
+#
 # `udev-trigger` is the one that is easy to miss and expensive to diagnose.
 # Without it udev never coldplugs, so devices that already existed when udev
 # started are never tagged in the udev database. libinput enumerates through
 # libudev, finds nothing, and wlroots refuses to start -- while dmesg plainly
-# shows "QEMU Virtio Keyboard ... input4". The compositor's error message
-# ("no input devices") describes the udev view, not the kernel's.
+# shows "QEMU Virtio Keyboard ... input4".
 #
 # `mdev` must NOT be here. Alpine ships either mdev or udev, never both: two
-# device managers race over /dev, and the one that loses leaves libinput reading
-# a database nobody populated. `setup-devd udev` removes mdev for this reason.
+# device managers race over /dev, and the loser leaves libinput reading a
+# database nobody populated.
 #
-# `networking` is what brings `lo` up. Its absence is not a networking problem --
-# it means the guest cannot reach its own portal, and the symptom is a bind
-# failing with "[Errno 99] address not available", which reads like a port
-# conflict.
+# `networking` brings `lo` up. Its absence is not a networking problem -- it
+# means the guest cannot reach its own portal, and the symptom is a bind failing
+# with "[Errno 99] address not available", which reads like a port conflict.
 GUEST_RUNLEVELS = {
     "sysinit": ("devfs", "dmesg", "udev", "udev-trigger", "udev-settle", "hwdrivers"),
-    # `root` remounts / read-write and must come first. The initramfs mounts the
-    # root read-only regardless of `rw` on the kernel cmdline, and nothing else
-    # undoes that: the portal then cannot write its state and dies before
-    # printing a single line, which looks exactly like a portal that never
-    # started. Confirmed from inside the guest --
-    # "/bin/sh: can't create /tmp/p.log: Read-only file system".
-    #
-    # This does not weaken the sandbox: the drive is attached snapshot=on, so
-    # every write goes to a host-side temporary overlay and is discarded on exit.
     "boot": ("root", "modules", "sysctl", "hostname", "bootmisc", "syslog",
              "networking"),
     "default": ("dbus", "seatd", "local", "kbb-kiosk"),
@@ -2183,14 +2228,13 @@ def _guest_init_files() -> Dict[str, str]:
         '        || kbb_log "no archive attached; UI will start without content"\n'
         '\n'
         '    # The portal, from the guest image if the stick did not supply one.\n'
-        '    # Content lives under library/ so the drive root stays small enough for\n'
-        '    # QEMU vvfat to present it at all. Fall back to the mount point itself\n'
-        '    # for drives provisioned before that layout existed.\n'
-        '    if [ -d "$KBB_DATA/library" ]; then\n'
-        '        KBB_BUCKET="$KBB_DATA/library"\n'
-        '    else\n'
-        '        KBB_BUCKET="$KBB_DATA"\n'
-        '    fi\n'
+        '    # Raw passthrough mounts the whole stick partition here, so content is\n'
+        '    # at library/archive. Earlier layouts put it at library/ or at the\n'
+        '    # mount point itself, and a drive provisioned before either change must\n'
+        '    # still serve rather than present an empty library.\n'
+        '    for cand in "$KBB_DATA/library/archive" "$KBB_DATA/library" "$KBB_DATA"; do\n'
+        '        [ -d "$cand" ] && KBB_BUCKET="$cand" && break\n'
+        '    done\n'
         '    kbb_log "bucket: $KBB_BUCKET"\n'
         '\n'
         '    KBB_PY=""\n'
