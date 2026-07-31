@@ -406,7 +406,7 @@ jobs:
           # block device as a regular file of its true size. Validated end to end
           # by the fuse-zim job before this image is ever booted.
           docker run --rm -v "$PWD:/work" -w /work alpine:3.20 sh -eux -c '
-            apk add --no-cache build-base fuse3-dev pkgconf
+            apk add --no-cache build-base fuse3-dev pkgconf linux-headers
             cc -O2 -Wall guest/kbb_blkfuse.c -o /work/kbb-blkfuse \
               $(pkg-config fuse3 --cflags --libs)
             file /work/kbb-blkfuse
