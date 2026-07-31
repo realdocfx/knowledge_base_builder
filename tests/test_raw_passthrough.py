@@ -315,68 +315,36 @@ def test_qemu_own_errors_are_captured_too(launchers):
         )
 
 
-def test_runtime_is_cached_before_the_volume_is_dismounted(launchers):
-    """Raw access to a mounted volume blocks, so D: must be dismounted -- but the
-    launcher reads its kernel, initramfs and guest image FROM D:.
+def test_the_launcher_never_alters_host_volume_state(launchers):
+    """Starting a sandbox must not change how the host mounts its own disks.
 
-    Windows holds the mounted volume, so the guest's virtio_blk probe against
-    \\.\PhysicalDriveN never returns: no error from QEMU, no virtio_blk at all
-    (not even the guest image), and a boot frozen before the disks appear.
-    Dismounting releases it -- and makes the boot files unreachable at the same
-    moment.
+    A previous version dismounted the stick to get exclusive raw access. It used
+    `mountvol /P`, which does not merely remove the mount point -- it marks the
+    volume NOT MOUNTABLE, and that state survives unplugging. The operator's
+    stick disappeared and did not return when replugged; recovering it meant
+    identifying volume GUIDs by hand from an elevated shell.
 
-    So they are cached off the stick first. The cache is re-derivable from the
-    stick, so this is not a host dependency in the sense that matters; it is a
-    copy that must exist before the volume goes away.
+    The cost of being wrong here is not a failed launch, it is a drive the
+    operator can no longer reach, on hardware carrying the only copy of their
+    archive. Nothing about running a sandbox justifies that risk, so the launcher
+    may read devices and must never reconfigure them. Reading a raw device is
+    permitted; changing the host's mount table is not.
     """
-    bat = launchers["start_sandbox.bat"]
-    code = _code(bat)
-    assert "Remove-PartitionAccessPath" in code, (
-        "the volume is never detached, so raw device reads block and the guest "
-        "hangs before enumerating any disk"
-    )
-    cache = code.index("CACHE")
-    dismount = code.index("Remove-PartitionAccessPath")
-    assert cache < dismount, (
-        "the runtime is cached after the volume is dismounted, by which time the "
-        "files it copies are unreachable"
-    )
-
-
-def test_the_volume_is_restored_afterwards(launchers):
-    """Taking D: away is acceptable for the session, not permanently."""
-    bat = launchers["start_sandbox.bat"]
-    code = _code(bat)
-    assert "Remove-PartitionAccessPath" in code, "the drive letter is never removed"
-    assert "Add-PartitionAccessPath" in code, (
-        "the drive letter is removed and never restored; the stick would stay "
-        "missing after the sandbox exits"
-    )
-    # `mountvol /P` is specifically forbidden: it also marks the volume NOT
-    # MOUNTABLE, and that survives unplugging. A stick detached that way does not
-    # return when replugged -- which is exactly what happened in the field.
-    assert "/P" not in code, (
-        "mountvol /P marks the volume unmountable; the stick will not come back "
-        "on replug and the operator is left hunting volume GUIDs"
-    )
-
-
-def test_a_failed_dismount_aborts_rather_than_hanging(launchers):
-    """Proceeding with the volume still mounted reproduces the original hang.
-
-    That failure has no error anywhere: QEMU says nothing, the guest enumerates
-    no disks at all, and the boot freezes before virtio_blk. Checking the
-    dismount converts a silent hang into a sentence the operator can act on.
-    """
-    code = _code(launchers["start_sandbox.bat"])
-    idx = code.index("Remove-PartitionAccessPath")
-    after = code[idx:idx + 900]
-    assert "ERRORLEVEL" in after, (
-        "the dismount result is never checked; a locked volume would hand the "
-        "guest a device whose probe never returns"
-    )
-    assert "exit /b 1" in after, "a failed dismount does not abort"
-    assert "Add-PartitionAccessPath" in after, (
-        "the drive letter is not restored on the abort path, leaving the stick "
-        "missing after a failure"
-    )
+    forbidden = {
+        "mountvol": "removes or invalidates volume mount points",
+        "Remove-PartitionAccessPath": "removes the drive letter",
+        "Add-PartitionAccessPath": "implies something removed it",
+        "Set-Partition": "alters partition attributes",
+        "diskpart": "scriptable partition manipulation",
+        "Clear-Disk": "destroys partitioning",
+        "Format-Volume": "destroys data",
+        "Set-Disk": "alters disk attributes",
+    }
+    for name, body in launchers.items():
+        code = _code(body)
+        for token in forbidden:
+            assert token not in code, (
+                f"{name} calls {token!r} ({forbidden[token]}). The launcher must "
+                "not reconfigure host storage: a mistake there costs the operator "
+                "their drive, not just their sandbox."
+            )
