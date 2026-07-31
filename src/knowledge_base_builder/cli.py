@@ -2032,7 +2032,7 @@ def _write_sandbox_launchers(root: Path, port: int = 8080) -> None:
         "    -device virtio-vga ^",
         "    -device virtio-keyboard-pci -device virtio-tablet-pci ^",
         r'    -serial file:"%TEMP%\kbb_sandbox.log" ^',
-        "    -full-screen -display sdl,grab-mod=rctrl",
+        '    -full-screen -display sdl,grab-mod=rctrl 2>"%TEMP%\kbb_qemu.log"',
     ]
     bat = root / "start_sandbox.bat"
     bat.write_bytes(("\r\n".join(win_lines) + "\r\n").encode("utf-8"))
@@ -2089,7 +2089,7 @@ def _write_sandbox_launchers(root: Path, port: int = 8080) -> None:
         "    -device virtio-vga \\",
         "    -device virtio-keyboard-pci -device virtio-tablet-pci \\",
         '    -serial file:"${TMPDIR:-/tmp}/kbb_sandbox.log" \\',
-        "    -full-screen -display sdl,grab-mod=rctrl",
+        '    -full-screen -display sdl,grab-mod=rctrl 2>"${TMPDIR:-/tmp}/kbb_qemu.log"',
     ]
     sh = root / "start_sandbox.sh"
     sh.write_bytes(("\n".join(posix_lines) + "\n").encode("utf-8"))

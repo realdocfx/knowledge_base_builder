@@ -295,3 +295,21 @@ def test_the_console_is_routed_to_the_recorder(launchers):
             f"serial is not the last console=, so /dev/console is the VGA and the "
             f"kiosk markers never reach the file: {consoles}"
         )
+
+
+def test_qemu_own_errors_are_captured_too(launchers):
+    """The guest console is only half the story.
+
+    A device that QEMU cannot open is reported by QEMU, not by the guest -- the
+    guest simply sees no disk. That happened: the boot stalled at "Mounting root"
+    with no virtio_blk lines at all, and the serial log could not say why because
+    QEMU's own diagnostics went to a console window nobody was reading.
+
+    Recording the guest without recording the hypervisor leaves exactly this gap.
+    """
+    for name, body in launchers.items():
+        code = _code(body)
+        assert "kbb_qemu.log" in code, (
+            f"{name} does not capture QEMU's own stderr; a device it cannot open "
+            "produces a guest that sees no disk and no explanation anywhere"
+        )
