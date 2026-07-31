@@ -313,3 +313,66 @@ def test_qemu_own_errors_are_captured_too(launchers):
             f"{name} does not capture QEMU's own stderr; a device it cannot open "
             "produces a guest that sees no disk and no explanation anywhere"
         )
+
+
+def test_runtime_is_cached_before_the_volume_is_dismounted(launchers):
+    """Raw access to a mounted volume blocks, so D: must be dismounted -- but the
+    launcher reads its kernel, initramfs and guest image FROM D:.
+
+    Windows holds the mounted volume, so the guest's virtio_blk probe against
+    \\.\PhysicalDriveN never returns: no error from QEMU, no virtio_blk at all
+    (not even the guest image), and a boot frozen before the disks appear.
+    Dismounting releases it -- and makes the boot files unreachable at the same
+    moment.
+
+    So they are cached off the stick first. The cache is re-derivable from the
+    stick, so this is not a host dependency in the sense that matters; it is a
+    copy that must exist before the volume goes away.
+    """
+    bat = launchers["start_sandbox.bat"]
+    code = _code(bat)
+    assert "mountvol" in code, (
+        "the volume is never dismounted, so raw device reads block and the guest "
+        "hangs before enumerating any disk"
+    )
+    cache = code.index("CACHE")
+    dismount = code.index("mountvol")
+    assert cache < dismount, (
+        "the runtime is cached after the volume is dismounted, by which time the "
+        "files it copies are unreachable"
+    )
+
+
+def test_the_volume_is_restored_afterwards(launchers):
+    """Taking D: away is acceptable for the session, not permanently."""
+    bat = launchers["start_sandbox.bat"]
+    code = _code(bat)
+    assert code.count("mountvol") >= 2, (
+        "the drive letter is removed and never restored; D: would stay missing "
+        "after the sandbox exits"
+    )
+    assert "VOLID" in code or "/L" in code, (
+        "no volume identity is captured before dismounting, so nothing can put "
+        "the drive letter back"
+    )
+
+
+def test_a_failed_dismount_aborts_rather_than_hanging(launchers):
+    """Proceeding with the volume still mounted reproduces the original hang.
+
+    That failure has no error anywhere: QEMU says nothing, the guest enumerates
+    no disks at all, and the boot freezes before virtio_blk. Checking the
+    dismount converts a silent hang into a sentence the operator can act on.
+    """
+    code = _code(launchers["start_sandbox.bat"])
+    idx = code.index("mountvol %DRV% /P")
+    after = code[idx:idx + 600]
+    assert "ERRORLEVEL" in after, (
+        "the dismount result is never checked; a locked volume would hand the "
+        "guest a device whose probe never returns"
+    )
+    assert "exit /b 1" in after, "a failed dismount does not abort"
+    assert "mountvol %DRV% %VOLID%" in after, (
+        "the drive letter is not restored on the abort path, leaving the volume "
+        "missing after a failure"
+    )
