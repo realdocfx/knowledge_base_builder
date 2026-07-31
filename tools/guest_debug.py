@@ -75,13 +75,16 @@ def boot(stick: Path, port: int, extra_drives=()) -> subprocess.Popen:
     ]
     # virtio-scsi rather than one virtio-blk per file: a single controller
     # addresses many disks, where virtio-blk would exhaust PCI slots long before
-    # a multi-slice archive is fully attached.
-    # virtio-blk, not virtio-scsi: the guest initramfs is built with the `virtio`
-    # feature, which carries virtio_blk but not virtio_scsi or sd_mod, so SCSI
-    # disks are attached by QEMU and simply never appear in the guest.
-    for n, path in enumerate(extra_drives):
-        args += ["-drive",
-                 f"file={path},format=raw,if=virtio,readonly=on,index={n + 1}"]
+    # a multi-slice archive is fully attached. The guest loads virtio_scsi +
+    # sd_mod post-boot (they are not in the initramfs).
+    if extra_drives:
+        args += ["-device", "virtio-scsi-pci,id=scsi0"]
+        for n, path in enumerate(extra_drives):
+            drive_id = f"zim{n}"
+            args += [
+                "-drive", f"file={path},format=raw,if=none,id={drive_id},readonly=on",
+                "-device", f"scsi-hd,drive={drive_id},bus=scsi0.0,scsi-id={n + 1},lun=0",
+            ]
     env = dict(os.environ, MSYS2_ARG_CONV_EXCL="*")
     return subprocess.Popen(args, env=env,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

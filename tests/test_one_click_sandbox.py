@@ -70,26 +70,20 @@ def _primary(launchers: dict) -> str:
 # ---------------------------------------------------------------------------
 # One click
 # ---------------------------------------------------------------------------
-def test_elevation_happens_once_and_says_why(launchers):
-    """The no-prompt requirement was traded, deliberately, for the archive.
+def test_no_elevation_required(launchers):
+    """File-backed SCSI drives use normal cached file handles -- no admin needed.
 
-    This guard used to assert the opposite. Removing the prompt was right while a
-    privilege-free data path looked possible; QEMU's vvfat turned out to cap the
-    synthesised volume at ~516 MB, so a 130 GB archive cannot pass through it at
-    any setting. The remaining route reads the physical device, which needs
-    Administrator.
-
-    What must not regress is *how* the prompt behaves: raised once, before
-    anything else happens, with the reason stated. A consent dialog that appears
-    with no explanation teaches operators to approve dialogs.
+    Raw ``\\\\.\\PhysicalDriveN`` passthrough required Administrator because
+    Windows owns the mounted volume. File-backed drives read through a normal
+    file handle, so elevation is gone entirely. A consent dialog that appears
+    for no reason teaches operators to approve dialogs.
     """
     body = _primary(launchers)
-    assert "RunAs" in body, "no elevation path; the archive would be unreachable"
-    assert body.count("RunAs") == 1, (
-        "elevation is requested more than once; the operator should see one prompt"
+    assert "RunAs" not in body, (
+        "the launcher still self-elevates; file-backed drives need no admin"
     )
-    assert re.search(r"archive|read-only", body, re.I), (
-        "the operator is asked to elevate with no stated reason"
+    assert "net session" not in body, (
+        "the launcher checks for admin privileges it no longer needs"
     )
 
 
@@ -125,17 +119,23 @@ def test_guest_has_a_framebuffer(launchers):
     )
 
 
-def test_the_data_path_is_the_physical_device(launchers):
-    """vvfat cannot carry this archive; the block device can.
+def test_the_data_path_is_file_backed_scsi(launchers):
+    """File-backed SCSI drives replace raw passthrough.
 
-    Three vvfat limits were measured: root-directory entries (solvable by
-    nesting), 2 GiB per file (solvable by re-slicing), and a fixed ~516 MB
-    synthesised volume (not solvable at all). Passthrough has no ceiling because
-    the guest's own kernel reads the partition.
+    Raw ``\\\\.\\PhysicalDriveN`` passthrough is dead: QEMU blocks in an
+    uninterruptible driver read because Windows owns the mounted volume.
+    File-backed drives use a normal cached file handle -- no admin, no block
+    passthrough, and no 2 GB limit (that was vvfat's).
     """
     body = _primary(launchers)
-    assert "PhysicalDrive" in body, (
-        "no physical device attached, so the guest boots with an empty library"
+    assert "PhysicalDrive" not in body, (
+        "raw block passthrough is dead; drives must be file-backed"
+    )
+    assert "virtio-scsi-pci" in body, (
+        "no virtio-scsi controller; SCSI disks cannot appear in the guest"
+    )
+    assert "scsi-hd" in body, (
+        "no scsi-hd devices; ZIM slices are not attached"
     )
 
 

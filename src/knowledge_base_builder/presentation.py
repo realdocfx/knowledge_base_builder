@@ -57,7 +57,10 @@ def discover_archives(root: Path) -> List[Tuple[str, Path]]:
     seen: Dict[str, Path] = {}
     for pattern in ("*.zim", "*.zim??"):
         for p in root.glob(pattern):
-            if not p.is_file():
+            # In the QEMU sandbox, ZIM slices are symlinks to /dev/sdX block
+            # devices. is_file() returns False for block devices (even through
+            # symlinks), so also accept block devices.
+            if not (p.is_file() or p.is_block_device()):
                 continue
             logical = _logical_zim_path(p)
             if logical.name not in seen:
@@ -75,7 +78,7 @@ def discover_archives(root: Path) -> List[Tuple[str, Path]]:
             size = sum(
                 part.stat().st_size
                 for part in root.glob(logical.stem + ".zim*")
-                if part.is_file()
+                if part.is_file() or part.is_block_device()
             )
         display = f"{logical.stem} ({_format_bytes(size)})"
         archives.append((display, logical))

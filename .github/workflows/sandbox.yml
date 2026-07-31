@@ -400,6 +400,19 @@ jobs:
           # through sudo instead.
           sudo install -Dm755 ui/launch_kbb rootfs/usr/local/bin/launch_kbb
 
+          # Compile kbb-blkfuse against the guest's own libfuse3, inside the
+          # Alpine/musl container, so the binary matches the image it ships in.
+          # This is what lets libzim read the ZIM slices: it presents each SCSI
+          # block device as a regular file of its true size. Validated end to end
+          # by the fuse-zim job before this image is ever booted.
+          docker run --rm -v "$PWD:/work" -w /work alpine:3.20 sh -eux -c '
+            apk add --no-cache build-base fuse3-dev pkgconf
+            cc -O2 -Wall guest/kbb_blkfuse.c -o /work/kbb-blkfuse \
+              $(pkg-config fuse3 --cflags --libs)
+            file /work/kbb-blkfuse
+          '
+          sudo install -Dm755 kbb-blkfuse rootfs/usr/local/bin/kbb-blkfuse
+
           # Generate the guest's init config from the shipping code path rather
           # than restating it in YAML, so CI exercises the same bytes the
           # provisioner writes. sudo -E with an explicit interpreter, because

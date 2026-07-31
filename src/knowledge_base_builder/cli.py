@@ -114,14 +114,12 @@ GUEST_WORLD = (
     "util-linux",     # agetty, for the single autologin TTY
     "eudev",
     "dbus",
-    # The head.
-    # device-mapper concatenates the archive slices back into one device.
-    # QEMU's vvfat cannot carry a file above 2 GB, but a raw virtio-blk attach has
-    # no size limit at all -- measured: a 4,089,446,400-byte slice appears in the
-    # guest at full size. So slices are attached as block devices and joined with
-    # dm-linear, which is a mapping rather than a copy: no space, no time, no
-    # second copy of a 51 GB archive.
-    "device-mapper",
+    # ZIM delivery. Each archive slice reaches the guest as a file-backed SCSI
+    # disk -- zero-copy, no admin. But libzim cannot read a block device (it sizes
+    # with fstat(), which returns 0 for a device), so kbb-blkfuse presents each
+    # device as a regular file of its true size and kiwix-serve reads that.
+    "fuse3",          # libfuse3, for kbb-blkfuse (compiled into the image)
+    "kiwix-tools",    # the Linux kiwix-serve the portal proxies to
     "cage",           # single-surface Wayland kiosk: no taskbar, no switcher
     "seatd",          # cage needs a seat manager to claim the DRM device
     "webkit2gtk",     # Tauri's renderer on Linux
@@ -1924,39 +1922,74 @@ def _reorganise_for_sandbox(root: Path, dry_run: bool = False) -> int:
     return moved
 
 
+def _enumerate_zim_slices(root: Path) -> list:
+    """Find every ZIM file and split-archive slice under the archive directory.
+
+    Returns a sorted list of ``(filename, full_path)`` tuples. The archive
+    directory is resolved with the same cascade the kiosk uses: ``library/archive``
+    first, then ``library``, then the root itself.
+    """
+    for cand in (
+        root / LIBRARY_DIR / ARCHIVE_SUBDIR,
+        root / LIBRARY_DIR,
+        root,
+    ):
+        if cand.is_dir():
+            archive_dir = cand
+            break
+    else:
+        return []
+
+    import re as _re
+
+    slices = []
+    for p in sorted(archive_dir.iterdir()):
+        if not p.is_file():
+            continue
+        # Match .zim (single file) and .zimaa/.zimab/... (split slices)
+        if _re.match(r"\.zim([a-z]{2})?$", p.suffix):
+            slices.append((p.name, p))
+    return slices
+
+
 def _write_sandbox_launchers(root: Path, port: int = 8080) -> None:
     r"""Generate the one-click Mode C launchers.
 
     The guest boots ``kbb_guest.img`` -- a finished Alpine filesystem with cage,
     WebKitGTK, Python, KBB and the Tauri UI already installed -- and reads the
-    archive from the stick's own block device, passed through raw.
+    ZIM archive from file-backed SCSI drives.
 
-    **Why raw passthrough, given it costs a consent dialog.**
+    **Why file-backed SCSI, not raw passthrough or vvfat.**
 
-    The privilege-free route was QEMU's vvfat, and it failed on three measured
-    limits. Two were solved: the root-directory entry cap (content nests under
-    ``library/archive/``) and the 2 GiB per-file ceiling (slices re-cut at
-    1900 MiB). The third ends it -- vvfat synthesises a fixed volume and reports
-    ``Directory does not fit in FAT32 (capacity 516.06 MB)``, with no option to
-    enlarge it. A 130 GB archive will not fit in 516 MB at any setting.
+    Raw ``\\.\PhysicalDriveN`` passthrough is dead. QEMU blocks in an
+    uninterruptible driver read because Windows owns the mounted volume.
+    ``cache=none,aio=threads`` is racy -- works warm, hangs after a write to
+    the stick. The standard fix (lock+dismount) makes the stick disappear.
+    vvfat caps the synthesised volume at ~516 MB.
 
-    Passthrough has no such ceiling. QEMU hands the guest the disk, the guest's
-    own kernel reads the FAT32 partition, and total size, file count and per-file
-    size all stop being QEMU's business. The cost is Administrator on Windows and
-    root elsewhere: one dialog, once per launch, and the launcher says why before
-    raising it. A consent prompt with no stated reason teaches people to click
-    through prompts.
+    File-backed drives work: ``-drive file=<slice.zim>,format=raw`` uses a
+    normal cached Windows file handle -- no admin, no block passthrough, no
+    copy, and no 2 GB limit (that was vvfat's).
 
-    **Two invariants the operator is entitled to.**
+    **The architecture.**
 
-    The device is *resolved*, never hardcoded -- a fixed ``PhysicalDrive1`` is
-    correct on the machine it was written on and hands the guest an unrelated disk
-    on the next one. And the passthrough is read-only at both ends: ``readonly=on``
-    on the drive, ``-o ro`` on the guest mount. A stray write to a raw device
-    behind a mounted host volume corrupts the filesystem rather than a file.
+    Each ZIM slice is attached as a read-only disk on a single
+    ``virtio-scsi-pci`` controller (one controller, up to 256 targets;
+    ``virtio-blk`` would exhaust ~28 PCI slots). A **manifest disk** at SCSI
+    target 0 tells the guest which ``/dev/sdX`` maps to which ``.zimaa`` /
+    ``.zimab`` filename. The guest loads ``virtio_scsi`` + ``sd_mod``
+    post-boot, reads the manifest, and symlinks the slices into a tmpfs bucket
+    that kiwix-serve and the portal can access.
 
+    **No elevation required.**  File-backed drives use a normal file handle.
     The host-native path (``Launch_KBB.exe``) is untouched and still needs no
-    privileges: it reads the volume the host has already mounted.
+    privileges either.
+
+    **Hard limit that remains:** directory trees (small content in many dirs)
+    cannot be file-backed -- a directory is not a block device. That needs
+    9p/virtiofs (unavailable on Windows QEMU builds) or a filesystem image.
+    The sandbox serves ZIMs zero-copy; small-content directories need a
+    separate decision.
     """
     cmdline = (
         "root=/dev/vda rootfstype=ext4 rw "
@@ -1969,27 +2002,30 @@ def _write_sandbox_launchers(root: Path, port: int = 8080) -> None:
         f"kbb_mode=qemu kbb_port={port}"
     )
 
+    # -----------------------------------------------------------------
+    # Windows launcher (.bat)
+    # -----------------------------------------------------------------
+    # The batch script uses PowerShell to enumerate ZIM slices at runtime,
+    # generate a manifest file, and build the SCSI drive arguments. This is
+    # dynamic rather than static so content added after provisioning is picked
+    # up without re-running `kb-builder portable`.
+    #
+    # The PowerShell block writes two temp files:
+    #   %TEMP%\kbb_manifest.bin  -- text manifest padded to 512 bytes (one sector)
+    #   %TEMP%\kbb_drives.cfg    -- single-line QEMU drive/device arguments
     win_lines = [
         "@echo off",
         "SETLOCAL EnableDelayedExpansion",
         "title KBB Tactical Sandbox",
         ":: ---------------------------------------------------------------",
-        ":: Raw block passthrough gives the guest the archive. Reading a",
-        ":: physical device requires Administrator on Windows, so this asks",
-        ":: once. The disk is attached READ-ONLY: the sandbox cannot alter",
-        ":: the stick. QEMU's privilege-free vvfat driver was tried first and",
-        ":: cannot carry an archive this large -- it synthesises a fixed",
-        ":: ~516 MB volume.",
+        ":: File-backed SCSI drives give the guest each ZIM slice as a",
+        ":: read-only disk. No admin elevation is needed: QEMU reads the",
+        ":: files with a normal cached Windows file handle. A single",
+        ":: virtio-scsi controller carries up to 256 targets; a manifest",
+        ":: disk at SCSI target 0 tells the guest which /dev/sdX maps to",
+        ":: which .zimaa/.zimab filename.",
         ":: ---------------------------------------------------------------",
-        "net session >nul 2>&1",
-        "IF ERRORLEVEL 1 (",
-        "    echo [KBB] The sandbox needs Administrator to read the archive",
-        "    echo [KBB] device read-only. Approving the prompt starts KBB.",
-        "    powershell -NoProfile -Command \"Start-Process -FilePath '%~f0' -Verb RunAs\"",
-        "    exit /b",
-        ")",
         'SET "USB=%~dp0"',
-        'SET "DRV=%~d0"',
         'SET "QEMU=%USB%qemu\\win\\qemu-system-x86_64.exe"',
         'SET "FW=%USB%qemu\\win\\share"',
         'IF NOT EXIST "%QEMU%" (',
@@ -2002,37 +2038,88 @@ def _write_sandbox_launchers(root: Path, port: int = 8080) -> None:
         "    timeout /t 15 >nul",
         "    exit /b 1",
         ")",
-        ":: Resolve the physical disk backing this drive letter. \\\\.\\X: would be",
-        ":: simpler but the host holds a lock on the mounted volume;",
-        ":: \\\\.\\PhysicalDriveN reads underneath it. Never hardcoded: a fixed",
-        ":: number is correct here and someone else's disk elsewhere.",
-        "FOR /F %%i IN ('powershell -NoProfile -Command \"(Get-Partition -DriveLetter %DRV:~0,1%).DiskNumber\"') DO SET DISKNUM=%%i",
-        'IF "%DISKNUM%"=="" (',
-        "    echo [!] Could not resolve the physical disk for %DRV%.",
-        "    echo [!] Refusing to guess: the wrong disk number would hand the",
-        "    echo [!] sandbox an unrelated device.",
-        "    timeout /t 20 >nul",
-        "    exit /b 1",
-        ")",
-        'SET "RAW=\\\\.\\PhysicalDrive%DISKNUM%"',
-        "echo [KBB] Archive device: %RAW% (read-only)",
+        "",
+        ":: Enumerate ZIM slices and write two temp files:",
+        "::   kbb_manifest.bin  - V2 manifest for the guest (SCSI target 0):",
+        "::                       'KBB_MANIFEST_V2' then '<target> <name> <size>'.",
+        "::   kbb_drives.cfg    - a QEMU -readconfig file, NOT an inline arg list.",
+        ":: -readconfig is mandatory: 59 slices of drive+device args are ~9700",
+        ":: characters, past cmd.exe's 8191 limit, so an inline expansion would be",
+        ":: silently truncated into a broken command. A config file has no limit.",
+        ":: The size is the TRUE file size: libzim reads a ZIM's MD5 from the last",
+        ":: 16 bytes, QEMU pads the disk up to 512, and kbb-blkfuse needs the exact",
+        ":: size to hide that padding.",
+        r'SET "MANIFEST=%TEMP%\kbb_manifest.bin"',
+        r'SET "DRIVECFG=%TEMP%\kbb_drives.cfg"',
+        'powershell -NoProfile -ExecutionPolicy Bypass -Command "& {',
+        "    $usb = $env:USB",
+        "    $archive = $null",
+        "    foreach ($d in @(",
+        "        (Join-Path $usb 'library\\archive'),",
+        "        (Join-Path $usb 'library'),",
+        "        $usb",
+        "    )) { if (Test-Path $d -PathType Container) { $archive = $d; break } }",
+        "    if (-not $archive) { exit }",
+        "    $slices = @(Get-ChildItem $archive -File |",
+        "        Where-Object { $_.Name -match '\\.zim([a-z]{2})?$' } |",
+        "        Sort-Object Name)",
+        "    if ($slices.Count -eq 0) {",
+        "        Write-Host '[KBB] No ZIM slices found; booting without content'",
+        "        Remove-Item $env:DRIVECFG -ErrorAction SilentlyContinue",
+        "        exit",
+        "    }",
+        "    $manifest = @('KBB_MANIFEST_V2')",
+        "    $cfg = @('[device \"\"scsi0\"\"]', '  driver = \"\"virtio-scsi-pci\"\"', '')",
+        "    $n = 0",
+        "    foreach ($s in $slices) {",
+        "        $n++",
+        "        $manifest += \"$n $($s.Name) $($s.Length)\"",
+        "        $f = ($s.FullName -replace '\\\\','/')",
+        "        $cfg += \"[drive \"\"zim$n\"\"]\"",
+        "        $cfg += \"  file = \"\"$f\"\"\"",
+        "        $cfg += '  format = \"\"raw\"\"'",
+        "        $cfg += '  if = \"\"none\"\"'",
+        "        $cfg += '  readonly = \"\"on\"\"'",
+        "        $cfg += \"[device \"\"zim${n}d\"\"]\"",
+        "        $cfg += '  driver = \"\"scsi-hd\"\"'",
+        "        $cfg += \"  drive = \"\"zim$n\"\"\"",
+        "        $cfg += '  bus = \"\"scsi0.0\"\"'",
+        "        $cfg += \"  scsi-id = \"\"$n\"\"\"",
+        "        $cfg += '  lun = \"\"0\"\"'",
+        "        $cfg += ''",
+        "    }",
+        "    $raw = ($manifest -join \"`n\").PadRight(8192, [char]0)",
+        "    [System.IO.File]::WriteAllBytes($env:MANIFEST,",
+        "        [System.Text.Encoding]::ASCII.GetBytes($raw))",
+        "    $mf = ($env:MANIFEST -replace '\\\\','/')",
+        "    $cfg += '[drive \"\"manifest\"\"]'",
+        "    $cfg += \"  file = \"\"$mf\"\"\"",
+        "    $cfg += '  format = \"\"raw\"\"'",
+        "    $cfg += '  if = \"\"none\"\"'",
+        "    $cfg += '  readonly = \"\"on\"\"'",
+        "    $cfg += '[device \"\"manifestd\"\"]'",
+        "    $cfg += '  driver = \"\"scsi-hd\"\"'",
+        "    $cfg += '  drive = \"\"manifest\"\"'",
+        "    $cfg += '  bus = \"\"scsi0.0\"\"'",
+        "    $cfg += '  scsi-id = \"\"0\"\"'",
+        "    $cfg += '  lun = \"\"0\"\"'",
+        "    ($cfg -join \"`n\") | Set-Content $env:DRIVECFG -Encoding ASCII",
+        "    Write-Host \"[KBB] $n ZIM slice(s) from $archive (no admin required)\"",
+        '}"',
+        "",
+        'SET "READCFG="',
+        'IF EXIST "%DRIVECFG%" SET "READCFG=-readconfig "%DRIVECFG%""',
+        "",
         ":: virtio-vga gives the guest a DRM node -- cage is a DRM compositor and",
         ":: exits instantly without one. The input devices are equally required:",
         ":: wlroots aborts with \"no input devices\" and takes cage down with it.",
-        ":: Flight recorder. Writes the guest console to a file -- no window, so",
-        ":: the kiosk is unaffected, and the same output CI reads. Deliberately",
-        ":: NOT on the stick: the guest reads that disk raw, and writing to the",
-        ":: volume while QEMU reads the device underneath is the inconsistency the",
-        ":: read-only passthrough exists to avoid.",
-        ":: cache=none opens the device unbuffered so reads bypass the Windows cache",
-        ":: manager -- the component that stalled on a handle to a mounted volume.",
-        ":: aio=threads keeps that I/O off the main loop, so a slow device is a slow",
-        ":: boot rather than a frozen hypervisor. Neither touches host mount state.",
+        ":: Flight recorder: guest console and QEMU's own stderr to %TEMP%, never",
+        ":: the stick (QEMU reads the stick through file handles).",
         '"%QEMU%" -L "%FW%" -nodefaults -M q35 -m 3072 -smp 2 ^',
         '    -kernel "%USB%vmlinuz-kbb" -initrd "%USB%initramfs-kbb" ^',
         f'    -append "{cmdline}" ^',
         '    -drive file="%USB%kbb_guest.img",format=raw,if=virtio,snapshot=on ^',
-        '    -drive file=%RAW%,format=raw,if=virtio,readonly=on,cache=none,aio=threads ^',
+        "    %READCFG% ^",
         "    -device virtio-vga ^",
         "    -device virtio-keyboard-pci -device virtio-tablet-pci ^",
         r'    -serial file:"%TEMP%\kbb_sandbox.log" ^',
@@ -2042,14 +2129,17 @@ def _write_sandbox_launchers(root: Path, port: int = 8080) -> None:
     bat.write_bytes(("\r\n".join(win_lines) + "\r\n").encode("utf-8"))
     os.system(f'attrib -h "{bat}" >nul 2>&1')
 
+    # -----------------------------------------------------------------
+    # POSIX launcher (.sh)
+    # -----------------------------------------------------------------
     posix_lines = [
         "#!/bin/sh",
         "# KBB Tactical Sandbox (Linux/macOS).",
         "#",
-        "# Raw block passthrough gives the guest the archive read-only. Reading a",
-        "# block device needs root, so this re-executes under sudo and says so.",
-        "# QEMU's privilege-free vvfat driver cannot carry an archive this large:",
-        "# it synthesises a fixed ~516 MB volume.",
+        "# File-backed SCSI drives give the guest each ZIM slice as a read-only",
+        "# disk. No root/sudo required -- QEMU reads ordinary files. A single",
+        "# virtio-scsi controller carries up to 256 targets; a manifest disk",
+        "# at SCSI target 0 maps /dev/sdX to the original .zimaa/.zimab filenames.",
         "set -eu",
         'USB="$(cd "$(dirname "$0")" && pwd)"',
         'case "$(uname -s)" in',
@@ -2061,35 +2151,45 @@ def _write_sandbox_launchers(root: Path, port: int = 8080) -> None:
         '[ -x "$QEMU" ] || { echo "[!] QEMU missing: $QEMU"; exit 1; }',
         '[ -f "$USB/kbb_guest.img" ] || { echo "[!] Guest image missing"; exit 1; }',
         "",
-        "# Resolve the block device backing this mount point. Never hardcoded.",
-        'RAWDEV=""',
-        "if command -v findmnt >/dev/null 2>&1; then",
-        '    RAWDEV="$(findmnt -no SOURCE --target "$USB" 2>/dev/null || true)"',
-        "elif command -v diskutil >/dev/null 2>&1; then",
-        '    RAWDEV="$(diskutil info "$USB" 2>/dev/null | awk \'/Device Node/{print $NF}\')"',
-        "fi",
-        'if [ -z "$RAWDEV" ] || [ ! -e "$RAWDEV" ]; then',
-        '    echo "[!] Could not resolve the block device for $USB."',
-        '    echo "[!] Refusing to guess: the wrong device would hand the sandbox"',
-        '    echo "[!] an unrelated disk."',
-        "    exit 1",
-        "fi",
+        "# Locate the archive directory (same cascade the kiosk uses).",
+        'ARCHIVE=""',
+        'for d in "$USB/library/archive" "$USB/library" "$USB"; do',
+        '    [ -d "$d" ] && ARCHIVE="$d" && break',
+        "done",
         "",
-        '# Whole disk, not the partition: the guest reads the partition table and',
-        "# mounts the first partition itself, which matches the Windows path.",
-        'RAWDISK="$(echo "$RAWDEV" | sed -E \'s/(p?[0-9]+)$//\')"',
-        '[ -e "$RAWDISK" ] || RAWDISK="$RAWDEV"',
+        "# Enumerate ZIM slices. The manifest is V2 -- '<target> <name> <size>' --",
+        "# because libzim reads a ZIM's MD5 from the last 16 bytes and QEMU pads a",
+        "# file-backed disk up to 512, so kbb-blkfuse needs the TRUE size to hide",
+        "# the padding. POSIX shells have no argv length limit, so the drives stay",
+        "# inline here (unlike the .bat, which must use -readconfig).",
+        'MANIFEST="${TMPDIR:-/tmp}/kbb_manifest.bin"',
+        'SCSI_ARGS="-device virtio-scsi-pci,id=scsi0"',
+        "N=0",
+        'printf "KBB_MANIFEST_V2\\n" > "$MANIFEST"',
+        'for f in "$ARCHIVE"/*.zim "$ARCHIVE"/*.zim??; do',
+        '    [ -f "$f" ] || continue',
+        "    N=$((N + 1))",
+        '    SZ=$(wc -c < "$f" | tr -d " ")',
+        '    printf "%d %s %s\\n" "$N" "$(basename "$f")" "$SZ" >> "$MANIFEST"',
+        '    SCSI_ARGS="$SCSI_ARGS -drive file=$f,format=raw,if=none,id=zim$N,readonly=on"',
+        '    SCSI_ARGS="$SCSI_ARGS -device scsi-hd,drive=zim$N,bus=scsi0.0,scsi-id=$N,lun=0"',
+        "done",
         "",
-        'if [ "$(id -u)" -ne 0 ]; then',
-        '    echo "[KBB] The sandbox needs root to read $RAWDISK read-only."',
-        '    exec sudo -- "$0" "$@"',
+        "# Pad the manifest to 8 KiB so QEMU's raw format has a whole sector and the",
+        "# guest can dd a fixed block; the header and null-strip make length exact.",
+        'MSIZE=$(wc -c < "$MANIFEST" | tr -d " ")',
+        'if [ "$MSIZE" -lt 8192 ]; then',
+        '    dd if=/dev/zero bs=1 count=$((8192 - MSIZE)) >> "$MANIFEST" 2>/dev/null',
         "fi",
-        'echo "[KBB] Archive device: $RAWDISK (read-only)"',
+        'SCSI_ARGS="$SCSI_ARGS -drive file=$MANIFEST,format=raw,if=none,id=manifest,readonly=on"',
+        'SCSI_ARGS="$SCSI_ARGS -device scsi-hd,drive=manifest,bus=scsi0.0,scsi-id=0,lun=0"',
+        "",
+        'echo "[KBB] $N ZIM slice(s) from $ARCHIVE (no root required)"',
         'exec "$QEMU" -L "$USB/qemu/$PLAT/share" -nodefaults -M q35 -m 3072 -smp 2 \\',
         '    -kernel "$USB/vmlinuz-kbb" -initrd "$USB/initramfs-kbb" \\',
         f'    -append "{cmdline}" \\',
         '    -drive file="$USB/kbb_guest.img",format=raw,if=virtio,snapshot=on \\',
-        '    -drive file="$RAWDISK",format=raw,if=virtio,readonly=on,cache=none,aio=threads \\',
+        "    $SCSI_ARGS \\",
         "    -device virtio-vga \\",
         "    -device virtio-keyboard-pci -device virtio-tablet-pci \\",
         '    -serial file:"${TMPDIR:-/tmp}/kbb_sandbox.log" \\',
@@ -2100,7 +2200,7 @@ def _write_sandbox_launchers(root: Path, port: int = 8080) -> None:
     sh.chmod(0o755)
 
     console.print(
-        "[bold green]Sandbox launchers generated (raw archive passthrough, read-only).[/bold green]"
+        "[bold green]Sandbox launchers generated (file-backed SCSI drives, no admin).[/bold green]"
     )
 
 
@@ -2230,73 +2330,125 @@ def _guest_init_files() -> Dict[str, str]:
         '    fi\n'
         '    rm -f /tmp/.kbb-write-test\n'
         '\n'
-        '    # The stick, when one is attached. The UI comes up regardless: it shows\n'
-        '    # its own boot screen while it probes for the portal, so a missing or\n'
-        '    # still-mounting archive must not gate the window appearing.\n'
-        '    # Two mount points: the device read-only, and the overlay the portal\n'
-        '    # actually uses. Keeping them separate is what lets the archive stay\n'
-        '    # read-only while the bucket is writable.\n'
-        '    KBB_RO=/media/kbb-ro\n'
-        '    mkdir -p "$KBB_RO" "$KBB_DATA"\n'
-        '    if ! mountpoint -q "$KBB_RO"; then\n'
-        '        for dev in /dev/vdb1 /dev/vdb /dev/sdb1 /dev/sda1; do\n'
-        '            [ -b "$dev" ] || continue\n'
-        '            mount -o ro,noatime "$dev" "$KBB_RO" 2>/dev/null && break\n'
+        '    # ---------------------------------------------------------------\n'
+        '    # SCSI ZIM delivery via kbb-blkfuse.\n'
+        '    # ---------------------------------------------------------------\n'
+        '    # Each ZIM slice arrives as a file-backed SCSI disk. libzim cannot\n'
+        '    # read a block device (it sizes with fstat, which returns 0), so\n'
+        '    # kbb-blkfuse presents each device as a regular file of its TRUE size\n'
+        '    # -- carried in the manifest, because the ZIM checksum lives in the\n'
+        '    # last 16 bytes and the device is padded up to 512. Proven end to end\n'
+        '    # by the fuse-zim CI job before this ever boots.\n'
+        '    #\n'
+        '    # The initramfs carries virtio_blk but not virtio_scsi/sd_mod/fuse.\n'
+        '    # busybox modprobe loads ONE module per call; extra args are treated\n'
+        '    # as parameters, so each module gets its own invocation.\n'
+        '    modprobe virtio_scsi 2>/dev/null && kbb_log "virtio_scsi loaded" \\\n'
+        '        || kbb_log "virtio_scsi: already loaded or unavailable"\n'
+        '    modprobe sd_mod 2>/dev/null && kbb_log "sd_mod loaded" \\\n'
+        '        || kbb_log "sd_mod: already loaded or unavailable"\n'
+        '    modprobe fuse 2>/dev/null && kbb_log "fuse loaded" \\\n'
+        '        || kbb_log "fuse: already loaded or unavailable"\n'
+        '\n'
+        '    # The SCSI scan is asynchronous; wait for the devices to appear.\n'
+        '    udevadm settle --timeout=15 2>/dev/null || sleep 3\n'
+        '\n'
+        '    KBB_ZIM_BUCKET=/tmp/kbb-zims\n'
+        '    KBB_FUSE_MANIFEST=/tmp/kbb-blkfuse.manifest\n'
+        '    mkdir -p "$KBB_ZIM_BUCKET"\n'
+        '    : > "$KBB_FUSE_MANIFEST"\n'
+        '\n'
+        '    # SCSI target 0 is the delivery manifest (see the launcher). It lists\n'
+        '    #   <target> <filename> <true_size>\n'
+        '    # per slice. Find its /dev/sdX by matching the target field of the\n'
+        '    # H:C:T:L address in sysfs.\n'
+        '    KBB_MANIFEST_DEV=""\n'
+        '    for dev in /sys/block/sd*; do\n'
+        '        [ -d "$dev" ] || continue\n'
+        '        hctl=$(basename "$(readlink "$dev/device")" 2>/dev/null) || continue\n'
+        '        [ "$(echo "$hctl" | cut -d: -f3)" = "0" ] || continue\n'
+        '        KBB_MANIFEST_DEV="/dev/$(basename "$dev")"\n'
+        '        break\n'
+        '    done\n'
+        '\n'
+        '    KBB_ZIM_COUNT=0\n'
+        '    if [ -n "$KBB_MANIFEST_DEV" ] && [ -b "$KBB_MANIFEST_DEV" ]; then\n'
+        '        kbb_log "manifest device: $KBB_MANIFEST_DEV"\n'
+        '        KBB_MANIFEST=$(dd if="$KBB_MANIFEST_DEV" bs=8192 count=1 2>/dev/null | tr -d "\\000")\n'
+        '        if echo "$KBB_MANIFEST" | head -1 | grep -q "KBB_MANIFEST_V2"; then\n'
+        '            # Build the kbb-blkfuse manifest: "<filename> <device> <size>".\n'
+        '            echo "$KBB_MANIFEST" | tail -n +2 | while IFS=" " read -r tgt fname fsize; do\n'
+        '                [ -z "$fname" ] && continue\n'
+        '                for sdev in /sys/block/sd*; do\n'
+        '                    [ -d "$sdev" ] || continue\n'
+        '                    sh2=$(basename "$(readlink "$sdev/device")" 2>/dev/null) || continue\n'
+        '                    [ "$(echo "$sh2" | cut -d: -f3)" = "$tgt" ] || continue\n'
+        '                    echo "$fname /dev/$(basename "$sdev") $fsize" >> "$KBB_FUSE_MANIFEST"\n'
+        '                    break\n'
+        '                done\n'
+        '            done\n'
+        '            KBB_ZIM_COUNT=$(wc -l < "$KBB_FUSE_MANIFEST" 2>/dev/null || echo 0)\n'
+        '        else\n'
+        '            kbb_log "manifest: header not KBB_MANIFEST_V2; ignoring"\n'
+        '        fi\n'
+        '    else\n'
+        '        kbb_log "no SCSI manifest device; no ZIM slices attached"\n'
+        '    fi\n'
+        '\n'
+        '    if [ "$KBB_ZIM_COUNT" -gt 0 ]; then\n'
+        '        kbb_log "mounting $KBB_ZIM_COUNT ZIM slice(s) via kbb-blkfuse"\n'
+        '        # No -f: fuse daemonises after mounting. allow_other so kiwix-serve\n'
+        '        # (spawned by the portal) can read the files; root may always grant\n'
+        '        # it. ro is belt-and-braces on top of the read-only implementation.\n'
+        '        kbb-blkfuse "$KBB_ZIM_BUCKET" "$KBB_FUSE_MANIFEST" -o allow_other,ro \\\n'
+        '            >/dev/console 2>&1 || kbb_log "WARNING kbb-blkfuse failed to mount"\n'
+        '        for i in $(seq 1 20); do mountpoint -q "$KBB_ZIM_BUCKET" && break; sleep 0.5; done\n'
+        '        if mountpoint -q "$KBB_ZIM_BUCKET"; then\n'
+        '            kbb_log "KBB-ZIM-MOUNTED $(ls "$KBB_ZIM_BUCKET" 2>/dev/null | wc -l) file(s)"\n'
+        '        else\n'
+        '            kbb_log "WARNING kbb-blkfuse mount did not appear"\n'
+        '        fi\n'
+        '        KBB_BUCKET="$KBB_ZIM_BUCKET"\n'
+        '    else\n'
+        '        # Bare-metal (Mode A) and legacy layouts: mount the real FAT32\n'
+        '        # partition, where the ZIMs are ordinary files and no FUSE is\n'
+        '        # needed. This path is unchanged.\n'
+        '        KBB_RO=/media/kbb-ro\n'
+        '        mkdir -p "$KBB_RO" "$KBB_DATA"\n'
+        '        if ! mountpoint -q "$KBB_RO"; then\n'
+        '            for dev in /dev/vdb1 /dev/vdb /dev/sdb1 /dev/sda1; do\n'
+        '                [ -b "$dev" ] || continue\n'
+        '                mount -o ro,noatime "$dev" "$KBB_RO" 2>/dev/null && break\n'
+        '            done\n'
+        '        fi\n'
+        '        if mountpoint -q "$KBB_RO"; then\n'
+        '            kbb_log "archive mounted read-only at $KBB_RO"\n'
+        '            mount --bind "$KBB_RO" "$KBB_DATA" 2>/dev/null\n'
+        '        else\n'
+        '            kbb_log "no archive attached; UI will start without content"\n'
+        '        fi\n'
+        '        for cand in "$KBB_DATA/library/archive" "$KBB_DATA/library" "$KBB_DATA"; do\n'
+        '            [ -d "$cand" ] && KBB_BUCKET="$cand" && break\n'
         '        done\n'
         '    fi\n'
-        '\n'
-        '    if mountpoint -q "$KBB_RO"; then\n'
-        '        kbb_log "archive mounted read-only at $KBB_RO"\n'
-        '        mount --bind "$KBB_RO" "$KBB_DATA" 2>/dev/null\n'
-        '    else\n'
-        '        kbb_log "no archive attached; UI will start without content"\n'
-        '    fi\n'
+        '    kbb_log "bucket: $KBB_BUCKET"\n'
         '\n'
         '    # The portal keeps its mutable state OUTSIDE the archive.\n'
-        '    #\n'
-        '    # It wrote .kb_state into the bucket, which cannot work here: the\n'
-        '    # archive is mounted read-only on purpose -- that is the whole safety\n'
-        '    # argument for handing a VM a physical disk -- so startup died with\n'
-        '    # "Errno 30 Read-only file system". An overlay was tried first and is\n'
-        '    # the wrong shape of fix: it makes a read-only thing look writable,\n'
-        '    # needs a kernel module that may be absent or refused, and per the\n'
-        '    # kernel documentation an overlay above a vfat lower is exactly the\n'
-        '    # fragile case. Telling the portal where to write removes the\n'
-        '    # requirement instead of working around it, and costs nothing here:\n'
-        '    # the state is a cache and the sandbox is amnesic by design.\n'
+        '    # The state is a cache and the sandbox is amnesic by design.\n'
         '    export KBB_STATE_DIR=/tmp/kbb-state\n'
         '    mkdir -p "$KBB_STATE_DIR"\n'
         '\n'
         '    kbb_log "portal state: $KBB_STATE_DIR (tmpfs, discarded at power-off)"\n'
         '\n'
-        '    # The portal, from the guest image if the stick did not supply one.\n'
-        '    # Raw passthrough mounts the whole stick partition here, so content is\n'
-        '    # at library/archive. Earlier layouts put it at library/ or at the\n'
-        '    # mount point itself, and a drive provisioned before either change must\n'
-        '    # still serve rather than present an empty library.\n'
-        '    for cand in "$KBB_DATA/library/archive" "$KBB_DATA/library" "$KBB_DATA"; do\n'
-        '        [ -d "$cand" ] && KBB_BUCKET="$cand" && break\n'
-        '    done\n'
-        '    kbb_log "bucket: $KBB_BUCKET"\n'
-        '    # Seed it from the index the archive already carries.\n'
-        '    #\n'
-        '    # Redirecting state to tmpfs left it EMPTY, so the portal re-indexed the\n'
-        '    # whole archive on every boot -- on a real stick that is ~119 GB across\n'
-        '    # 300+ entries, read over emulated I/O. It cannot finish inside the\n'
-        '    # readiness budget, and the UI reports "portal backend did not respond"\n'
-        '    # while the portal is alive and indexing. CI missed it because the\n'
-        '    # synthetic archive is 512 MB with two files.\n'
-        '    #\n'
-        '    # The existing index is an INPUT: copy it in, then update the copy. The\n'
-        '    # archive stays read-only and the sandbox stays amnesic; the copy costs\n'
-        '    # seconds where the rebuild costs hours.\n'
+        '    # Seed state from the archive index when available (legacy mount path\n'
+        '    # only -- SCSI-delivered ZIMs have no .kb_state on a block device).\n'
         '    if [ -d "$KBB_BUCKET/.kb_state" ]; then\n'
         '        kbb_log "seeding portal state from the archive index"\n'
         '        cp -a "$KBB_BUCKET/.kb_state/." "$KBB_STATE_DIR/" 2>/dev/null \\\n'
         '            && kbb_log "state seeded ($(du -sh "$KBB_STATE_DIR" 2>/dev/null | cut -f1))" \\\n'
         '            || kbb_log "WARNING seed failed; the portal will rebuild the index"\n'
         '    else\n'
-        '        kbb_log "no prebuilt index on the archive; the portal will build one"\n'
+        '        kbb_log "no prebuilt index; the portal will build one"\n'
         '    fi\n'
         '\n'
         '    # Choose the interpreter that can RUN the portal, not the first one\n'

@@ -189,13 +189,12 @@ def test_write_sandbox_launchers(tmp_path):
     assert "kbb_mode=qemu" in sh_text
 
 
-def test_sandbox_launcher_passes_the_device_through_read_only(tmp_path):
-    """The archive reaches the guest as a device, and the guest cannot write it.
+def test_sandbox_launcher_uses_file_backed_scsi_drives(tmp_path):
+    """The archive reaches the guest via file-backed SCSI drives.
 
-    vvfat is gone -- it cannot present a volume larger than ~516 MB -- so the
-    stick's physical disk is attached instead. `readonly=on` is the whole safety
-    argument for doing that: a raw write behind a mounted host volume corrupts
-    the filesystem rather than a file.
+    Raw PhysicalDrive passthrough is dead -- QEMU blocks on mounted volumes.
+    vvfat caps the synthesised volume at ~516 MB. File-backed drives use a
+    normal cached file handle: no admin, no block passthrough, no 2 GB limit.
     """
     cli._write_sandbox_launchers(tmp_path)
 
@@ -208,15 +207,12 @@ def test_sandbox_launcher_passes_the_device_through_read_only(tmp_path):
         assert "fat:" not in text, (
             f"{name} still attaches vvfat, which aborts QEMU on this archive"
         )
-        device_lines = [
-            ln for ln in text.splitlines()
-            if "-drive" in ln and ("RAW" in ln or "PhysicalDrive" in ln)
-        ]
-        assert device_lines, f"{name} attaches no archive device"
-        for ln in device_lines:
-            assert "readonly=on" in ln, (
-                f"{name} passes the disk through writable: {ln.strip()}"
-            )
+        assert "PhysicalDrive" not in text, (
+            f"{name} still uses raw block passthrough which is dead"
+        )
+        assert "virtio-scsi-pci" in text, (
+            f"{name} has no virtio-scsi controller; SCSI disks cannot appear"
+        )
         assert "kbb_guest.img" in text, f"{name} does not boot the guest image"
 
 
