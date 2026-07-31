@@ -15,7 +15,6 @@ import os
 import secrets
 import posixpath
 import re
-import shutil
 import socket
 import subprocess
 import threading
@@ -458,21 +457,16 @@ def _find_free_port(start: int = 18080) -> int:
 
 
 def _find_kiwix_binary(root: Path) -> str:
-    """Locate a kiwix-serve binary, preferring the portable runtime."""
-    candidates = [
-        root / ".kb_env" / "kiwix" / "kiwix-serve.exe",
-        root / ".kb_env" / "kiwix" / "kiwix-serve",
-    ]
-    for cand in candidates:
-        if cand.exists():
-            return str(cand)
-    system = shutil.which("kiwix-serve")
-    if system:
-        return system
-    raise RuntimeError(
-        "kiwix-serve binary not found. Install it from https://kiwix.org/en/applications/ "
-        "or run: kb-builder portable <drive>"
-    )
+    """Locate kiwix-serve. Delegates -- this file had its own copy of the search.
+
+    Two independent copies is how the nested-bucket regression happened: content
+    moved to library/archive/ for the sandbox passthrough, one copy was taught to
+    search upward for .kb_env and the other was not, so the portal still reported
+    "ZIM engine unavailable". One definition, both callers.
+    """
+    from .presentation import _find_kiwix_binary as _resolve
+
+    return _resolve(root)
 
 
 def _select_kiwix_archive(root: Path) -> Optional[Path]:

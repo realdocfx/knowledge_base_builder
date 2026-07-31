@@ -5,6 +5,7 @@ not provided because ``libzim`` alone cannot expose the REST APIs and
 ServiceWorker environment that the ZIM's bundled Wikipedia JavaScript requires.
 """
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -82,14 +83,29 @@ def discover_archives(root: Path) -> List[Tuple[str, Path]]:
 
 
 def _find_kiwix_binary(root: Path) -> str:
-    """Locate a kiwix-serve binary, preferring a portable runtime on *root*."""
-    candidates = [
-        root / ".kb_env" / "kiwix" / "kiwix-serve.exe",
-        root / ".kb_env" / "kiwix" / "kiwix-serve",
-    ]
-    for cand in candidates:
-        if cand.exists():
-            return str(cand)
+    """Locate a kiwix-serve binary, preferring the portable runtime on the drive.
+
+    ``.kb_env`` is *installation* state, not content, so its location must not be
+    derived from where the content happens to sit. The previous version looked
+    only in ``<root>/.kb_env``, which held while the bucket was the drive root and
+    broke the moment content moved to ``library/archive/`` for the sandbox
+    passthrough -- the portal then reported "ZIM engine unavailable".
+
+    Searching upward finds the runtime wherever the content is nested, and keeps
+    working if the layout nests again. The walk stops at the filesystem root
+    rather than climbing indefinitely, so a missing runtime raises instead of
+    silently binding to an unrelated ``.kb_env`` in some ancestor.
+    """
+    override = os.environ.get("KBB_KIWIX_BINARY")
+    if override and Path(override).exists():
+        return override
+
+    for base in [root, *root.parents]:
+        for name in ("kiwix-serve.exe", "kiwix-serve"):
+            cand = base / ".kb_env" / "kiwix" / name
+            if cand.exists():
+                return str(cand)
+
     system = shutil.which("kiwix-serve")
     if system:
         return system
