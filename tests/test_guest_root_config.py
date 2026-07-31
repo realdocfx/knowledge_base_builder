@@ -290,3 +290,30 @@ def test_the_kiosk_serves_the_library_directory(rootfs):
         "the portal is still started against the mount point rather than the "
         "resolved bucket"
     )
+
+
+def test_the_ui_is_configured_for_software_rendering(rootfs):
+    """A VM has no GPU, and WebKitGTK's default renderer needs one.
+
+    The guest reached the UI: cage started, launch_kbb ran, it attached to the
+    portal -- and nothing ever painted. The log says why:
+
+        libEGL warning: egl: failed to create dri2 screen
+        MESA: error: ZINK: vkCreateInstance failed (VK_ERROR_INCOMPATIBLE_DRIVER)
+        libEGL warning: NEEDS EXTENSION: falling back to kms_swrast
+
+    WebKitGTK renders through a DMA-BUF path that assumes a working GPU. With
+    virtio-vga and no virgl there is none, so it degrades to a fallback that
+    initialises and then produces no frames. The process is alive, the marker
+    fires, and the screen stays on the last kernel message -- which is precisely
+    the failure a liveness check cannot see.
+
+    Forcing the software path is not a workaround for a broken GPU; it is the
+    correct configuration for a machine that has none.
+    """
+    svc = _read(rootfs, "etc/init.d/kbb-kiosk")
+    for var in ("WEBKIT_DISABLE_DMABUF_RENDERER", "LIBGL_ALWAYS_SOFTWARE"):
+        assert var in svc, (
+            f"{var} is not exported; WebKitGTK will take a GPU path the guest "
+            "cannot satisfy and the window will never paint"
+        )

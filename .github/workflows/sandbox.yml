@@ -583,8 +583,7 @@ jobs:
             -append "root=/dev/vda rootfstype=ext4 rw console=ttyS0 kbb_mode=qemu" \
             -device virtio-vga \
             -device virtio-keyboard-pci -device virtio-tablet-pci \
-            -display none -serial stdio \
-            2>&1 | tee archive.log || true
+            -display none -serial stdio \n            -monitor unix:qmp.sock,server,nowait \n            2>&1 | tee archive.log || true
           echo "--- tail ---"; tail -40 archive.log
 
       - name: Assert the archive was mounted and served
@@ -631,7 +630,23 @@ jobs:
             grep -a "seed\|prebuilt" archive.log || true
             exit 1
           }
-          echo "archive mounted, bucket resolved, index seeded, portal serving"
+          # ...and the screen must actually have something on it.
+          #
+          # Every assertion so far proves the UI process is ALIVE, which is not
+          # the same as painted. The guest reached cage, ran launch_kbb and
+          # attached to the portal while WebKitGTK failed its GPU path, fell back
+          # to kms_swrast and produced no frames: process alive, marker fired,
+          # screen frozen on the last kernel message. Liveness cannot see that; a
+          # framebuffer dump can.
+          echo screendump fb.ppm | timeout 30 socat - UNIX-CONNECT:qmp.sock >/dev/null 2>&1 || true
+          if [ -s fb.ppm ]; then
+            COLOURS=$(python3 -c "d=open('fb.ppm','rb').read().split(bytes([10]),3); p=d[3] if len(d)>3 else b''; print(len(set(p[i:i+3] for i in range(0,min(len(p),300000),3))))")
+            echo "framebuffer distinct colours: $COLOURS"
+            test "$COLOURS" -ge 3 || { echo "::error::framebuffer is blank -- the UI never painted"; exit 1; }
+          else
+            echo "::warning::no framebuffer dump captured"
+          fi
+          echo "archive mounted, bucket resolved, index seeded, portal serving, screen painted"
 
       - name: Assert the guest cannot write to the archive
         run: |
