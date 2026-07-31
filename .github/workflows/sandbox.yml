@@ -35,6 +35,7 @@ on:
       # leaving the one job that would have caught a regression unrun.
       - 'src/knowledge_base_builder/**'
       - 'launcher/**'
+      - 'guest/**'
       - '.github/workflows/sandbox.yml'
       - 'tests/test_sandbox_head.py'
       - 'tests/test_guest_root_config.py'
@@ -203,6 +204,132 @@ jobs:
           name: launch_kbb-alpine-x86_64
           path: /tmp/launch_kbb
           retention-days: 7
+  # ---------------------------------------------------------------------------
+  # The load-bearing assumption, proven before anything is built on it.
+  #
+  # Mode C delivers each ZIM slice as a file-backed SCSI disk -- zero-copy, no
+  # admin. The catch, proven in the guest: libzim sizes a file with fstat(), a
+  # block device reports st_size == 0, so libzim rejects it as "too small to
+  # contain a header" even though the bytes are right there. kbb-blkfuse bridges
+  # the gap by presenting each block device as a regular file of its true size.
+  #
+  # This job replicates the exact chain -- block device -> FUSE-sized file ->
+  # libzim mmap + split-archive sequence -- against a real generated ZIM. If
+  # libzim's mmap does not work through FUSE, the whole approach is dead and this
+  # fails here in two minutes rather than after a guest rebuild and a stick copy.
+  # ---------------------------------------------------------------------------
+  fuse-zim:
+    name: libzim reads a block device via FUSE
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with:
+          python-version: '3.12'
+
+      - name: Toolchain and libzim
+        run: |
+          set -eux
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential pkg-config fuse3 libfuse3-dev
+          pip install libzim
+          # allow_other so a reader in another context can see the files, matching
+          # how the guest runs kiwix and the FUSE mount under different services.
+          echo user_allow_other | sudo tee -a /etc/fuse.conf
+
+      - name: Compile kbb-blkfuse
+        run: |
+          set -eux
+          cc -O2 -Wall guest/kbb_blkfuse.c -o kbb-blkfuse \
+            $(pkg-config fuse3 --cflags --libs)
+          ./kbb-blkfuse 2>&1 | head -1 || true   # prints usage, exit 2
+
+      - name: Generate a real split ZIM
+        run: |
+          set -eux
+          python3 - <<'PY'
+          from libzim.writer import Creator, Item, StringProvider, Hint
+
+          class Page(Item):
+              def __init__(self, path, title, content):
+                  super().__init__()
+                  self._p, self._t, self._c = path, title, content
+              def get_path(self): return self._p
+              def get_title(self): return self._t
+              def get_mimetype(self): return "text/html"
+              def get_contentprovider(self): return StringProvider(self._c)
+              def get_hints(self): return {Hint.FRONT_ARTICLE: True}
+
+          with Creator("test.zim").config_indexing(True, "eng") as c:
+              c.set_mainpath("index")
+              c.add_item(Page("index", "Home", "<html><body>home</body></html>"))
+              # Enough content that the file is comfortably larger than a header
+              # and worth splitting in two.
+              for i in range(2000):
+                  body = "<html><body>" + (f"page {i} " * 200) + "</body></html>"
+                  c.add_item(Page(f"page{i}", f"Page {i}", body))
+          print("generated test.zim")
+          PY
+          ls -l test.zim
+          # Split into two parts the way a stick carries slices: .zimaa/.zimab.
+          SZ=$(stat -c%s test.zim)
+          HALF=$(( (SZ/2/512)*512 ))     # 512-aligned, like the real 1900 MiB cut
+          dd if=test.zim of=test.zimaa bs=1 count=$HALF 2>/dev/null
+          dd if=test.zim of=test.zimab bs=1 skip=$HALF 2>/dev/null
+          ls -l test.zimaa test.zimab
+
+      - name: Back each part with a loop block device (proving st_size==0 path)
+        run: |
+          set -eux
+          LA=$(sudo losetup --show -f -r test.zimaa)
+          LB=$(sudo losetup --show -f -r test.zimab)
+          echo "loop devices: $LA $LB"
+          # Confirm we are actually reproducing the failing condition.
+          echo "stat st_size of $LA: $(stat -c%s $LA)  (expect 0 for a block device)"
+          test "$(stat -c%s $LA)" = "0"
+          sudo chmod a+r "$LA" "$LB"
+          printf 'test.zimaa %s\ntest.zimab %s\n' "$LA" "$LB" > manifest.txt
+          cat manifest.txt
+          echo "$LA $LB" > loops.txt
+
+      - name: Mount via kbb-blkfuse and read with libzim
+        run: |
+          set -eux
+          mkdir -p mnt
+          sudo ./kbb-blkfuse mnt manifest.txt -f -o allow_other,ro &
+          FUSE_PID=$!
+          # Wait for the mount to appear.
+          for i in $(seq 1 20); do
+            [ -e mnt/test.zimaa ] && break; sleep 0.5
+          done
+          ls -l mnt/
+          echo "--- st_size through FUSE (must be the real size, not 0) ---"
+          stat -c '%n %s' mnt/test.zimaa mnt/test.zimab
+          test "$(stat -c%s mnt/test.zimaa)" -gt 0
+
+          echo "--- libzim reads the split archive through FUSE ---"
+          python3 - <<'PY'
+          import sys
+          from libzim.reader import Archive
+          a = Archive("mnt/test.zimaa")     # split: libzim follows .zimab itself
+          print("entry_count:", a.entry_count)
+          assert a.entry_count > 1000, f"too few entries: {a.entry_count}"
+          # Actually fetch content, so we exercise mmap page-faults through FUSE,
+          # not just the header read.
+          e = a.get_entry_by_path("page1999")
+          data = bytes(e.get_item().content)
+          assert b"page 1999" in data, "content read through FUSE is wrong"
+          print("FUSE-BACKED-LIBZIM-OK")
+          PY
+
+          sudo umount mnt || true
+          kill $FUSE_PID 2>/dev/null || true
+
+      - name: Release loop devices
+        if: always()
+        run: |
+          for d in $(cat loops.txt 2>/dev/null); do sudo losetup -d "$d" || true; done
+
 
   # ---------------------------------------------------------------------------
   # The guest image: a complete Alpine root with the head, the runtime and the
