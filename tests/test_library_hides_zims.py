@@ -28,7 +28,15 @@ def media_bucket(tmp_path, monkeypatch):
     # archive.org media: a folder with a file, and a top-level document.
     book = tmp_path / "101omelettes0000clau"
     book.mkdir()
-    (book / "101omelettes.pdf").write_bytes(b"%PDF-1.4 x")
+    # A real minimal PDF (pypdf-generated) so PyMuPDF can parse pages.
+    try:
+        from pypdf import PdfWriter
+        w = PdfWriter()
+        w.add_blank_page(width=612, height=792)
+        with open(book / "101omelettes.pdf", "wb") as f:
+            w.write(f)
+    except ImportError:
+        (book / "101omelettes.pdf").write_bytes(b"%PDF-1.4 x")
     (tmp_path / "field_notes.epub").write_bytes(b"PK\x03\x04 epub")
     # KBB internal state dir (not media -- must be hidden).
     (tmp_path / ".kb_state").mkdir()
@@ -91,33 +99,28 @@ def test_media_file_is_still_served(media_bucket):
 # ---------------------------------------------------------------------------
 # PDF rendering: vendored pdf.js viewer (WebKitGTK has no PDF handler)
 # ---------------------------------------------------------------------------
-def test_pdf_reader_uses_pdfjs_viewer(media_bucket):
-    """PDFs must be rendered by the vendored pdf.js, not a raw iframe src.
+def test_pdf_reader_uses_server_side_rendering(media_bucket):
+    """PDFs must be rendered server-side as page images, not client-side.
 
-    WebKitGTK (QEMU guest) has no built-in PDF handler. Loading a raw PDF in
-    an iframe either freezes the VM or shows blank content. The pdf.js viewer
-    renders via canvas and works in any browser.
+    WebKitGTK (QEMU guest) freezes on ANY client-side PDF approach — raw
+    iframe, pdf.js viewer, embed/object. Server-side PyMuPDF rendering
+    produces PNG images the browser displays as plain <img> tags.
     """
     r = TestClient(web.content_app).get(
         "/read?path=101omelettes0000clau/101omelettes.pdf", follow_redirects=False
     )
     assert r.status_code == 200
     body = r.text
-    assert "viewer.html" in body, (
-        "PDF reader does not use the pdf.js viewer — raw iframe will freeze WebKitGTK"
+    assert "pdf-page" in body, (
+        "PDF reader does not use server-side page rendering"
     )
-    assert "assets/pdfjs" in body, (
-        "PDF reader does not reference the vendored pdf.js assets"
+    assert "<img" in body, (
+        "PDF reader does not serve pages as images"
     )
-
-
-def test_pdfjs_viewer_assets_are_served(media_bucket):
-    """The vendored pdf.js viewer HTML must be accessible on the content plane."""
-    r = TestClient(web.content_app).get(
-        "/assets/pdfjs/web/viewer.html", follow_redirects=False
+    # Must NOT use raw iframe src to the PDF file (freezes WebKitGTK)
+    assert 'src="/files/' not in body or 'download' in body, (
+        "PDF reader still points an iframe/embed at the raw PDF file"
     )
-    assert r.status_code == 200, f"pdf.js viewer not served: {r.status_code}"
-    assert "pdf" in r.text.lower(), "viewer.html does not appear to be a PDF viewer"
 
 
 def test_pdf_raw_file_keeps_strict_sandbox(media_bucket):

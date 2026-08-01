@@ -1,1 +1,1 @@
-feat: vendor pdf.js viewer for cross-renderer PDF display - fixes WebKitGTK freeze
+feat: server-side PDF rendering via PyMuPDF - fixes WebKitGTK freeze on all client-side approaches

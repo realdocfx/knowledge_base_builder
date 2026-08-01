@@ -21,7 +21,7 @@ modprobe isofs 2>/dev/null
 mkdir -p /tmp/_iso
 mount -t iso9660 -o ro /dev/vdb /tmp/_iso 2>/dev/null || exit 0
 S=$(python3 -c "import knowledge_base_builder as k,os;print(os.path.dirname(k.__file__))" 2>/dev/null)
-[ -d /tmp/_iso/__kbb_patches__ ] && [ -n "$S" ] && cp /tmp/_iso/__kbb_patches__/*.py "$S/" 2>/dev/null
+[ -d /tmp/_iso/__kbb_patches__ ] && [ -n "$S" ] && cp -r /tmp/_iso/__kbb_patches__/. "$S/" 2>/dev/null
 umount /tmp/_iso 2>/dev/null
 rmdir /tmp/_iso 2>/dev/null
 '''

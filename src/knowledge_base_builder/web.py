@@ -1351,6 +1351,47 @@ async def wiki_proxy(request: Request, path: str) -> Response:
     )
 
 
+@content_app.get("/pdf-page")
+async def pdf_page_image(
+    path: str = Query(..., description="Bucket-relative path to the PDF"),
+    p: int = Query(0, ge=0, description="Zero-indexed page number"),
+    dpi: int = Query(150, ge=72, le=300, description="Render resolution"),
+) -> Any:
+    """Render a single PDF page as a PNG image (server-side, PyMuPDF).
+
+    The browser receives a plain PNG — zero client-side PDF processing.
+    WebKitGTK (QEMU guest) freezes on ANY client-side PDF approach (raw iframe,
+    pdf.js, embed/object). Server-side rendering is the only reliable fix.
+    """
+    if BUCKET is None:
+        raise HTTPException(status_code=503, detail="Bucket not initialized")
+    root = BUCKET.root
+    target = _safe_content_path(root, path)
+    if target is None:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    if not target.exists() or not target.is_file():
+        raise HTTPException(status_code=404, detail="File not found")
+    if target.suffix.lower() != ".pdf":
+        raise HTTPException(status_code=400, detail="Not a PDF file")
+    try:
+        import pymupdf
+        doc = pymupdf.open(str(target))
+        if p >= len(doc):
+            doc.close()
+            raise HTTPException(status_code=404, detail=f"Page {p} does not exist")
+        page = doc[p]
+        pix = page.get_pixmap(dpi=dpi)
+        png_bytes = pix.tobytes("png")
+        doc.close()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"PDF render failed: {exc}")
+    return Response(content=png_bytes, media_type="image/png", headers={
+        "Cache-Control": "public, max-age=3600",
+    })
+
+
 @content_app.get("/assets/pdfjs/{path:path}")
 async def pdfjs_asset(path: str) -> Any:
     """Serve vendored pdf.js viewer files (no CDN, airgap-safe).
@@ -3037,16 +3078,36 @@ async def read_document(
         )
 
     if ext == ".pdf":
-        # pdf.js viewer: renders via canvas, no browser PDF plugin needed.
-        # WebKitGTK (QEMU guest) has no built-in PDF handler and freezes on
-        # raw <iframe src="file.pdf">. The vendored viewer works everywhere.
-        viewer_url = (
-            "/assets/pdfjs/web/viewer.html?file="
-            + urllib.parse.quote(file_url, safe="")
+        # Server-side rendering: PyMuPDF renders each page as a PNG image.
+        # The browser receives only <img> tags — zero client-side PDF processing.
+        # WebKitGTK (QEMU guest) freezes on ANY client-side PDF approach (raw
+        # iframe, pdf.js viewer, embed/object). Server-side is the only fix.
+        try:
+            import pymupdf
+            doc = pymupdf.open(str(target))
+            num_pages = len(doc)
+            doc.close()
+        except Exception:
+            num_pages = 0
+        page_imgs = []
+        page_url_base = "/pdf-page?path=" + urllib.parse.quote(rel, safe="") + "&p="
+        for p in range(num_pages):
+            page_imgs.append(
+                '<div style="margin:8px auto;max-width:900px;">'
+                '<img src="' + page_url_base + str(p)
+                + '" loading="lazy" alt="Page ' + str(p + 1)
+                + '" style="width:100%;display:block;box-shadow:0 2px 8px rgba(0,0,0,.3);"'
+                '></div>'
+            )
+        nav = (
+            '<span>' + str(num_pages) + ' page'
+            + ('s' if num_pages != 1 else '') + '</span>'
         )
         body = (
-            "<h1>" + esc_name + "</h1>" + toolbar()
-            + '<iframe class="doc-frame" src="' + viewer_url + '" title="' + esc_name + '"></iframe>'
+            "<h1>" + esc_name + "</h1>" + toolbar(nav)
+            + '<div style="max-height:calc(100vh - 172px);overflow:auto;">'
+            + '\n'.join(page_imgs)
+            + '</div>'
         )
         return HTMLResponse(_themed_page(name, body, back_href, back_label), headers=trusted_page_headers())
 
