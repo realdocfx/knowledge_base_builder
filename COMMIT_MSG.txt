@@ -1,1 +1,1 @@
-feat: add py3-pymupdf to GUEST_WORLD for server-side PDF rendering in sandbox
+fix: pymupdf via pip [web] extra, not Alpine apk (py3-pymupdf does not exist)

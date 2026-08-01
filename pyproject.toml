@@ -53,6 +53,9 @@ web = [
     "fastapi>=0.100.0",
     "uvicorn[standard]>=0.23.0",
     "httpx>=0.24.0",
+    "pymupdf>=1.24.0",  # server-side PDF-to-PNG rendering (WebKitGTK freezes
+                        # on any client-side approach; PyMuPDF renders pages as
+                        # images the browser displays as plain <img> tags)
 ]
 # Xapian is deliberately NOT in [web]. `xapian-bindings` on PyPI is an unrelated
 # stub at 0.0.x, so ">=1.4.0" cannot be satisfied from an index and

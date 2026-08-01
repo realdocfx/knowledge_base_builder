@@ -119,9 +119,9 @@ GUEST_WORLD = (
     # with fstat(), which returns 0 for a device), so kbb-blkfuse presents each
     # device as a regular file of its true size and kiwix-serve reads that.
     "fuse3",          # libfuse3, for kbb-blkfuse (compiled into the image)
-    "py3-pymupdf",    # server-side PDF-to-PNG rendering (WebKitGTK freezes on
-                      # ANY client-side PDF approach; PyMuPDF renders pages as
-                      # images the browser displays as plain <img> tags)
+    # PyMuPDF (server-side PDF-to-PNG) is NOT an Alpine package — it's installed
+    # via pip as part of the [web] extra. The CI guest-image build runs
+    # `pip install "[web]"` which pulls pymupdf alongside fastapi/uvicorn.
     # kiwix-serve is NOT the Alpine package: Alpine 3.20 ships kiwix-tools 3.7.0,
     # whose bundled libzim cannot read a ZIM of format 6.3 -- "Unable to add the
     # ZIM file to the internal library" -- while the guest's newer python libzim
