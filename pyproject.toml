@@ -94,7 +94,7 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 # assets/* vendors swagger-ui so /docs renders with no CDN (airgapped drives).
-knowledge_base_builder = ["docs/*.md", "assets/*"]
+knowledge_base_builder = ["docs/*.md", "assets/*", "assets/pdfjs/**/*"]
 
 [tool.black]
 line-length = 88

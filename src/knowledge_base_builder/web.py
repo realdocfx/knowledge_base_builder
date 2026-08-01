@@ -279,6 +279,11 @@ async def harden_content_responses(request: Request, call_next):
 # Swagger UI shipped with the package so the API console works with no network.
 SWAGGER_ASSETS = Path(__file__).resolve().parent / "assets"
 
+# pdf.js viewer shipped alongside swagger-ui so PDFs render in WebKitGTK (the
+# QEMU guest renderer) which has no built-in PDF handler. Loading a raw PDF in
+# an iframe freezes the VM; pdf.js renders via canvas instead.
+PDFJS_ASSETS = Path(__file__).resolve().parent / "assets" / "pdfjs"
+
 # --- Control-plane authentication -------------------------------------------
 # Loopback is not a trust boundary: any unprivileged local process, or a web page
 # the operator visits issuing a cross-site request to 127.0.0.1, could otherwise
@@ -1346,6 +1351,42 @@ async def wiki_proxy(request: Request, path: str) -> Response:
     )
 
 
+@content_app.get("/assets/pdfjs/{path:path}")
+async def pdfjs_asset(path: str) -> Any:
+    """Serve vendored pdf.js viewer files (no CDN, airgap-safe).
+
+    pdf.js renders PDFs via canvas — no browser PDF plugin needed. WebKitGTK
+    (the QEMU guest renderer) has no built-in PDF handler; loading a raw PDF
+    in an iframe freezes the VM. The vendored viewer works everywhere.
+    """
+    safe = Path(os.path.normpath(path))
+    if safe.is_absolute() or ".." in safe.parts:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    target = PDFJS_ASSETS / safe
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail="asset not found")
+    suffix = target.suffix.lower()
+    media_types = {
+        ".html": "text/html",
+        ".js": "application/javascript",
+        ".mjs": "application/javascript",
+        ".css": "text/css",
+        ".svg": "image/svg+xml",
+        ".png": "image/png",
+    }
+    mt = media_types.get(suffix, "application/octet-stream")
+    # The viewer page needs scripts + workers to render PDFs.
+    headers = {}
+    if suffix in (".html", ".mjs", ".js"):
+        headers["Content-Security-Policy"] = (
+            "default-src 'self' blob: data:; script-src 'self' 'unsafe-inline' blob:; "
+            "style-src 'self' 'unsafe-inline'; worker-src 'self' blob:; "
+            "connect-src 'self'; img-src 'self' data: blob:; "
+            "frame-ancestors http://127.0.0.1:* http://localhost:*"
+        )
+    return FileResponse(target, media_type=mt, headers=headers)
+
+
 @content_app.get(
     "/files/{path:path}",
     responses={
@@ -1378,25 +1419,11 @@ async def static_files(path: str) -> Any:
     # Active content (.html/.svg/...) must never render as a document, even on the
     # sandboxed content origin: forcing a download removes the question entirely.
     disposition = content_disposition_for(target.name)
-    # PDF files: NO sandbox at all. The sandbox directive blocks Web Workers
-    # even with allow-scripts — pdf.js needs workers to parse the PDF binary.
-    # Without workers it shows toolbar but "0 of 0" pages (proven on real guest).
-    # PDFs are binary data rendered by the browser's own trusted pdf.js, not
-    # untrusted HTML/script — sandbox serves no security purpose for them.
-    ext = target.suffix.lower()
-    if ext == ".pdf":
-        csp = (
-            "default-src 'self' blob: data:; script-src 'self' 'unsafe-inline' blob:; "
-            "style-src 'self' 'unsafe-inline'; worker-src 'self' blob:; "
-            "img-src 'self' data: blob:; "
-            "frame-ancestors http://127.0.0.1:* http://localhost:*"
-        )
-    else:
-        csp = (
-            "sandbox; default-src 'none'; img-src 'self' data: blob:; "
-            "media-src 'self' blob:; style-src 'unsafe-inline'; "
-            "frame-ancestors http://127.0.0.1:* http://localhost:*"
-        )
+    csp = (
+        "sandbox; default-src 'none'; img-src 'self' data: blob:; "
+        "media-src 'self' blob:; style-src 'unsafe-inline'; "
+        "frame-ancestors http://127.0.0.1:* http://localhost:*"
+    )
     return FileResponse(
         target,
         headers={
@@ -3010,9 +3037,16 @@ async def read_document(
         )
 
     if ext == ".pdf":
+        # pdf.js viewer: renders via canvas, no browser PDF plugin needed.
+        # WebKitGTK (QEMU guest) has no built-in PDF handler and freezes on
+        # raw <iframe src="file.pdf">. The vendored viewer works everywhere.
+        viewer_url = (
+            "/assets/pdfjs/web/viewer.html?file="
+            + urllib.parse.quote(file_url, safe="")
+        )
         body = (
             "<h1>" + esc_name + "</h1>" + toolbar()
-            + '<iframe class="doc-frame" src="' + file_url + '#view=FitH" title="' + esc_name + '"></iframe>'
+            + '<iframe class="doc-frame" src="' + viewer_url + '" title="' + esc_name + '"></iframe>'
         )
         return HTMLResponse(_themed_page(name, body, back_href, back_label), headers=trusted_page_headers())
 

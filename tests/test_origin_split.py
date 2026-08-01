@@ -136,12 +136,13 @@ def test_raw_downloaded_files_are_sandboxed(tmp_path, monkeypatch):
     (tmp_path / "data.bin").write_bytes(b"\x00" * 16)
     monkeypatch.setattr(web, "BUCKET", bucket)
 
-    # PDF: NO sandbox (workers blocked even with allow-scripts in WebKitGTK)
+    # PDF: strict sandbox (raw bytes never rendered by the browser — pdf.js viewer
+    # handles rendering from a separate /assets/pdfjs/ route with its own CSP).
     r = TestClient(web.content_app).get("/files/payload.pdf", follow_redirects=False)
     assert r.status_code == 200, r.status_code
     csp = r.headers.get("content-security-policy", "")
-    assert "sandbox" not in csp, f"PDF has sandbox which blocks pdf.js workers: {csp!r}"
-    assert "worker-src" in csp, f"PDF CSP needs worker-src for pdf.js: {csp}"
+    assert "sandbox" in csp, f"raw PDF served without sandbox: {csp!r}"
+    assert "default-src 'none'" in csp, f"raw PDF has relaxed CSP: {csp}"
     assert r.headers.get("content-disposition", "").startswith("inline"), (
         "a PDF is inline-safe and must still render in the reader"
     )

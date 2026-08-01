@@ -89,39 +89,50 @@ def test_media_file_is_still_served(media_bucket):
 
 
 # ---------------------------------------------------------------------------
-# PDF CSP: WebKitGTK needs allow-scripts to render PDFs inline
+# PDF rendering: vendored pdf.js viewer (WebKitGTK has no PDF handler)
 # ---------------------------------------------------------------------------
-def test_pdf_has_no_sandbox_and_allows_workers(media_bucket):
-    """pdf.js needs Web Workers to parse PDFs — sandbox blocks them entirely.
+def test_pdf_reader_uses_pdfjs_viewer(media_bucket):
+    """PDFs must be rendered by the vendored pdf.js, not a raw iframe src.
 
-    Even sandbox allow-scripts blocks workers in WebKitGTK. Without workers,
-    pdf.js shows toolbar but '0 of 0' pages (proven on real guest). PDFs are
-    binary data rendered by the browser's own trusted pdf.js, not untrusted
-    HTML — sandbox serves no security purpose for them.
+    WebKitGTK (QEMU guest) has no built-in PDF handler. Loading a raw PDF in
+    an iframe either freezes the VM or shows blank content. The pdf.js viewer
+    renders via canvas and works in any browser.
+    """
+    r = TestClient(web.content_app).get(
+        "/read?path=101omelettes0000clau/101omelettes.pdf", follow_redirects=False
+    )
+    assert r.status_code == 200
+    body = r.text
+    assert "viewer.html" in body, (
+        "PDF reader does not use the pdf.js viewer — raw iframe will freeze WebKitGTK"
+    )
+    assert "assets/pdfjs" in body, (
+        "PDF reader does not reference the vendored pdf.js assets"
+    )
+
+
+def test_pdfjs_viewer_assets_are_served(media_bucket):
+    """The vendored pdf.js viewer HTML must be accessible on the content plane."""
+    r = TestClient(web.content_app).get(
+        "/assets/pdfjs/web/viewer.html", follow_redirects=False
+    )
+    assert r.status_code == 200, f"pdf.js viewer not served: {r.status_code}"
+    assert "pdf" in r.text.lower(), "viewer.html does not appear to be a PDF viewer"
+
+
+def test_pdf_raw_file_keeps_strict_sandbox(media_bucket):
+    """Raw PDF bytes via /files/ keep the strict sandbox CSP.
+
+    PDFs are no longer loaded raw by the browser (pdf.js handles rendering),
+    so the raw bytes can stay fully sandboxed with no scripts allowed.
     """
     r = TestClient(web.content_app).get(
         "/files/101omelettes0000clau/101omelettes.pdf", follow_redirects=False
     )
     assert r.status_code == 200
     csp = r.headers.get("content-security-policy", "")
-    assert "sandbox" not in csp, (
-        f"PDF has sandbox CSP which blocks Web Workers: {csp}"
-    )
-    assert "worker-src" in csp, (
-        f"PDF CSP missing worker-src directive needed by pdf.js: {csp}"
-    )
-
-
-def test_non_pdf_keeps_strict_sandbox_csp(media_bucket):
-    """Non-PDF files must stay sandboxed with no scripts allowed."""
-    (media_bucket / "notes.txt").write_text("hello")
-    r = TestClient(web.content_app).get("/files/notes.txt", follow_redirects=False)
-    assert r.status_code == 200
-    csp = r.headers.get("content-security-policy", "")
-    assert "sandbox;" in csp, f"non-PDF file has relaxed CSP: {csp}"
-    assert "allow-scripts" not in csp, (
-        f"non-PDF file has allow-scripts, which is a security regression: {csp}"
-    )
+    assert "sandbox;" in csp, f"raw PDF not sandboxed: {csp}"
+    assert "default-src 'none'" in csp, f"raw PDF has relaxed CSP: {csp}"
 
 
 # --------------------------------------------------------------------------

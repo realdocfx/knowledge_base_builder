@@ -1,1 +1,1 @@
-fix: remove sandbox CSP for PDFs - Web Workers blocked even with allow-scripts
+feat: vendor pdf.js viewer for cross-renderer PDF display - fixes WebKitGTK freeze
