@@ -91,20 +91,24 @@ def test_media_file_is_still_served(media_bucket):
 # ---------------------------------------------------------------------------
 # PDF CSP: WebKitGTK needs allow-scripts to render PDFs inline
 # ---------------------------------------------------------------------------
-def test_pdf_gets_allow_scripts_csp(media_bucket):
-    """WebKitGTK has no browser-level PDF handler — it needs JavaScript.
+def test_pdf_has_no_sandbox_and_allows_workers(media_bucket):
+    """pdf.js needs Web Workers to parse PDFs — sandbox blocks them entirely.
 
-    Without allow-scripts, the PDF viewer toolbar appears but the content area
-    stays blank (proven on the real guest image). Chrome bypasses CSP for its
-    built-in PDF viewer, but WebKitGTK does not.
+    Even sandbox allow-scripts blocks workers in WebKitGTK. Without workers,
+    pdf.js shows toolbar but '0 of 0' pages (proven on real guest). PDFs are
+    binary data rendered by the browser's own trusted pdf.js, not untrusted
+    HTML — sandbox serves no security purpose for them.
     """
     r = TestClient(web.content_app).get(
         "/files/101omelettes0000clau/101omelettes.pdf", follow_redirects=False
     )
     assert r.status_code == 200
     csp = r.headers.get("content-security-policy", "")
-    assert "allow-scripts" in csp, (
-        f"PDF served without allow-scripts; WebKitGTK cannot render it: {csp}"
+    assert "sandbox" not in csp, (
+        f"PDF has sandbox CSP which blocks Web Workers: {csp}"
+    )
+    assert "worker-src" in csp, (
+        f"PDF CSP missing worker-src directive needed by pdf.js: {csp}"
     )
 
 

@@ -1,1 +1,1 @@
-feat(sandbox): PDF CSP fix, media ISO patches, overlayfs bucket, ZIM filter
+fix: remove sandbox CSP for PDFs - Web Workers blocked even with allow-scripts

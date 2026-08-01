@@ -1378,14 +1378,17 @@ async def static_files(path: str) -> Any:
     # Active content (.html/.svg/...) must never render as a document, even on the
     # sandboxed content origin: forcing a download removes the question entirely.
     disposition = content_disposition_for(target.name)
-    # PDF files need allow-scripts: WebKitGTK (the QEMU guest renderer) has no
-    # browser-level PDF handler like Chrome — it needs JavaScript to render pages.
-    # Without allow-scripts the viewer toolbar appears but content is blank.
+    # PDF files: NO sandbox at all. The sandbox directive blocks Web Workers
+    # even with allow-scripts — pdf.js needs workers to parse the PDF binary.
+    # Without workers it shows toolbar but "0 of 0" pages (proven on real guest).
+    # PDFs are binary data rendered by the browser's own trusted pdf.js, not
+    # untrusted HTML/script — sandbox serves no security purpose for them.
     ext = target.suffix.lower()
     if ext == ".pdf":
         csp = (
-            "sandbox allow-scripts allow-same-origin; default-src 'self' blob: data:; "
-            "style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; "
+            "default-src 'self' blob: data:; script-src 'self' 'unsafe-inline' blob:; "
+            "style-src 'self' 'unsafe-inline'; worker-src 'self' blob:; "
+            "img-src 'self' data: blob:; "
             "frame-ancestors http://127.0.0.1:* http://localhost:*"
         )
     else:
