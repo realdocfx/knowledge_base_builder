@@ -293,29 +293,27 @@ def test_the_kiosk_serves_the_library_directory(rootfs):
 
 
 def test_the_ui_is_configured_for_software_rendering(rootfs):
-    """A VM has no GPU, and WebKitGTK's default renderer needs one.
+    """A VM has no GPU, and both the compositor and WebKitGTK need telling.
 
-    The guest reached the UI: cage started, launch_kbb ran, it attached to the
-    portal -- and nothing ever painted. The log says why:
+    Two layers must render in software:
 
-        libEGL warning: egl: failed to create dri2 screen
-        MESA: error: ZINK: vkCreateInstance failed (VK_ERROR_INCOMPATIBLE_DRIVER)
-        libEGL warning: NEEDS EXTENSION: falling back to kms_swrast
+    * **cage/wlroots**: ``WLR_RENDERER=pixman`` selects a pure-software renderer
+      that never touches EGL/GL. The GL path fails because current Mesa REFUSES
+      ``LIBGL_ALWAYS_SOFTWARE`` once EGL has opened the virtio-gpu device.
+      pixman sidesteps that fight entirely.
 
-    WebKitGTK renders through a DMA-BUF path that assumes a working GPU. With
-    virtio-vga and no virgl there is none, so it degrades to a fallback that
-    initialises and then produces no frames. The process is alive, the marker
-    fires, and the screen stays on the last kernel message -- which is precisely
-    the failure a liveness check cannot see.
+    * **WebKitGTK**: its DMA-BUF path assumes a working GPU. With virtio-vga and
+      no virgl it initialises, falls back, and produces no frames.
+      ``WEBKIT_DISABLE_DMABUF_RENDERER`` drops it to a CPU raster path.
 
     Forcing the software path is not a workaround for a broken GPU; it is the
     correct configuration for a machine that has none.
     """
     svc = _read(rootfs, "etc/init.d/kbb-kiosk")
-    for var in ("WEBKIT_DISABLE_DMABUF_RENDERER", "LIBGL_ALWAYS_SOFTWARE"):
+    for var in ("WEBKIT_DISABLE_DMABUF_RENDERER", "WLR_RENDERER"):
         assert var in svc, (
-            f"{var} is not exported; WebKitGTK will take a GPU path the guest "
-            "cannot satisfy and the window will never paint"
+            f"{var} is not exported; the graphics stack will take a GPU path the "
+            "guest cannot satisfy and the window will never paint"
         )
 
 

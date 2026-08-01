@@ -34,11 +34,20 @@ from knowledge_base_builder import cli
 @pytest.fixture()
 def launchers(tmp_path):
     cli._write_sandbox_launchers(tmp_path)
-    return {
+    out = {
         p.name: p.read_text(encoding="utf-8")
         for p in tmp_path.iterdir()
         if p.suffix in (".bat", ".sh")
     }
+    # The .bat drives its SCSI enumeration from a sibling kbb_drivegen.ps1;
+    # fold it in so per-launcher assertions see the controller and drives.
+    gen = tmp_path / "kbb_drivegen.ps1"
+    if gen.is_file():
+        gen_text = gen.read_text(encoding="utf-8")
+        for name in list(out):
+            if name.endswith(".bat"):
+                out[name] = out[name] + "\n" + gen_text
+    return out
 
 
 def _code(body: str) -> str:

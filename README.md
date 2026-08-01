@@ -288,7 +288,7 @@ kb-builder portable D:\ --with-alpine --allow-insecure-network
 Injects `/boot/` (Alpine kernel + initramfs + kiosk overlay), `/EFI/BOOT/`
 (GRUB2 bootloader + `grub.cfg`). The target host boots from USB via the UEFI
 boot menu — Alpine loads into RAM, mounts the stick read-only, and launches
-the KBB portal in a Cage/Chromium kiosk. Zero trace on host storage.
+the KBB portal in a Cage/WebKitGTK kiosk. Zero trace on host storage.
 
 #### Provision Mode C (QEMU sandbox)
 
@@ -296,11 +296,15 @@ the KBB portal in a Cage/Chromium kiosk. Zero trace on host storage.
 kb-builder portable D:\ --with-qemu --allow-insecure-network
 ```
 
-Downloads portable QEMU binaries and generates `start_sandbox.bat` /
-`start_sandbox.sh`. The launcher self-elevates (UAC on Windows, sudo on
-Linux), auto-detects the USB's physical drive, and boots the same Alpine
-kernel inside a QEMU VM with raw disk passthrough (read-only). The portal
-runs inside the VM, accessible from the host browser at `http://localhost:8080`.
+Downloads portable QEMU binaries, generates `start_sandbox.bat` /
+`start_sandbox.sh`, and writes `kbb_drivegen.ps1`. **No admin elevation
+is needed** — each ZIM slice is attached as a file-backed SCSI disk that
+QEMU reads through a normal cached file handle. The guest boots a
+prebuilt image (`kbb_guest.img`) with cage + WebKitGTK rendering the
+Tauri UI fullscreen inside the VM (the same UI as host-native Mode B).
+`kbb-blkfuse` presents each block device as a regular file so libzim can
+read it. The operator sees only the QEMU window — no host browser
+interaction is required.
 
 #### Provision both modes at once
 
@@ -319,6 +323,8 @@ D:\
 ├── C2_Portal.bat               # Mode B: batch launcher
 ├── start_sandbox.bat           # Mode C: QEMU sandbox (Windows)
 ├── start_sandbox.sh            # Mode C: QEMU sandbox (Linux/macOS)
+├── kbb_drivegen.ps1            # Mode C: ZIM slice enumerator (called by .bat)
+├── kbb_guest.img               # Mode C: prebuilt Alpine guest filesystem
 ├── EFI/BOOT/                   # Mode A: UEFI bootloader
 │   ├── BOOTX64.EFI
 │   └── grub.cfg

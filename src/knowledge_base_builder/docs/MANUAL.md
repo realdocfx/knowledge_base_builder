@@ -122,7 +122,8 @@ items, ZIM slices, search state).
 
 Boot the target hardware directly from the USB stick. Alpine Linux loads entirely
 into RAM — **zero trace** on host storage upon power-off or physical device
-detachment. The KBB portal runs in a Cage/Chromium kiosk.
+detachment. The KBB portal runs in a Cage/WebKitGTK kiosk (the same Tauri UI as
+host-native Mode B).
 
 **One-time preparation** (on the build PC, once per stick):
 ```bash
@@ -136,7 +137,7 @@ This downloads the Alpine kernel, initramfs, modloop, and GRUB2 EFI bootloader
 2. Enter the UEFI/BIOS boot menu (typically **F12**, **F2**, or **Esc** at power-on).
 3. Select the USB drive. GRUB shows: **"KBB Tactical OSINT Appliance (Amnesic RAM)"**.
 4. Press Enter. Alpine loads into RAM (~5 seconds), mounts the stick read-only,
-   and starts the KBB portal in a fullscreen Cage/Chromium kiosk.
+   and starts the KBB portal in a fullscreen Cage/WebKitGTK kiosk.
 5. **Power off = total erasure.** Nothing is written to the host's internal storage.
 
 **Requirements:**
@@ -156,47 +157,55 @@ This downloads the Alpine kernel, initramfs, modloop, and GRUB2 EFI bootloader
 
 Run the KBB portal **inside a hypervisor** on the host OS. The QEMU virtual
 machine isolates OSINT processing from the host's EDR, DLP, and antivirus
-telemetry. The stick's content is passed to the guest via read-only raw disk
-passthrough — no file size or entry count limits.
+telemetry. Each ZIM slice on the stick is delivered to the guest as a
+**file-backed SCSI disk** — zero-copy, no admin elevation, no file-size limits.
 
 **One-time preparation** (on the build PC, once per stick):
 ```bash
 kb-builder portable E:\ --with-qemu --allow-insecure-network
 ```
-This downloads the portable QEMU binary (~240 MB for Windows) and generates the
-sandbox launcher scripts.
+This downloads the portable QEMU binary (~240 MB for Windows), generates the
+sandbox launcher scripts (`start_sandbox.bat`, `start_sandbox.sh`), and writes
+the ZIM enumerator (`kbb_drivegen.ps1`).
 
 **Using it in the field:**
 
 ### Windows
 1. Insert the stick.
 2. Double-click **`start_sandbox.bat`** at the drive root.
-3. A UAC prompt appears — click **Yes** (raw disk access requires admin).
-4. A console window shows Alpine booting; the KBB portal starts inside the VM.
-5. Open `http://localhost:8080` in the host browser.
+3. **No UAC prompt** — file-backed drives need no admin privileges.
+4. The QEMU window opens fullscreen; the guest boots and renders the KBB portal
+   UI inside the VM (Cage/WebKitGTK, the same Tauri UI as host-native Mode B).
+5. The operator interacts with the QEMU window directly — no host browser needed.
 
 ### Linux / macOS
 1. Insert the stick and note the mount point.
 2. Run `./start_sandbox.sh` from the stick root.
-3. Enter sudo password when prompted.
-4. Open `http://localhost:8080` in the host browser.
+3. **No sudo needed** — QEMU reads ordinary files.
+4. The QEMU window shows the KBB UI fullscreen.
 
 **How it works:**
-- The launcher auto-detects the USB's physical drive number (Windows) or block
-  device (Linux/macOS).
-- QEMU boots the **same Alpine kernel** used by Mode A — direct-kernel-boot,
-  no virtual disk image, no BIOS emulation.
-- The stick's FAT32 partition is passed as a read-only virtio block device
-  (`\\.\PhysicalDriveN` on Windows, `/dev/sdX` on Linux). The guest mounts it
-  at `/media/kbb` and runs the KBB portal from `.kb_env/python`.
-- Port 8080 is forwarded from the guest to the host for browser access.
+- The launcher enumerates every `.zim*` file in `library/archive/` and attaches
+  each as a read-only disk on a single `virtio-scsi-pci` controller (up to 256
+  targets). A manifest disk at SCSI target 0 carries a V2 text manifest:
+  `<target> <filename> <true_size>`.
+- QEMU boots a **prebuilt Alpine guest image** (`kbb_guest.img`) — direct-kernel-
+  boot with `vmlinuz-kbb` + `initramfs-kbb`, no BIOS emulation.
+- The guest loads `virtio_scsi` + `sd_mod` post-boot, reads the manifest from
+  SCSI target 0, and mounts the ZIM slices via **kbb-blkfuse** (a FUSE layer
+  that presents each block device as a regular file of its true size — libzim
+  cannot `fstat()` a block device, which reports size 0).
+- kiwix-serve reads the FUSE-presented files normally; the portal and Tauri UI
+  run inside the guest. The display uses GTK (not SDL, which hangs on Windows).
 
-**Why not QEMU's virtual FAT (`vvfat`) driver?**
+**Why not raw passthrough or vvfat?**
 
-The `vvfat` driver reconstructs a FAT filesystem in memory. It has a hard root
-directory entry limit and fails on sticks with many files (the typical KBB stick
-has 100+ items). Raw disk passthrough has no such limit — it gives the guest the
-real FAT32 partition directly.
+- **Raw `\\.\PhysicalDriveN`**: QEMU blocks in an uninterruptible driver read
+  because Windows owns the mounted volume. `cache=none,aio=threads` is racy.
+  The lock+dismount workaround makes the stick disappear (`mountvol /P` marks
+  it not-mountable across replug).
+- **vvfat**: synthesises a fixed ~516 MB volume — cannot carry a 119 GB archive.
+  Also caps files at 2 GB and root-directory entries at ~100.
 
 ---
 

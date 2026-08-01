@@ -40,6 +40,15 @@ def launchers(tmp_path):
     for p in tmp_path.iterdir():
         if p.is_file() and p.suffix in (".bat", ".sh", ".command"):
             out[p.name] = p.read_text(encoding="utf-8")
+    # The .bat delegates ZIM enumeration to a sibling kbb_drivegen.ps1 (a .bat
+    # cannot carry a multi-line PowerShell block inline). Fold it into the .bat
+    # body so the launcher's full behaviour is visible to assertions.
+    gen = tmp_path / "kbb_drivegen.ps1"
+    if gen.is_file():
+        gen_text = gen.read_text(encoding="utf-8")
+        for name in list(out):
+            if name.endswith(".bat"):
+                out[name] = out[name] + "\n" + gen_text
     assert out, "no sandbox launchers were generated"
     return out
 

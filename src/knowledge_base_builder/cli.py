@@ -1811,7 +1811,7 @@ def _install_guest_image(root: Path, source: Optional[str] = None) -> None:
 SANDBOX_INFRA_NAMES = frozenset({
     ".kb_env", ".kb_state", ".ia_state", "qemu", "boot", "EFI", "docs",
     "kbb_guest.img", "vmlinuz-kbb", "initramfs-kbb",
-    "start_sandbox.bat", "start_sandbox.sh", "Launch_KBB.exe",
+    "start_sandbox.bat", "start_sandbox.sh", "kbb_drivegen.ps1", "Launch_KBB.exe",
     "System Volume Information", "$RECYCLE.BIN",
 })
 
@@ -1863,10 +1863,13 @@ VVFAT_MAX_ROOT_ENTRIES = 100
 #
 # So even with a small exposed root and every slice under 2 GiB -- both of which
 # were achieved -- vvfat cannot present a 130 GB archive. It is not a tuning
-# problem. No vvfat drive is emitted, and the remaining routes are a block-device
-# attach per slice (raw virtio-blk has no size limit; whether libzim will read a
-# block device is untested, and stat() reports st_size 0 for one) or raw
-# passthrough, which reintroduces the UAC prompt.
+# problem. No vvfat drive is emitted.
+#
+# The shipping solution: each ZIM slice is a file-backed SCSI disk on a
+# virtio-scsi controller (no size limit, no admin). libzim cannot fstat() a
+# block device (returns 0), so kbb-blkfuse presents each device as a regular
+# file of its true size. See _write_sandbox_launchers() and the kbb-kiosk init
+# script for the implementation.
 VVFAT_MAX_VOLUME_BYTES = 516 * 1024 * 1024
 
 
@@ -2008,16 +2011,89 @@ def _write_sandbox_launchers(root: Path, port: int = 8080) -> None:
     )
 
     # -----------------------------------------------------------------
+    # Windows drive generator (kbb_drivegen.ps1)
+    # -----------------------------------------------------------------
+    # A companion PowerShell script the .bat invokes with -File. It enumerates
+    # ZIM slices at runtime -- dynamic, not static, so content added after
+    # provisioning is picked up without re-running `kb-builder portable` -- and
+    # writes two files:
+    #   %MANIFEST%  the guest's V2 manifest padded to 8 KiB (SCSI target 0)
+    #   %DRIVECFG%  a QEMU -readconfig file describing every file-backed drive
+    #
+    # It MUST be its own file, not an inline `powershell -Command "& { ... }"`
+    # block: cmd.exe parses each physical line of a .bat as a separate command,
+    # so a multi-line inline block runs only its first line (an unterminated
+    # script) and silently writes nothing -- the defect that left QEMU booting
+    # with no ZIM drives. A -File script is immune. Single double-quotes here
+    # (escaped with a backtick where a value must contain one) rather than the
+    # doubled "" an inline -Command demands: the file is far easier to read and
+    # cannot regress into that quoting trap.
+    drivegen_lines = [
+        "# kbb_drivegen.ps1 -- enumerate the ZIM slices on the stick and write",
+        "# the two files start_sandbox.bat feeds to QEMU. It runs as a -File",
+        "# script, never inline, because a .bat cannot carry a multi-line",
+        "# PowerShell block (cmd.exe would run only its first line). USB,",
+        "# MANIFEST and DRIVECFG are exported by the .bat before it calls this.",
+        "$usb = $env:USB",
+        "$archive = $null",
+        "foreach ($d in @(",
+        "    (Join-Path $usb 'library\\archive'),",
+        "    (Join-Path $usb 'library'),",
+        "    $usb",
+        ")) { if (Test-Path $d -PathType Container) { $archive = $d; break } }",
+        "if (-not $archive) { exit }",
+        "$slices = @(Get-ChildItem $archive -File |",
+        "    Where-Object { $_.Name -match '\\.zim([a-z]{2})?$' } |",
+        "    Sort-Object Name)",
+        "if ($slices.Count -eq 0) {",
+        "    Write-Host '[KBB] No ZIM slices found; booting without content'",
+        "    if (Test-Path $env:DRIVECFG) { Remove-Item $env:DRIVECFG -ErrorAction SilentlyContinue }",
+        "    exit",
+        "}",
+        "$manifest = @('KBB_MANIFEST_V2')",
+        "$cfg = @('[device \"scsi0\"]', '  driver = \"virtio-scsi-pci\"', '')",
+        "$n = 0",
+        "foreach ($s in $slices) {",
+        "    $n++",
+        "    $manifest += \"$n $($s.Name) $($s.Length)\"",
+        "    $f = ($s.FullName -replace '\\\\','/')",
+        "    $cfg += \"[drive `\"zim$n`\"]\"",
+        "    $cfg += \"  file = `\"$f`\"\"",
+        "    $cfg += '  format = \"raw\"'",
+        "    $cfg += '  if = \"none\"'",
+        "    $cfg += '  readonly = \"on\"'",
+        "    $cfg += \"[device `\"zim${n}d`\"]\"",
+        "    $cfg += '  driver = \"scsi-hd\"'",
+        "    $cfg += \"  drive = `\"zim$n`\"\"",
+        "    $cfg += '  bus = \"scsi0.0\"'",
+        "    $cfg += \"  scsi-id = `\"$n`\"\"",
+        "    $cfg += '  lun = \"0\"'",
+        "    $cfg += ''",
+        "}",
+        "$raw = ($manifest -join \"`n\").PadRight(8192, [char]0)",
+        "[System.IO.File]::WriteAllBytes($env:MANIFEST,",
+        "    [System.Text.Encoding]::ASCII.GetBytes($raw))",
+        "$mf = ($env:MANIFEST -replace '\\\\','/')",
+        "$cfg += '[drive \"manifest\"]'",
+        "$cfg += \"  file = `\"$mf`\"\"",
+        "$cfg += '  format = \"raw\"'",
+        "$cfg += '  if = \"none\"'",
+        "$cfg += '  readonly = \"on\"'",
+        "$cfg += '[device \"manifestd\"]'",
+        "$cfg += '  driver = \"scsi-hd\"'",
+        "$cfg += '  drive = \"manifest\"'",
+        "$cfg += '  bus = \"scsi0.0\"'",
+        "$cfg += '  scsi-id = \"0\"'",
+        "$cfg += '  lun = \"0\"'",
+        "($cfg -join \"`n\") | Set-Content $env:DRIVECFG -Encoding ASCII",
+        "Write-Host \"[KBB] $n ZIM slice(s) from $archive (no admin required)\"",
+    ]
+
+    # -----------------------------------------------------------------
     # Windows launcher (.bat)
     # -----------------------------------------------------------------
-    # The batch script uses PowerShell to enumerate ZIM slices at runtime,
-    # generate a manifest file, and build the SCSI drive arguments. This is
-    # dynamic rather than static so content added after provisioning is picked
-    # up without re-running `kb-builder portable`.
-    #
-    # The PowerShell block writes two temp files:
-    #   %TEMP%\kbb_manifest.bin  -- text manifest padded to 512 bytes (one sector)
-    #   %TEMP%\kbb_drives.cfg    -- single-line QEMU drive/device arguments
+    # The batch invokes kbb_drivegen.ps1 (above) to enumerate slices, then
+    # boots the guest with the resulting -readconfig drive file.
     win_lines = [
         "@echo off",
         "SETLOCAL EnableDelayedExpansion",
@@ -2056,61 +2132,13 @@ def _write_sandbox_launchers(root: Path, port: int = 8080) -> None:
         ":: size to hide that padding.",
         r'SET "MANIFEST=%TEMP%\kbb_manifest.bin"',
         r'SET "DRIVECFG=%TEMP%\kbb_drives.cfg"',
-        'powershell -NoProfile -ExecutionPolicy Bypass -Command "& {',
-        "    $usb = $env:USB",
-        "    $archive = $null",
-        "    foreach ($d in @(",
-        "        (Join-Path $usb 'library\\archive'),",
-        "        (Join-Path $usb 'library'),",
-        "        $usb",
-        "    )) { if (Test-Path $d -PathType Container) { $archive = $d; break } }",
-        "    if (-not $archive) { exit }",
-        "    $slices = @(Get-ChildItem $archive -File |",
-        "        Where-Object { $_.Name -match '\\.zim([a-z]{2})?$' } |",
-        "        Sort-Object Name)",
-        "    if ($slices.Count -eq 0) {",
-        "        Write-Host '[KBB] No ZIM slices found; booting without content'",
-        "        Remove-Item $env:DRIVECFG -ErrorAction SilentlyContinue",
-        "        exit",
-        "    }",
-        "    $manifest = @('KBB_MANIFEST_V2')",
-        "    $cfg = @(\"[device \"\"scsi0\"\"]\", \"  driver = \"\"virtio-scsi-pci\"\"\", \"\")",
-        "    $n = 0",
-        "    foreach ($s in $slices) {",
-        "        $n++",
-        "        $manifest += \"$n $($s.Name) $($s.Length)\"",
-        "        $f = ($s.FullName -replace '\\\\','/')",
-        "        $cfg += \"[drive \"\"zim$n\"\"]\"",
-        "        $cfg += \"  file = \"\"$f\"\"\"",
-        "        $cfg += \"  format = \"\"raw\"\"\"",
-        "        $cfg += \"  if = \"\"none\"\"\"",
-        "        $cfg += \"  readonly = \"\"on\"\"\"",
-        "        $cfg += \"[device \"\"zim${n}d\"\"]\"",
-        "        $cfg += \"  driver = \"\"scsi-hd\"\"\"",
-        "        $cfg += \"  drive = \"\"zim$n\"\"\"",
-        "        $cfg += \"  bus = \"\"scsi0.0\"\"\"",
-        "        $cfg += \"  scsi-id = \"\"$n\"\"\"",
-        "        $cfg += \"  lun = \"\"0\"\"\"",
-        "        $cfg += \"\"",
-        "    }",
-        "    $raw = ($manifest -join \"`n\").PadRight(8192, [char]0)",
-        "    [System.IO.File]::WriteAllBytes($env:MANIFEST,",
-        "        [System.Text.Encoding]::ASCII.GetBytes($raw))",
-        "    $mf = ($env:MANIFEST -replace '\\\\','/')",
-        "    $cfg += \"[drive \"\"manifest\"\"]\"",
-        "    $cfg += \"  file = \"\"$mf\"\"\"",
-        "    $cfg += \"  format = \"\"raw\"\"\"",
-        "    $cfg += \"  if = \"\"none\"\"\"",
-        "    $cfg += \"  readonly = \"\"on\"\"\"",
-        "    $cfg += \"[device \"\"manifestd\"\"]\"",
-        "    $cfg += \"  driver = \"\"scsi-hd\"\"\"",
-        "    $cfg += \"  drive = \"\"manifest\"\"\"",
-        "    $cfg += \"  bus = \"\"scsi0.0\"\"\"",
-        "    $cfg += \"  scsi-id = \"\"0\"\"\"",
-        "    $cfg += \"  lun = \"\"0\"\"\"",
-        "    ($cfg -join \"`n\") | Set-Content $env:DRIVECFG -Encoding ASCII",
-        "    Write-Host \"[KBB] $n ZIM slice(s) from $archive (no admin required)\"",
-        '}"',
+        ":: The enumeration lives in kbb_drivegen.ps1, NOT inline here. cmd.exe",
+        ":: parses each physical line of a .bat as its own command, so a",
+        ":: multi-line inline PowerShell block would run only its first line",
+        ":: (an unterminated script) and silently write nothing -- the defect",
+        ":: that left QEMU booting with no ZIM drives. A -File script is immune.",
+        ":: USB/MANIFEST/DRIVECFG above are inherited as env vars.",
+        'powershell -NoProfile -ExecutionPolicy Bypass -File "%USB%kbb_drivegen.ps1"',
         "",
         'SET "READCFG="',
         'IF EXIST "%DRIVECFG%" SET "READCFG=-readconfig "%DRIVECFG%""',
@@ -2128,11 +2156,22 @@ def _write_sandbox_launchers(root: Path, port: int = 8080) -> None:
         "    -device virtio-vga ^",
         "    -device virtio-keyboard-pci -device virtio-tablet-pci ^",
         r'    -serial file:"%TEMP%\kbb_sandbox.log" ^',
-        r'    -full-screen -display sdl,grab-mod=rctrl 2>"%TEMP%\kbb_qemu.log"',
+        # GTK, not SDL. On Windows the SDL display hangs QEMU the instant the
+        # guest switches fbcon to the virtio-gpu framebuffer: the window stops
+        # responding (WER logs AppHangB1) and the guest freezes mid-boot,
+        # because SDL2 fullscreen performs an exclusive display mode change.
+        # GTK does a composited window-manager fullscreen instead and boots
+        # straight through to the live UI (proven on the real image, QEMU
+        # 9.2.0). zoom-to-fit scales the guest to fill the screen.
+        r'    -full-screen -display gtk,zoom-to-fit=on 2>"%TEMP%\kbb_qemu.log"',
     ]
     bat = root / "start_sandbox.bat"
     bat.write_bytes(("\r\n".join(win_lines) + "\r\n").encode("utf-8"))
     os.system(f'attrib -h "{bat}" >nul 2>&1')
+
+    drivegen = root / "kbb_drivegen.ps1"
+    drivegen.write_bytes(("\r\n".join(drivegen_lines) + "\r\n").encode("utf-8"))
+    os.system(f'attrib -h "{drivegen}" >nul 2>&1')
 
     # -----------------------------------------------------------------
     # POSIX launcher (.sh)

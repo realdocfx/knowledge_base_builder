@@ -61,8 +61,19 @@ def launchers(stick_with_zims):
     cli._write_sandbox_launchers(stick_with_zims)
     out = {}
     for p in stick_with_zims.iterdir():
-        if p.is_file() and p.suffix in (".bat", ".sh", ".ps1"):
+        if p.is_file() and p.suffix in (".bat", ".sh"):
             out[p.name] = p.read_text(encoding="utf-8")
+    # The Windows launcher delegates ZIM enumeration to a sibling PowerShell
+    # script -- a .bat parses each physical line separately, so a multi-line
+    # -Command block cannot live inline. That script is part of the launcher,
+    # so fold it into the .bat body: assertions about the drive configuration
+    # then see the whole mechanism as one launcher.
+    gen = stick_with_zims / "kbb_drivegen.ps1"
+    if gen.is_file():
+        gen_text = gen.read_text(encoding="utf-8")
+        for name in list(out):
+            if name.endswith(".bat"):
+                out[name] = out[name] + "\n" + gen_text
     assert out, "no sandbox launchers were generated"
     return out
 
@@ -168,6 +179,78 @@ class TestScsiConfiguration:
             assert "if=virtio" not in ln, (
                 f"ZIM slice uses virtio-blk instead of SCSI: {ln.strip()}"
             )
+
+
+# ---------------------------------------------------------------------------
+# Launcher: the .bat must be valid cmd, and the display must not hang QEMU
+# ---------------------------------------------------------------------------
+class TestLauncherIsWellFormed:
+    """Two field-fatal launcher defects, each with its own regression guard."""
+
+    def test_batch_has_no_multiline_powershell(self, stick_with_zims):
+        r"""cmd.exe parses each physical line of a .bat separately.
+
+        A multi-line ``powershell -Command "& { ... }"`` block splits at the
+        first newline: cmd runs ``powershell ... -Command "& {`` on its own --
+        an unterminated script that dies with ``Missing closing '}'`` -- and
+        then tries to execute ``$usb``, ``foreach`` and the rest as shell
+        commands.  The drive config is never written, so QEMU boots with no
+        ZIM drives at all.  The invariant that catches it: after joining ``^``
+        continuations, every logical command line has an even number of
+        double quotes (an odd count means an unterminated argument).
+        """
+        cli._write_sandbox_launchers(stick_with_zims)
+        bat = (stick_with_zims / "start_sandbox.bat").read_text(encoding="utf-8")
+        logical, buf = [], ""
+        for ln in bat.splitlines():
+            s = ln.rstrip("\r")
+            if s.endswith("^"):
+                buf += s[:-1]
+            else:
+                logical.append(buf + s)
+                buf = ""
+        if buf:
+            logical.append(buf)
+        for ll in logical:
+            assert ll.count('"') % 2 == 0, (
+                "unbalanced quotes on a cmd line -- a multi-line block will not "
+                f"run as one command: {ll!r}"
+            )
+        assert "-Command" not in bat, (
+            "an inline -Command block is fragile in a .bat; the drive generator "
+            "must be invoked as a separate -File script"
+        )
+
+    def test_drive_generator_is_a_shipped_script(self, stick_with_zims):
+        cli._write_sandbox_launchers(stick_with_zims)
+        gen = stick_with_zims / "kbb_drivegen.ps1"
+        assert gen.is_file(), "kbb_drivegen.ps1 was not generated next to the .bat"
+        bat = (stick_with_zims / "start_sandbox.bat").read_text(encoding="utf-8")
+        assert "-File" in bat and "kbb_drivegen.ps1" in bat, (
+            "the .bat does not invoke the drive generator via -File"
+        )
+        body = gen.read_text(encoding="utf-8")
+        for needle in ("KBB_MANIFEST_V2", "virtio-scsi-pci", "scsi-hd", "Get-ChildItem"):
+            assert needle in body, f"drive generator is missing {needle!r}"
+
+    def test_display_is_gtk_not_sdl(self, launchers):
+        r"""SDL ``-full-screen`` hangs QEMU on Windows at the framebuffer mode-set.
+
+        With ``-display sdl`` the guest froze exactly when fbcon switched to the
+        virtio-gpu framebuffer: QEMU's window stopped responding (Windows Error
+        Reporting logged AppHangB1) and the serial log died mid-boot.  GTK does
+        a composited window-manager fullscreen instead of an exclusive display
+        mode change and boots straight through to the live UI -- proven on the
+        real guest image with the bundled QEMU 9.2.0.
+        """
+        body = _primary(launchers)
+        assert "-display sdl" not in body, (
+            "the Windows launcher uses the SDL display, which hangs QEMU "
+            "fullscreen on Windows at the virtio-gpu mode-set (AppHangB1)"
+        )
+        assert "-display gtk" in body, (
+            "the Windows launcher does not select the GTK display"
+        )
 
 
 # ---------------------------------------------------------------------------

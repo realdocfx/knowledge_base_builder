@@ -200,6 +200,13 @@ def test_sandbox_launcher_uses_file_backed_scsi_drives(tmp_path):
 
     for name in ("start_sandbox.bat", "start_sandbox.sh"):
         raw = (tmp_path / name).read_text(encoding="utf-8")
+        # The .bat declares its virtio-scsi controller in a sibling
+        # kbb_drivegen.ps1 (a multi-line PowerShell block cannot live inline in
+        # a .bat); include it so the controller assertion sees the whole launcher.
+        if name.endswith(".bat"):
+            gen = tmp_path / "kbb_drivegen.ps1"
+            if gen.is_file():
+                raw = raw + "\n" + gen.read_text(encoding="utf-8")
         text = chr(10).join(
             ln for ln in raw.splitlines()
             if not ln.lstrip().startswith(("#", "::", "REM ", "rem "))

@@ -160,7 +160,7 @@ Knowledge-Base-Builder is a Python-based CLI tool that treats local storage (typ
 **Responsibilities:**
 - Provision Alpine Linux bare-metal boot infrastructure (Mode A)
 - Provision QEMU sandbox hypervisor binaries (Mode C)
-- Generate platform-specific sandbox launchers with raw disk passthrough
+- Generate platform-specific sandbox launchers with file-backed SCSI drives
 - Build the Alpine kiosk overlay (`apkovl.tar.gz`) that reuses `.kb_env/python`
 - Extend `cloning.py` so drive duplication includes boot/QEMU infrastructure
 
@@ -202,8 +202,8 @@ Knowledge-Base-Builder is a Python-based CLI tool that treats local storage (typ
 - **Non-destructive provisioning**: `--with-alpine` and `--with-qemu` only add files; existing content is never moved or deleted
 - **Shared kernel**: `boot/vmlinuz-lts` and `boot/initramfs-lts` serve both bare-metal UEFI boot and QEMU direct-kernel-boot — one artefact, two execution contexts
 - **SSOT Python runtime**: the Alpine kiosk overlay mounts the USB and runs `.kb_env/python/bin/python3` directly — no second Python installation inside the RAM disk
-- **Raw disk passthrough**: QEMU uses `\\.\PhysicalDriveN` (Windows) or `/dev/sdX` (Linux) instead of the `vvfat` virtual FAT driver, which has a hard root directory entry limit and cannot handle sticks with many files
-- **Self-elevating launchers**: `start_sandbox.bat` requests UAC elevation; `start_sandbox.sh` uses sudo — raw disk access requires privilege on all platforms
+- **File-backed SCSI drives**: each ZIM slice is attached as a read-only disk on a single `virtio-scsi-pci` controller (up to 256 targets). A manifest disk at SCSI target 0 maps `/dev/sdX` → filename. `kbb-blkfuse` presents each block device as a regular file of its true size (libzim cannot `fstat()` a block device). No admin elevation is needed — QEMU reads ordinary cached file handles
+- **No elevation**: `start_sandbox.bat` needs no UAC; `start_sandbox.sh` needs no sudo — file-backed drives use normal file I/O
 
 **Provisioning Functions (in `cli.py`):**
 
