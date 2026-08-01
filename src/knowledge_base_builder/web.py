@@ -3089,26 +3089,37 @@ async def read_document(
             doc.close()
         except Exception:
             num_pages = 0
-        page_imgs = []
-        page_url_base = "/pdf-page?path=" + urllib.parse.quote(rel, safe="") + "&p="
-        for p in range(num_pages):
-            page_imgs.append(
-                '<div style="margin:8px auto;max-width:900px;">'
-                '<img src="' + page_url_base + str(p)
-                + '" loading="lazy" alt="Page ' + str(p + 1)
-                + '" style="width:100%;display:block;box-shadow:0 2px 8px rgba(0,0,0,.3);"'
-                '></div>'
+        if num_pages > 0:
+            page_imgs = []
+            page_url_base = "/pdf-page?path=" + urllib.parse.quote(rel, safe="") + "&p="
+            for p in range(num_pages):
+                page_imgs.append(
+                    '<div style="margin:8px auto;max-width:900px;">'
+                    '<img src="' + page_url_base + str(p)
+                    + '" loading="lazy" alt="Page ' + str(p + 1)
+                    + '" style="width:100%;display:block;box-shadow:0 2px 8px rgba(0,0,0,.3);"'
+                    '></div>'
+                )
+            nav = '<span>' + str(num_pages) + ' page' + ('s' if num_pages != 1 else '') + '</span>'
+            body = (
+                "<h1>" + esc_name + "</h1>" + toolbar(nav)
+                + '<div style="max-height:calc(100vh - 172px);overflow:auto;">'
+                + '\n'.join(page_imgs)
+                + '</div>'
             )
-        nav = (
-            '<span>' + str(num_pages) + ' page'
-            + ('s' if num_pages != 1 else '') + '</span>'
-        )
-        body = (
-            "<h1>" + esc_name + "</h1>" + toolbar(nav)
-            + '<div style="max-height:calc(100vh - 172px);overflow:auto;">'
-            + '\n'.join(page_imgs)
-            + '</div>'
-        )
+        else:
+            try:
+                fsize = _human_size(target.stat().st_size)
+            except OSError:
+                fsize = "?"
+            body = (
+                "<h1>" + esc_name + "</h1>" + toolbar()
+                + '<div class="card" style="text-align:center;padding:40px;">'
+                + '<p style="font-size:1.2em;">PDF document &middot; ' + fsize + '</p>'
+                + '<a class="btn" href="' + file_url + '" download '
+                + 'style="font-size:1.1em;padding:12px 32px;">Download PDF</a>'
+                + '</div>'
+            )
         return HTMLResponse(_themed_page(name, body, back_href, back_label), headers=trusted_page_headers())
 
     if ext in _IMAGE_EXT:

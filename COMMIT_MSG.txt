@@ -1,1 +1,1 @@
-feat: server-side PDF rendering via PyMuPDF - fixes WebKitGTK freeze on all client-side approaches
+feat: add py3-pymupdf to GUEST_WORLD for server-side PDF rendering in sandbox
