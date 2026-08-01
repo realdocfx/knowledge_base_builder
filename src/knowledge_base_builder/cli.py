@@ -119,7 +119,12 @@ GUEST_WORLD = (
     # with fstat(), which returns 0 for a device), so kbb-blkfuse presents each
     # device as a regular file of its true size and kiwix-serve reads that.
     "fuse3",          # libfuse3, for kbb-blkfuse (compiled into the image)
-    "kiwix-tools",    # the Linux kiwix-serve the portal proxies to
+    # kiwix-serve is NOT the Alpine package: Alpine 3.20 ships kiwix-tools 3.7.0,
+    # whose bundled libzim cannot read a ZIM of format 6.3 -- "Unable to add the
+    # ZIM file to the internal library" -- while the guest's newer python libzim
+    # reads the very same file. The guest-image build installs the musl-static
+    # kiwix-tools 3.8.2 instead, matching the version the host already serves
+    # these archives with.
     "cage",           # single-surface Wayland kiosk: no taskbar, no switcher
     "seatd",          # cage needs a seat manager to claim the DRM device
     "webkit2gtk",     # Tauri's renderer on Linux

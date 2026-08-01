@@ -434,6 +434,24 @@ jobs:
           '
           sudo install -Dm755 kbb-blkfuse rootfs/usr/local/bin/kbb-blkfuse
 
+          # kiwix-serve, musl-static 3.8.2 -- NOT Alpine's 3.7.0. The 3.7.0 libzim
+          # rejects these archives (format 6.3) with "Unable to add the ZIM file
+          # to the internal library" while the guest's newer python libzim reads
+          # the same file; 3.8.2 matches the version the host already serves them
+          # with. The musl build is self-contained, so it just drops into the
+          # image with no extra libraries.
+          KVER=3.8.2
+          curl -fsSL -o kiwix-tools.tar.gz \
+            "https://download.kiwix.org/release/kiwix-tools/kiwix-tools_linux-x86_64-musl-${KVER}.tar.gz"
+          mkdir -p kiwix-extract
+          tar -xzf kiwix-tools.tar.gz -C kiwix-extract --strip-components=1
+          test -f kiwix-extract/kiwix-serve
+          sudo install -Dm755 kiwix-extract/kiwix-serve rootfs/usr/local/bin/kiwix-serve
+          # Confirm it is genuinely self-contained (no interpreter / no shared
+          # libs), so it runs in the guest with nothing else installed.
+          file kiwix-extract/kiwix-serve
+          ( ldd kiwix-extract/kiwix-serve 2>&1 || true ) | head -3
+
           # Generate the guest's init config from the shipping code path rather
           # than restating it in YAML, so CI exercises the same bytes the
           # provisioner writes. sudo -E with an explicit interpreter, because
