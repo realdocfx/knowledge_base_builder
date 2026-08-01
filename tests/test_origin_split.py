@@ -123,22 +123,34 @@ def test_generated_pages_are_locked_down_but_functional(content_client):
 
 
 def test_raw_downloaded_files_are_sandboxed(tmp_path, monkeypatch):
-    """Sandbox belongs on the untrusted bytes, applied where they are delivered."""
+    """Sandbox belongs on the untrusted bytes, applied where they are delivered.
+
+    PDFs get a relaxed sandbox (allow-scripts) because WebKitGTK needs JS to
+    render them inline.  Non-PDF files keep the strict default-src 'none'.
+    """
     from knowledge_base_builder.buckets.usb import UsbBucket
 
     bucket = UsbBucket(str(tmp_path))
     bucket.initialize()
     (tmp_path / "payload.pdf").write_bytes(b"%PDF-1.4 x")
+    (tmp_path / "data.bin").write_bytes(b"\x00" * 16)
     monkeypatch.setattr(web, "BUCKET", bucket)
 
+    # PDF: sandboxed WITH allow-scripts (WebKitGTK needs JS for rendering)
     r = TestClient(web.content_app).get("/files/payload.pdf", follow_redirects=False)
     assert r.status_code == 200, r.status_code
     csp = r.headers.get("content-security-policy", "")
-    assert "sandbox" in csp, f"raw file served without a sandbox: {csp!r}"
-    assert "default-src 'none'" in csp, csp
+    assert "sandbox" in csp, f"PDF served without a sandbox: {csp!r}"
+    assert "allow-scripts" in csp, f"PDF needs allow-scripts for WebKitGTK: {csp}"
     assert r.headers.get("content-disposition", "").startswith("inline"), (
         "a PDF is inline-safe and must still render in the reader"
     )
+
+    # Non-PDF: strict sandbox, no scripts
+    r2 = TestClient(web.content_app).get("/files/data.bin", follow_redirects=False)
+    assert r2.status_code == 200
+    csp2 = r2.headers.get("content-security-policy", "")
+    assert "default-src 'none'" in csp2, f"non-PDF missing strict CSP: {csp2}"
 
 
 def test_raw_active_content_is_sandboxed_and_downloaded(tmp_path, monkeypatch):

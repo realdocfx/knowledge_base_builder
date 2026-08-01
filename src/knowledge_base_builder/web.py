@@ -93,6 +93,77 @@ _INLINE_SAFE_EXT = {
 }
 
 
+def _is_zim_file(name: str) -> bool:
+    """Return True if *name* is a ZIM archive or a split slice (.zimaa, .zimab, ...).
+
+    ZIMs are served by the kiwix reader and must not appear in the raw /files/
+    browser or be served as static downloads.  The pattern matches:
+      .zim         single-file archive
+      .zim[a-z]{2} split slices (.zimaa through .zimzz)
+    """
+    low = name.lower()
+    if low.endswith(".zim"):
+        return True
+    if len(low) > 6 and low[-6:-2] == ".zim" and low[-2:].isalpha():
+        return True
+    return False
+
+
+def _within(p: Path, base: Path) -> bool:
+    """True if *p* is *base* or lives under it."""
+    try:
+        p.relative_to(base)
+        return True
+    except ValueError:
+        return False
+
+
+def _content_link_roots() -> List[Path]:
+    """Extra roots a ``/files`` symlink is allowed to point into.
+
+    The QEMU sandbox merges the ZIM FUSE mount and the media ISO into one
+    ``/tmp/kbb-bucket`` using symlinks, so a browsed path resolves out to
+    ``/tmp/kbb-zims`` or ``/tmp/kbb-media``. Those mounts are read-only and
+    created by the kiosk, so following the links is safe -- the kiosk lists them
+    in ``KBB_BUCKET_LINK_ROOTS``. On the host the variable is unset and the
+    browser stays strict, because following a content symlink out of the bucket
+    there would be a real filesystem escape.
+    """
+    raw = os.environ.get("KBB_BUCKET_LINK_ROOTS", "")
+    roots: List[Path] = []
+    for part in raw.split(os.pathsep):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            roots.append(Path(part).resolve())
+        except OSError:
+            continue
+    return roots
+
+
+def _safe_content_path(root: Path, path: str) -> Optional[Path]:
+    """Map a ``/files`` request to a filesystem path, or None if it escapes.
+
+    ``../`` traversal is blocked lexically, independent of symlinks. A path whose
+    real location leaves the bucket is rejected too -- UNLESS it lands inside a
+    trusted link root (the sandbox's unified bucket links into read-only mounts
+    the kiosk created). The returned path is the *unresolved* lexical path so the
+    caller still follows the symlink when opening or listing it.
+    """
+    base = root.resolve()
+    lexical = Path(os.path.normpath(str(base / path)))
+    if not _within(lexical, base):  # blocks ../ regardless of symlinks
+        return None
+    real = lexical.resolve()
+    if _within(real, base):
+        return lexical
+    for extra in _content_link_roots():
+        if _within(real, extra):
+            return lexical
+    return None
+
+
 # The content plane serves two populations, and which one a route belongs to must
 # be decided by the ROUTE, with the safe answer as the default. N2 existed because
 # the permissive policy was the default and safety was opt-in: /epubres was added
@@ -1287,31 +1358,47 @@ async def wiki_proxy(request: Request, path: str) -> Response:
 async def static_files(path: str) -> Any:
     if BUCKET is None:
         raise HTTPException(status_code=503, detail="Bucket not initialized")
-    root = BUCKET.root.resolve()
-    target = (root / path).resolve()
-    try:
-        target.relative_to(root)
-    except ValueError:
+    root = BUCKET.root
+    # Resolve within the bucket. The sandbox unifies the ZIM FUSE mount and the
+    # media ISO into the bucket with symlinks, so a valid media path resolves out
+    # to a trusted link root; _safe_content_path allows that while still blocking
+    # ../ traversal and untrusted symlink escapes.
+    target = _safe_content_path(root, path)
+    if target is None:
         raise HTTPException(status_code=403, detail="Forbidden")
     if not target.exists():
         raise HTTPException(status_code=404, detail="File not found")
+    # ZIM archives and split slices are served by kiwix, not the file browser.
+    # Blocking them here prevents accidental multi-GB raw downloads and keeps
+    # the content separation clean: /files/ is for media, /wiki/ is for ZIMs.
+    if target.is_file() and _is_zim_file(target.name):
+        raise HTTPException(status_code=404, detail="ZIM files are served by the kiwix reader")
     if target.is_dir():
-        return HTMLResponse(_render_library_listing(path, target, root), headers=trusted_page_headers())
+        return HTMLResponse(_render_library_listing(path, target, root.resolve()), headers=trusted_page_headers())
     # Active content (.html/.svg/...) must never render as a document, even on the
     # sandboxed content origin: forcing a download removes the question entirely.
     disposition = content_disposition_for(target.name)
+    # PDF files need allow-scripts: WebKitGTK (the QEMU guest renderer) has no
+    # browser-level PDF handler like Chrome — it needs JavaScript to render pages.
+    # Without allow-scripts the viewer toolbar appears but content is blank.
+    ext = target.suffix.lower()
+    if ext == ".pdf":
+        csp = (
+            "sandbox allow-scripts allow-same-origin; default-src 'self' blob: data:; "
+            "style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; "
+            "frame-ancestors http://127.0.0.1:* http://localhost:*"
+        )
+    else:
+        csp = (
+            "sandbox; default-src 'none'; img-src 'self' data: blob:; "
+            "media-src 'self' blob:; style-src 'unsafe-inline'; "
+            "frame-ancestors http://127.0.0.1:* http://localhost:*"
+        )
     return FileResponse(
         target,
         headers={
             "Content-Disposition": f'{disposition}; filename="{target.name}"',
-            # THIS is where sandbox belongs: an opaque, script-disabled context for
-            # bytes that came from Archive.org or Kiwix. Set here rather than plane
-            # wide so KBB's own reader pages keep working.
-            "Content-Security-Policy": (
-                "sandbox; default-src 'none'; img-src 'self' data: blob:; "
-                "media-src 'self' blob:; style-src 'unsafe-inline'; "
-                "frame-ancestors http://127.0.0.1:* http://localhost:*"
-            ),
+            "Content-Security-Policy": csp,
         },
     )
 
@@ -2736,6 +2823,12 @@ def _render_library_listing(path: str, target: Path, root: Path) -> str:
     rows: List[str] = []
     for item in items:
         name = item.name
+        # Hide ZIM archives/slices (served by kiwix) and internal dot-entries
+        # (.kb_state, .kb_env, etc.) which are not operator-facing media.
+        if name.startswith("."):
+            continue
+        if item.is_file() and _is_zim_file(name):
+            continue
         item_rel = (rel + "/" + name) if rel else name
         if item.is_dir():
             href = "/files/" + urllib.parse.quote(item_rel, safe="/") + "/"

@@ -63,6 +63,9 @@ web = [
 xapian = [
     "xapian-bindings>=1.4.0",
 ]
+sandbox = [
+    "pycdlib>=1.14.0",  # Pure-Python ISO 9660 builder for media image provisioning
+]
 dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
@@ -74,6 +77,7 @@ dev = [
     "tomli>=2.0.0; python_version<'3.11'",
     "pip-tools>=7.0.0",
     "cyclonedx-bom>=4.0.0",
+    "pycdlib>=1.14.0",  # needed by sandbox provisioning tests
 ]
 
 [project.urls]

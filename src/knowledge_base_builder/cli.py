@@ -1811,7 +1811,8 @@ def _install_guest_image(root: Path, source: Optional[str] = None) -> None:
 SANDBOX_INFRA_NAMES = frozenset({
     ".kb_env", ".kb_state", ".ia_state", "qemu", "boot", "EFI", "docs",
     "kbb_guest.img", "vmlinuz-kbb", "initramfs-kbb",
-    "start_sandbox.bat", "start_sandbox.sh", "kbb_drivegen.ps1", "Launch_KBB.exe",
+    "start_sandbox.bat", "start_sandbox.sh", "kbb_drivegen.ps1",
+    "kbb_mediagen.py", "Launch_KBB.exe",
     "System Volume Information", "$RECYCLE.BIN",
 })
 
@@ -2143,6 +2144,19 @@ def _write_sandbox_launchers(root: Path, port: int = 8080) -> None:
         'SET "READCFG="',
         'IF EXIST "%DRIVECFG%" SET "READCFG=-readconfig "%DRIVECFG%""',
         "",
+        ":: Non-ZIM media image (Archive.org PDFs, EPUBs, etc.). Built dynamically",
+        ":: at startup (not provisioning) so content downloaded from the UI after",
+        ":: provisioning is always included. Written to %TEMP% (host NTFS, no FAT32",
+        ":: 4 GB limit). kbb_mediagen.py mirrors kbb_drivegen.ps1: both enumerate",
+        ":: content at launch time.",
+        r'SET "MEDIA_ISO=%TEMP%\kbb_media.iso"',
+        'SET "MEDIA_DRIVE="',
+        r'IF EXIST "%USB%.kb_env\python\python.exe" IF EXIST "%USB%kbb_mediagen.py" (',
+        r'    echo [KBB] Building media ISO from non-ZIM content...',
+        r'    "%USB%.kb_env\python\python.exe" "%USB%kbb_mediagen.py" "%USB%." "%MEDIA_ISO%"',
+        r'    IF EXIST "%MEDIA_ISO%" SET "MEDIA_DRIVE=-drive file=%MEDIA_ISO%,format=raw,if=virtio,readonly=on"',
+        ")",
+        "",
         ":: virtio-vga gives the guest a DRM node -- cage is a DRM compositor and",
         ":: exits instantly without one. The input devices are equally required:",
         ":: wlroots aborts with \"no input devices\" and takes cage down with it.",
@@ -2152,6 +2166,7 @@ def _write_sandbox_launchers(root: Path, port: int = 8080) -> None:
         '    -kernel "%USB%vmlinuz-kbb" -initrd "%USB%initramfs-kbb" ^',
         f'    -append "{cmdline}" ^',
         '    -drive file="%USB%kbb_guest.img",format=raw,if=virtio,snapshot=on ^',
+        '    %MEDIA_DRIVE% ^',
         "    %READCFG% ^",
         "    -device virtio-vga ^",
         "    -device virtio-keyboard-pci -device virtio-tablet-pci ^",
@@ -2172,6 +2187,197 @@ def _write_sandbox_launchers(root: Path, port: int = 8080) -> None:
     drivegen = root / "kbb_drivegen.ps1"
     drivegen.write_bytes(("\r\n".join(drivegen_lines) + "\r\n").encode("utf-8"))
     os.system(f'attrib -h "{drivegen}" >nul 2>&1')
+
+    # -----------------------------------------------------------------
+    # Media ISO generator (kbb_mediagen.py)
+    # -----------------------------------------------------------------
+    # A standalone Python script called by the .bat/.sh at QEMU startup.
+    # It builds an ISO 9660 + Rock Ridge image of all non-ZIM content in
+    # library/archive/ and writes it to the host temp dir (no FAT32 limit).
+    # Mirrors kbb_drivegen.ps1: content is enumerated dynamically so items
+    # downloaded from the UI after provisioning are always included.
+    mediagen_src = '''\n#!/usr/bin/env python3
+"""Build a read-only ISO of non-ZIM media for the QEMU sandbox guest.
+
+Called by start_sandbox.bat/.sh before QEMU boots. Writes the ISO to the host
+temp directory (NTFS/ext4, no FAT32 4 GB limit). The guest mounts it as
+/dev/vdb and the portal serves media from it.
+
+The image is cached: a signature of the media tree (path/size/mtime) is written
+beside the ISO, and a rebuild is skipped when nothing changed -- so only the
+first launch after adding content pays the packing cost, not every launch (the
+media set can be many GB, and rebuilding each time would add minutes per boot).
+
+Usage: python kbb_mediagen.py <stick_root> <output_iso_path>
+"""
+import hashlib
+import re
+import sys
+from pathlib import Path
+
+def _is_zim(name):
+    return bool(re.match(r".*\\.zim([a-z]{2})?$", name, re.IGNORECASE))
+
+def _iter_media_files(item):
+    """Yield every file that goes into the ISO, mirroring the build walk."""
+    if item.is_file():
+        if not _is_zim(item.name):
+            yield item
+        return
+    if item.is_dir():
+        try:
+            entries = sorted(item.iterdir())
+        except OSError:
+            return
+        for e in entries:
+            if e.name.startswith("."):
+                continue
+            if e.is_dir():
+                for f in _iter_media_files(e):
+                    yield f
+            elif e.is_file() and not _is_zim(e.name):
+                yield e
+
+def _signature(media, archive):
+    """A hash of every included file's relpath/size/mtime -- the cache key."""
+    files = []
+    for item in media:
+        for f in _iter_media_files(item):
+            files.append(f)
+    h = hashlib.sha256()
+    for f in sorted(files, key=lambda p: str(p)):
+        try:
+            st = f.stat()
+        except OSError:
+            continue
+        h.update(f.relative_to(archive).as_posix().encode("utf-8", "surrogatepass"))
+        h.update(b"|")
+        h.update(str(st.st_size).encode())
+        h.update(b"|")
+        h.update(str(int(st.st_mtime)).encode())
+        h.update(b";")
+    h.update(("count=" + str(len(files))).encode())
+    return h.hexdigest()
+
+def main():
+    if len(sys.argv) < 3:
+        print("Usage: kbb_mediagen.py <stick_root> <output_iso>", file=sys.stderr)
+        sys.exit(1)
+
+    stick = Path(sys.argv[1])
+    output = Path(sys.argv[2])
+    sigfile = Path(str(output) + ".sig")
+
+    for cand in (stick / "library" / "archive", stick / "library", stick):
+        if cand.is_dir():
+            archive = cand
+            break
+    else:
+        print("[KBB] No archive directory found; skipping media ISO.")
+        sys.exit(0)
+
+    media = []
+    for item in sorted(archive.iterdir()):
+        if item.name.startswith("."):
+            continue
+        if item.is_file() and _is_zim(item.name):
+            continue
+        media.append(item)
+
+    if not media:
+        for p in (output, sigfile):
+            try:
+                p.unlink()
+            except OSError:
+                pass
+        print("[KBB] No non-ZIM media found; skipping ISO.")
+        sys.exit(0)
+
+    sig = _signature(media, archive)
+    if output.exists() and sigfile.exists():
+        try:
+            if sigfile.read_text().strip() == sig:
+                print(f"[KBB] Media unchanged; reusing cached ISO ({output.name}).")
+                sys.exit(0)
+        except OSError:
+            pass
+
+    try:
+        import pycdlib
+    except ImportError:
+        print("[KBB] pycdlib not installed; skipping media ISO.", file=sys.stderr)
+        print("[KBB] Install: pip install pycdlib", file=sys.stderr)
+        sys.exit(0)
+
+    print(f"[KBB] Packing {len(media)} media entries into ISO...")
+
+    iso = pycdlib.PyCdlib()
+    iso.new(interchange_level=3, rock_ridge="1.09")
+
+    counter = [0]
+    open_handles = []
+
+    def short():
+        counter[0] += 1
+        return f"F{counter[0]:07d}"
+
+    def add_file(fs_path, iso_dir):
+        try:
+            sz = fs_path.stat().st_size
+        except OSError:
+            return
+        s = "/" + short() + ".;1"
+        fh = open(fs_path, "rb")
+        open_handles.append(fh)
+        iso.add_fp(fh, sz, iso_dir + s, rr_name=fs_path.name)
+
+    def add_dir(fs_path, iso_dir):
+        try:
+            entries = sorted(fs_path.iterdir())
+        except OSError:
+            return
+        for e in entries:
+            if e.name.startswith("."):
+                continue
+            if e.is_dir():
+                s = "/" + short()
+                child = iso_dir + s
+                iso.add_directory(child, rr_name=e.name)
+                add_dir(e, child)
+            elif e.is_file() and not _is_zim(e.name):
+                add_file(e, iso_dir)
+
+    try:
+        for item in media:
+            if item.is_dir():
+                s = "/" + short()
+                iso.add_directory(s, rr_name=item.name)
+                add_dir(item, s)
+            elif item.is_file():
+                add_file(item, "")
+        iso.write(str(output))
+    finally:
+        for fh in open_handles:
+            try:
+                fh.close()
+            except OSError:
+                pass
+    iso.close()
+
+    try:
+        sigfile.write_text(sig)
+    except OSError:
+        pass
+
+    sz = output.stat().st_size
+    print(f"[KBB] Media ISO: {output.name} ({sz / (1024*1024*1024):.1f} GB)")
+
+if __name__ == "__main__":
+    main()
+'''
+    mediagen = root / "kbb_mediagen.py"
+    mediagen.write_text(mediagen_src, encoding="utf-8")
+    os.system(f'attrib -h "{mediagen}" >nul 2>&1')
 
     # -----------------------------------------------------------------
     # POSIX launcher (.sh)
@@ -2228,11 +2434,27 @@ def _write_sandbox_launchers(root: Path, port: int = 8080) -> None:
         'SCSI_ARGS="$SCSI_ARGS -drive file=$MANIFEST,format=raw,if=none,id=manifest,readonly=on"',
         'SCSI_ARGS="$SCSI_ARGS -device scsi-hd,drive=manifest,bus=scsi0.0,scsi-id=0,lun=0"',
         "",
+        "# Non-ZIM media: build ISO dynamically at startup (not provisioning) so",
+        "# content downloaded from the UI after provisioning is always included.",
+        "# ISO written to host temp dir (no FAT32 4 GB limit).",
+        'MEDIA_ISO="${TMPDIR:-/tmp}/kbb_media.iso"',
+        'MEDIA_DRIVE=""',
+        'KBB_PY="$USB/.kb_env/python/bin/python3"',
+        '[ -x "$KBB_PY" ] || KBB_PY="$USB/.kb_env/python-linux/bin/python3"',
+        'if [ -x "$KBB_PY" ] && [ -f "$USB/kbb_mediagen.py" ]; then',
+        '    echo "[KBB] Building media ISO from non-ZIM content..."',
+        '    "$KBB_PY" "$USB/kbb_mediagen.py" "$USB" "$MEDIA_ISO"',
+        '    if [ -f "$MEDIA_ISO" ]; then',
+        '        MEDIA_DRIVE="-drive file=$MEDIA_ISO,format=raw,if=virtio,readonly=on"',
+        '    fi',
+        "fi",
+        "",
         'echo "[KBB] $N ZIM slice(s) from $ARCHIVE (no root required)"',
         'exec "$QEMU" -L "$USB/qemu/$PLAT/share" -nodefaults -M q35 -m 3072 -smp 2 \\',
         '    -kernel "$USB/vmlinuz-kbb" -initrd "$USB/initramfs-kbb" \\',
         f'    -append "{cmdline}" \\',
         '    -drive file="$USB/kbb_guest.img",format=raw,if=virtio,snapshot=on \\',
+        "    $MEDIA_DRIVE \\",
         "    $SCSI_ARGS \\",
         "    -device virtio-vga \\",
         "    -device virtio-keyboard-pci -device virtio-tablet-pci \\",
@@ -2452,7 +2674,48 @@ def _guest_init_files() -> Dict[str, str]:
         '        else\n'
         '            kbb_log "WARNING kbb-blkfuse mount did not appear"\n'
         '        fi\n'
-        '        KBB_BUCKET="$KBB_ZIM_BUCKET"\n'
+        '\n'
+        '        # ---------------------------------------------------------------\n'
+        '        # Non-ZIM media: mount the ISO image if present (/dev/vdb).\n'
+        '        # ---------------------------------------------------------------\n'
+        '        # The media ISO is built at LAUNCH time by the .bat/.sh (kbb_mediagen.py)\n'
+        '        # from library/archive minus ZIM files, so UI-downloaded content is\n'
+        '        # always included. It appears as /dev/vdb (virtio-blk after the\n'
+        '        # rootfs). Mount it read-only at /tmp/kbb-media.\n'
+        '        KBB_MEDIA_MNT=/tmp/kbb-media\n'
+        '        mkdir -p "$KBB_MEDIA_MNT"\n'
+        '        if [ -b /dev/vdb ]; then\n'
+        '            modprobe isofs 2>/dev/null || true\n'
+        '            mount -t iso9660 -o ro,noatime /dev/vdb "$KBB_MEDIA_MNT" 2>/dev/null\n'
+        '            if mountpoint -q "$KBB_MEDIA_MNT"; then\n'
+        '                kbb_log "media ISO mounted at $KBB_MEDIA_MNT"\n'
+        '            else\n'
+        '                kbb_log "media ISO mount failed; non-ZIM content unavailable"\n'
+        '            fi\n'
+        '        fi\n'
+        '\n'
+        '        # Unified bucket via overlayfs: merge ZIMs + media into one\n'
+        '        # mount point. Unlike symlinks, overlay paths resolve() within\n'
+        '        # the mount point itself, so the portal traversal check does not\n'
+        '        # reject them as escaping the bucket root (the 403 bug).\n'
+        '        KBB_UNIFIED=/tmp/kbb-bucket\n'
+        '        mkdir -p "$KBB_UNIFIED"\n'
+        '        if mountpoint -q "$KBB_MEDIA_MNT"; then\n'
+        '            mount -t overlay overlay \\\n'
+        '                -o lowerdir="$KBB_ZIM_BUCKET":"$KBB_MEDIA_MNT" \\\n'
+        '                "$KBB_UNIFIED" 2>/dev/null \\\n'
+        '                && kbb_log "unified bucket: overlay ZIMs + media" \\\n'
+        '                || kbb_log "overlay failed; ZIMs only"\n'
+        '        fi\n'
+        '        if mountpoint -q "$KBB_UNIFIED"; then\n'
+        '            KBB_BUCKET="$KBB_UNIFIED"\n'
+        '        else\n'
+        '            KBB_BUCKET="$KBB_ZIM_BUCKET"\n'
+        '        fi\n'
+        '        # The unified bucket links out to the ZIM FUSE mount and the media\n'
+        '        # ISO; tell the portal those roots are trusted so /files can follow\n'
+        '        # the symlinks (it stays strict for any other escape).\n'
+        '        export KBB_BUCKET_LINK_ROOTS="$KBB_ZIM_BUCKET:$KBB_MEDIA_MNT"\n'
         '    else\n'
         '        # Bare-metal (Mode A) and legacy layouts: mount the real FAT32\n'
         '        # partition, where the ZIMs are ordinary files and no FUSE is\n'
@@ -2522,6 +2785,11 @@ def _guest_init_files() -> Dict[str, str]:
         '\n'
         '    if [ -n "$KBB_PY" ]; then\n'
         '        kbb_log "portal python: $KBB_PY"\n'
+        '        KBB_SITE=$($KBB_PY -c "import knowledge_base_builder as k; import os; print(os.path.dirname(k.__file__))" 2>/dev/null)\n'
+        '        if [ -d "$KBB_MEDIA_MNT/__kbb_patches__" ] && [ -n "$KBB_SITE" ]; then\n'
+        '            cp "$KBB_MEDIA_MNT/__kbb_patches__/"*.py "$KBB_SITE/" 2>/dev/null \\\n'
+        '                && kbb_log "portal code patched from media ISO"\n'
+        '        fi\n'
         '        "$KBB_PY" -m knowledge_base_builder.cli portal "$KBB_BUCKET" \\\n'
         '            --port "$KBB_PORT" --no-browser >/dev/console 2>&1 &\n'
         '    else\n'

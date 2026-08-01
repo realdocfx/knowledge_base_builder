@@ -86,3 +86,81 @@ def test_media_file_is_still_served(media_bucket):
         "/files/101omelettes0000clau/101omelettes.pdf", follow_redirects=False
     )
     assert r.status_code == 200, f"media file no longer served: {r.status_code}"
+
+
+# ---------------------------------------------------------------------------
+# PDF CSP: WebKitGTK needs allow-scripts to render PDFs inline
+# ---------------------------------------------------------------------------
+def test_pdf_gets_allow_scripts_csp(media_bucket):
+    """WebKitGTK has no browser-level PDF handler — it needs JavaScript.
+
+    Without allow-scripts, the PDF viewer toolbar appears but the content area
+    stays blank (proven on the real guest image). Chrome bypasses CSP for its
+    built-in PDF viewer, but WebKitGTK does not.
+    """
+    r = TestClient(web.content_app).get(
+        "/files/101omelettes0000clau/101omelettes.pdf", follow_redirects=False
+    )
+    assert r.status_code == 200
+    csp = r.headers.get("content-security-policy", "")
+    assert "allow-scripts" in csp, (
+        f"PDF served without allow-scripts; WebKitGTK cannot render it: {csp}"
+    )
+
+
+def test_non_pdf_keeps_strict_sandbox_csp(media_bucket):
+    """Non-PDF files must stay sandboxed with no scripts allowed."""
+    (media_bucket / "notes.txt").write_text("hello")
+    r = TestClient(web.content_app).get("/files/notes.txt", follow_redirects=False)
+    assert r.status_code == 200
+    csp = r.headers.get("content-security-policy", "")
+    assert "sandbox;" in csp, f"non-PDF file has relaxed CSP: {csp}"
+    assert "allow-scripts" not in csp, (
+        f"non-PDF file has allow-scripts, which is a security regression: {csp}"
+    )
+
+
+# --------------------------------------------------------------------------
+# _safe_content_path: the sandbox unifies mounts with symlinks, so /files must
+# follow trusted links -- while still blocking ../ traversal and untrusted
+# escapes. (In the QEMU guest the ZIM FUSE mount and media ISO live outside the
+# bucket dir; the resolve()+relative_to() check used to 403 all media.)
+# --------------------------------------------------------------------------
+def test_safe_path_allows_within_bucket(tmp_path):
+    (tmp_path / "book").mkdir()
+    (tmp_path / "book" / "x.pdf").write_bytes(b"%PDF")
+    assert web._safe_content_path(tmp_path, "book/x.pdf") is not None
+    assert web._safe_content_path(tmp_path, "") is not None
+
+
+def test_safe_path_blocks_parent_escape(tmp_path):
+    (tmp_path / "inside").mkdir()
+    assert web._safe_content_path(tmp_path, "../secret") is None
+    assert web._safe_content_path(tmp_path, "inside/../../secret") is None
+
+
+def test_safe_path_follows_only_trusted_symlinks(tmp_path, monkeypatch):
+    bucket = tmp_path / "bucket"
+    bucket.mkdir()
+    trusted = tmp_path / "media"
+    (trusted / "book").mkdir(parents=True)
+    (trusted / "book" / "x.pdf").write_bytes(b"%PDF")
+    untrusted = tmp_path / "elsewhere"
+    untrusted.mkdir()
+    (untrusted / "secret.txt").write_bytes(b"secret")
+    try:
+        (bucket / "book").symlink_to(trusted / "book", target_is_directory=True)
+        (bucket / "leak").symlink_to(untrusted, target_is_directory=True)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"symlinks unavailable on this host: {exc}")
+
+    # No trusted roots configured -> the symlink escape is rejected (host default).
+    monkeypatch.delenv("KBB_BUCKET_LINK_ROOTS", raising=False)
+    assert web._safe_content_path(bucket, "book/x.pdf") is None
+
+    # Trust the media root -> the link is followed, but only for that root.
+    monkeypatch.setenv("KBB_BUCKET_LINK_ROOTS", str(trusted))
+    assert web._safe_content_path(bucket, "book/x.pdf") is not None
+    assert web._safe_content_path(bucket, "leak/secret.txt") is None, (
+        "a symlink into an untrusted root must not be followed"
+    )

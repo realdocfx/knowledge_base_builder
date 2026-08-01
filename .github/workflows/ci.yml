@@ -50,7 +50,7 @@ jobs:
           python -m pip install \
             "internetarchive>=3.0.0" "typer>=0.9.0" "rich>=13.0.0" \
             "requests>=2.28.0" "libzim>=3.0.0" "pypdf>=4.0.0" \
-            "fastapi>=0.100.0" "httpx>=0.24.0"
+            "fastapi>=0.100.0" "httpx>=0.24.0" "pycdlib>=1.14.0"
           python -m pip install pytest
 
       - name: Verify the package is not installed (clean-clone precondition)
