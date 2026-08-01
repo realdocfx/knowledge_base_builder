@@ -359,6 +359,24 @@ jobs:
         run: |
           set -eux
           chmod +x ui/launch_kbb
+          # Derive the guest package set from GUEST_WORLD rather than restating it.
+          # A hardcoded list here silently diverged once already: fuse3 and
+          # kiwix-tools were added to GUEST_WORLD but never reached the image, so
+          # kbb-blkfuse could not find libfuse3.so.3 and served no ZIMs. The build
+          # adds only its OWN extras (the kernel, initramfs tooling, and the pip
+          # runtime) on top.
+          GUEST_PKGS=$(python3 -c "
+          import ast
+          src = open('src/knowledge_base_builder/cli.py', encoding='utf-8').read()
+          names = {n.targets[0].id: n.value for n in ast.parse(src).body
+                   if isinstance(n, ast.Assign) and isinstance(n.targets[0], ast.Name)}
+          v = names['GUEST_WORLD']
+          while isinstance(v, ast.Name): v = names[v.id]
+          print(' '.join(ast.literal_eval(v)))
+          ")
+          echo "guest packages: $GUEST_PKGS"
+          test -n "$GUEST_PKGS"
+          export GUEST_PKGS
           cat > build-root.sh <<'SCRIPT'
           #!/bin/sh
           # Assemble the guest root with apk-tools from the Alpine container,
@@ -384,11 +402,14 @@ jobs:
             echo "https://dl-cdn.alpinelinux.org/alpine/v3.20/community"
           } > "$R/etc/apk/repositories"
           cp /etc/apk/keys/* "$R/etc/apk/keys/"
-          apk --root "$R" --initdb --arch x86_64 --update-cache add alpine-base busybox openrc util-linux eudev dbus linux-lts mkinitfs cage seatd mesa-dri-gallium mesa-egl webkit2gtk gtk+3.0 font-dejavu python3 py3-pip
+          # GUEST_WORLD (the shipping package set) plus build-only extras: the
+          # kernel, initramfs tooling, GL/EGL for the webview, and the pip
+          # runtime KBB is installed with.
+          apk --root "$R" --initdb --arch x86_64 --update-cache add  $GUEST_PKGS linux-lts mkinitfs mesa-egl python3 py3-pip
           SCRIPT
           sed -i 's/^          //' build-root.sh
           chmod +x build-root.sh
-          docker run --rm -v "$PWD:/work" -w /work alpine:3.20 /work/build-root.sh
+          docker run --rm -e GUEST_PKGS -v "$PWD:/work" -w /work alpine:3.20 /work/build-root.sh
           sudo du -sh rootfs
 
       - name: Install the UI and the kiosk head
