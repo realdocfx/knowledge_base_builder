@@ -157,6 +157,10 @@ def _enrich(output: Path, project_root: Path) -> None:
         c for c in data.get("components", []) if _canonical(c.get("name", "")) not in _TOOLING
     ]
 
+    # Licences cyclonedx could not extract from installed metadata (declared via
+    # classifiers only). A licence is an NTIA minimum element.
+    _KNOWN_LICENSES = {"pymupdf": {"id": "AGPL-3.0-or-later"}}
+
     attached = 0
     for comp in data.get("components", []):
         name = _canonical(comp.get("name", ""))
@@ -164,6 +168,8 @@ def _enrich(output: Path, project_root: Path) -> None:
         if digs and not comp.get("hashes"):
             comp["hashes"] = _sha256_entries(digs)
             attached += 1
+        if not comp.get("licenses") and name in _KNOWN_LICENSES:
+            comp["licenses"] = [{"license": _KNOWN_LICENSES[name]}]
 
     # Non-PyPI runtime components the stick boots/serves, with pinned digests.
     H = PROVISIONING_HASHES

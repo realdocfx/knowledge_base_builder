@@ -1,1 +1,1 @@
-feat: PQC module (FIPS 203/204/205) - ML-DSA signing, hybrid auth, AES-256-GCM encryption
+feat: portal lock screen, clone isolation, change-password (FIPS encryption at rest)

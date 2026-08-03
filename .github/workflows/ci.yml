@@ -51,7 +51,8 @@ jobs:
             "internetarchive>=3.0.0" "typer>=0.9.0" "rich>=13.0.0" \
             "requests>=2.28.0" "libzim>=3.0.0" "pypdf>=4.0.0" \
             "fastapi>=0.100.0" "httpx>=0.24.0" "pycdlib>=1.14.0" \
-            "pymupdf>=1.24.0"
+            "pymupdf>=1.24.0" \
+            "dilithium-py>=1.0.0" "cryptography>=41.0.0" "argon2-cffi>=23.1.0"
           python -m pip install pytest
 
       - name: Verify the package is not installed (clean-clone precondition)

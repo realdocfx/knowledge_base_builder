@@ -323,6 +323,12 @@ _PROXY_STRIPPED_HEADERS = frozenset({
 AUTH_COOKIE = "kbb_session"
 _AUTH_TOKEN: Optional[str] = None
 
+# --- Portal lock screen (FIPS 203/204/205 encryption at rest) ----------------
+# The passphrase-derived AES-256 key. None = portal is LOCKED (or unencrypted
+# stick with no salt file, which runs open for backward compat). Set by
+# /api/unlock or /api/setup-passphrase; cleared at process exit (in-memory only).
+_CONTENT_KEY: Optional[bytes] = None
+
 
 def get_auth_token() -> str:
     """Return this process's control-plane token, minting one on first use."""
@@ -427,9 +433,11 @@ _SANDBOX_PREFIX = "/sandbox/"
 async def enforce_api_auth(request: Request, call_next):
     """Reject unauthenticated control-plane calls before they reach a handler."""
     # Narrow exemption: the sandbox assets, and only while the sandbox is armed.
-    # Checked against the *prefix* rather than a route name so a future route
-    # cannot inherit the exemption by accident.
     if SANDBOX_ASSETS and request.url.path.startswith(_SANDBOX_PREFIX):
+        return await call_next(request)
+    # Lock screen endpoints: must be accessible without a token because the
+    # operator hasn't authenticated yet. The passphrase IS the authentication.
+    if request.url.path in _LOCK_EXEMPT_PATHS:
         return await call_next(request)
     if not request_is_authorised(request):
         return JSONResponse(
@@ -437,6 +445,149 @@ async def enforce_api_auth(request: Request, call_next):
             status_code=401,
         )
     return await call_next(request)
+
+
+# ---------------------------------------------------------------------------
+# Lock screen endpoints (FIPS encryption at rest / first-login passphrase)
+# ---------------------------------------------------------------------------
+def _stick_has_passphrase() -> bool:
+    """True if the stick has a crypto salt (passphrase was set)."""
+    if BUCKET is None:
+        return False
+    from .pqc import CRYPTO_SALT_FILE
+    from .state_paths import resolve_state_dir
+    return (resolve_state_dir(BUCKET.root) / CRYPTO_SALT_FILE).exists()
+
+
+def _portal_is_locked() -> bool:
+    """True if the portal should show the lock screen."""
+    return _stick_has_passphrase() and _CONTENT_KEY is None
+
+
+_LOCK_EXEMPT_PATHS = frozenset({
+    "/lock", "/api/unlock", "/api/setup-passphrase", "/portal.css",
+})
+
+
+@app.middleware("http")
+async def enforce_lock_screen(request: Request, call_next):
+    """Gate access when the portal is locked (passphrase not yet entered)."""
+    if _portal_is_locked() and request.url.path not in _LOCK_EXEMPT_PATHS:
+        if request.url.path.startswith("/api/"):
+            return JSONResponse({"detail": "portal locked"}, status_code=401)
+        from starlette.responses import RedirectResponse
+        return RedirectResponse("/lock", status_code=307)
+    return await call_next(request)
+
+
+@app.get("/lock", response_class=HTMLResponse)
+async def lock_screen() -> str:
+    """The passphrase entry page (unlock or first-use setup)."""
+    if _stick_has_passphrase():
+        # Existing stick — unlock form
+        body = (
+            '<div style="max-width:400px;margin:80px auto;text-align:center;">'
+            '<h1 style="margin-bottom:24px;">KBB // C2 Knowledge Portal</h1>'
+            '<p>Enter passphrase to unlock the secured library.</p>'
+            '<form method="POST" action="/api/unlock" style="margin-top:16px;">'
+            '<input type="password" name="passphrase" placeholder="Passphrase" '
+            'required autofocus style="width:100%;padding:10px;margin:8px 0;font-size:1rem;">'
+            '<button type="submit" style="width:100%;padding:10px;font-size:1rem;'
+            'cursor:pointer;margin-top:8px;">Unlock</button>'
+            '</form></div>'
+        )
+    else:
+        # First use — create passphrase form
+        body = (
+            '<div style="max-width:400px;margin:80px auto;text-align:center;">'
+            '<h1 style="margin-bottom:24px;">KBB // First-Time Setup</h1>'
+            '<p>Create a passphrase to secure this drive. You will need it every time you launch.</p>'
+            '<form method="POST" action="/api/setup-passphrase" style="margin-top:16px;">'
+            '<input type="password" name="passphrase" placeholder="Create passphrase (min 8 chars)" '
+            'required style="width:100%;padding:10px;margin:8px 0;font-size:1rem;">'
+            '<input type="password" name="confirm" placeholder="Confirm passphrase" '
+            'required style="width:100%;padding:10px;margin:8px 0;font-size:1rem;">'
+            '<button type="submit" style="width:100%;padding:10px;font-size:1rem;'
+            'cursor:pointer;margin-top:8px;">Set Passphrase &amp; Unlock</button>'
+            '</form></div>'
+        )
+    return HTMLResponse(body)
+
+
+@app.post("/api/setup-passphrase")
+async def setup_passphrase(request: Request) -> Any:
+    """First-use: create a passphrase, derive AES key, store salt."""
+    global _CONTENT_KEY
+    form = await request.form()
+    pw = form.get("passphrase", "")
+    confirm = form.get("confirm", "")
+
+    if len(pw) < 8:
+        return JSONResponse({"detail": "Passphrase must be at least 8 characters"}, status_code=400)
+    if pw != confirm:
+        return JSONResponse({"detail": "Passphrases do not match"}, status_code=400)
+
+    if BUCKET is None:
+        return JSONResponse({"detail": "No bucket configured"}, status_code=503)
+
+    from . import pqc
+    _CONTENT_KEY = pqc.setup_stick_encryption(BUCKET.root, pw)
+
+    response = JSONResponse({"detail": "Passphrase set and portal unlocked"})
+    response.set_cookie(AUTH_COOKIE, get_auth_token(), httponly=True, samesite="strict", path="/")
+    return response
+
+
+@app.post("/api/unlock")
+async def unlock_portal(request: Request) -> Any:
+    """Verify passphrase, derive key, unlock the portal."""
+    global _CONTENT_KEY
+    form = await request.form()
+    pw = form.get("passphrase", "")
+
+    if BUCKET is None:
+        return JSONResponse({"detail": "No bucket configured"}, status_code=503)
+
+    from . import pqc
+    # Verify the passphrase against the stored verification token
+    if not pqc.verify_passphrase(BUCKET.root, pw):
+        return JSONResponse({"detail": "Incorrect passphrase"}, status_code=403)
+
+    _CONTENT_KEY = pqc.unlock_stick(BUCKET.root, pw)
+
+    response = JSONResponse({"detail": "Portal unlocked"})
+    response.set_cookie(AUTH_COOKIE, get_auth_token(), httponly=True, samesite="strict", path="/")
+    return response
+
+
+@app.post("/api/change-passphrase")
+async def change_passphrase_endpoint(request: Request) -> Any:
+    """Change the portal passphrase. Requires current passphrase verification."""
+    global _CONTENT_KEY
+    form = await request.form()
+    current = form.get("current", "")
+    new_pw = form.get("new_passphrase", "")
+    confirm = form.get("confirm", "")
+
+    if not current:
+        return JSONResponse({"detail": "Current passphrase required"}, status_code=400)
+    if len(new_pw) < 8:
+        return JSONResponse({"detail": "New passphrase must be at least 8 characters"}, status_code=400)
+    if new_pw != confirm:
+        return JSONResponse({"detail": "New passphrases do not match"}, status_code=400)
+
+    if BUCKET is None:
+        return JSONResponse({"detail": "No bucket configured"}, status_code=503)
+
+    from . import pqc
+    # Verify the current passphrase by deriving and comparing with in-memory key
+    current_derived = pqc.unlock_stick(BUCKET.root, current)
+    if current_derived is None or (_CONTENT_KEY is not None and current_derived != _CONTENT_KEY):
+        return JSONResponse({"detail": "Current passphrase is incorrect"}, status_code=403)
+
+    # Change: new salt + new key
+    _CONTENT_KEY = pqc.change_passphrase(BUCKET.root, current, new_pw)
+    return JSONResponse({"detail": "Passphrase changed successfully"})
 
 
 @app.middleware("http")

@@ -70,6 +70,13 @@ _ALWAYS_SKIP_REL = (
     os.path.join(".kb_state", "archive_index.db-wal"),
     os.path.join(".kb_state", "archive_index.db-shm"),
     os.path.join(".kb_state", "archive_index.db-journal"),
+    # PQC crypto credentials: NEVER cloned. Each stick must have its own
+    # passphrase and signing identity. Copying these would share the encryption
+    # key and ML-DSA signing identity between source and clone — an operator who
+    # gives a clone to a colleague would unknowingly share their secrets.
+    os.path.join(".kb_state", ".kbb_crypto_salt"),
+    os.path.join(".kb_state", ".kbb_signing_key"),
+    ".kbb_pubkey.bin",
 )
 
 # Refuse to start a clone that cannot fit, with headroom for filesystem overhead.

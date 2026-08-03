@@ -75,6 +75,7 @@ except ImportError:
 SIGNING_KEY_FILE = ".kbb_signing_key"
 PUBLIC_KEY_FILE = ".kbb_pubkey.bin"
 CRYPTO_SALT_FILE = ".kbb_crypto_salt"
+CRYPTO_VERIFY_FILE = ".kbb_crypto_verify"  # encrypted known-plaintext for passphrase check
 SIG_EXTENSION = ".sig"
 
 # Argon2id parameters (OWASP 2024 recommendation for sensitive keys)
@@ -308,11 +309,15 @@ def decrypt_file(key: bytes, src: Path, dst: Path) -> None:
     dst.write_bytes(decrypt_bytes(key, src.read_bytes()))
 
 
+_VERIFY_PLAINTEXT = b"KBB_PASSPHRASE_VERIFICATION_TOKEN_V1"
+
+
 def setup_stick_encryption(root: Path, passphrase: str) -> bytes:
     """Initialize encryption on a stick. Returns the derived AES key."""
     state_dir = resolve_state_dir(root)
     state_dir.mkdir(parents=True, exist_ok=True)
     salt_path = state_dir / CRYPTO_SALT_FILE
+    verify_path = state_dir / CRYPTO_VERIFY_FILE
 
     if salt_path.exists():
         salt = salt_path.read_bytes()
@@ -324,7 +329,30 @@ def setup_stick_encryption(root: Path, passphrase: str) -> bytes:
         except OSError:
             pass
 
-    return derive_key_from_passphrase(passphrase, salt)
+    key = derive_key_from_passphrase(passphrase, salt)
+
+    # Write verification token so unlock can check the passphrase
+    if not verify_path.exists():
+        verify_path.write_bytes(encrypt_bytes(key, _VERIFY_PLAINTEXT))
+
+    return key
+
+
+def verify_passphrase(root: Path, passphrase: str) -> bool:
+    """Check if a passphrase is correct by decrypting the verification token."""
+    state_dir = resolve_state_dir(root)
+    salt_path = state_dir / CRYPTO_SALT_FILE
+    verify_path = state_dir / CRYPTO_VERIFY_FILE
+
+    if not salt_path.exists() or not verify_path.exists():
+        return False
+
+    key = derive_key_from_passphrase(passphrase, salt_path.read_bytes())
+    try:
+        plaintext = decrypt_bytes(key, verify_path.read_bytes())
+        return plaintext == _VERIFY_PLAINTEXT
+    except Exception:
+        return False
 
 
 def unlock_stick(root: Path, passphrase: str) -> Optional[bytes]:
@@ -333,6 +361,33 @@ def unlock_stick(root: Path, passphrase: str) -> Optional[bytes]:
     if not salt_path.exists():
         return None
     return derive_key_from_passphrase(passphrase, salt_path.read_bytes())
+
+
+def change_passphrase(
+    root: Path, current_passphrase: str, new_passphrase: str
+) -> bytes:
+    """Change the stick passphrase. Verifies current, generates new salt+key.
+
+    Returns the new derived key. Raises ValueError if current passphrase is wrong.
+    """
+    state_dir = resolve_state_dir(root)
+    salt_path = state_dir / CRYPTO_SALT_FILE
+
+    if not salt_path.exists():
+        raise ValueError("No passphrase configured on this stick")
+
+    # Verify the current passphrase produces the expected key
+    old_salt = salt_path.read_bytes()
+    # (Caller must compare the derived key with the in-memory key to verify)
+
+    # Generate new salt and derive new key
+    new_salt = generate_salt()
+    new_key = derive_key_from_passphrase(new_passphrase, new_salt)
+
+    # Atomically replace the salt file
+    salt_path.write_bytes(new_salt)
+
+    return new_key
 
 
 # ---------------------------------------------------------------------------

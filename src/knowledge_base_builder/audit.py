@@ -23,6 +23,26 @@ off the newest records leaves a shorter but internally consistent history. So
 :meth:`AuditLog.head` exposes the current value so a caller can anchor it
 somewhere the log's writer does not control.
 
+Authenticity (N3)
+-----------------
+A hash chain proves *internal consistency*, but the hash function is public: an
+adversary who can rewrite the file can recompute every digest and re-chain a
+forged history that verifies clean. To make the chain *unforgeable* rather than
+merely consistent, each record is additionally signed with ML-DSA-65 (Dilithium3,
+FIPS 204/205) using the per-stick keypair from :mod:`.pqc`. Editing a record and
+re-deriving its hash then leaves a signature that no longer matches, and the
+forger cannot produce a replacement without the secret key.
+
+Verification needs only the *public* key, so anchor it (or its fingerprint) off
+the medium exactly as you anchor the head: :meth:`AuditLog.verify` accepts a
+``pubkey`` to check against and rejects a record signed by any other key, which
+detects wholesale re-signing under a swapped keypair. Signing degrades gracefully
+-- if the keypair or dilithium-py is absent the chain is still written and checked
+(SHA-256 only), so the audit trail is never the thing that fails an acquisition.
+The residual threat is an adversary who can also read the secret-key file; protect
+it with :func:`pqc.setup_stick_encryption` (Argon2id + AES-256-GCM, passphrase held
+off the medium) where that threat is in scope.
+
 Every record is fsynced. On removable media an entry lost to an unclean eject is
 indistinguishable from one that was never written, which would undermine the whole
 point.
@@ -39,6 +59,7 @@ nothing here is constrained by an external file format.
 from __future__ import annotations
 from .state_paths import resolve_state_dir
 
+import base64
 import getpass
 import hashlib
 import json
@@ -48,8 +69,23 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+from . import pqc
+
 GENESIS_HASH = "0" * 64
 LOG_NAME = "audit.log"
+
+# ML-DSA-65 (Dilithium3), FIPS 204/205 -- the scheme pqc.sign_bytes implements.
+SIG_ALG = "ML-DSA-65"
+
+
+def _pubkey_fingerprint(pubkey: bytes) -> str:
+    """Short, stable identifier for a signing key: first 16 hex of SHA-256(pk).
+
+    Stored on every signed record so verification can tell "signed by the key I
+    expected" from "re-signed under a swapped key", and so an operator can anchor
+    the fingerprint off the medium without carrying the whole public key.
+    """
+    return hashlib.sha256(pubkey).hexdigest()[:16]
 
 
 class Event:
@@ -110,6 +146,57 @@ def compute_hash(record: Dict[str, Any]) -> str:
     return hashlib.sha256(_canonical(record).encode("utf-8")).hexdigest()
 
 
+def _verify_record_signature(
+    index: int,
+    entry: Dict[str, Any],
+    verify_pk: Optional[bytes],
+    expected_fp: Optional[str],
+    ml_dsa_available: bool,
+    require_signatures: bool,
+) -> str:
+    """Return a problem string for record *index*, or ``""`` if acceptable.
+
+    Split out of :meth:`AuditLog.verify` so the chain loop reads as one thing and
+    the signature policy as another. The chain hash has already been re-derived by
+    the caller; this only adjudicates the ML-DSA signature.
+    """
+    sig_b64 = entry.get("sig")
+    if not sig_b64:
+        if require_signatures:
+            return (
+                f"record {index}: unsigned, but signatures are required -- the "
+                "signature was stripped or the record predates signing"
+            )
+        return ""
+
+    # The record claims a signature. Being unable to check it is only fatal when
+    # the caller demanded signatures; otherwise the chain itself was still verified.
+    if verify_pk is None or not ml_dsa_available:
+        if require_signatures:
+            why = "no public key to verify against" if verify_pk is None \
+                else "dilithium-py is not installed"
+            return f"record {index}: cannot verify a required signature -- {why}"
+        return ""
+
+    fp = entry.get("sig_key")
+    if fp and expected_fp and fp != expected_fp:
+        return (
+            f"record {index}: signed by key {fp} but verifying with {expected_fp} -- "
+            "the log was re-signed under a different keypair"
+        )
+    try:
+        signature = base64.b64decode(sig_b64)
+        good = pqc.verify_signature(verify_pk, entry["hash"].encode("ascii"), signature)
+    except Exception as exc:  # malformed base64, wrong length, backend error
+        return f"record {index}: signature could not be decoded or checked ({exc})"
+    if not good:
+        return (
+            f"record {index}: ML-DSA signature does not verify -- the record was "
+            "re-hashed after a forged edit, or signed by another key"
+        )
+    return ""
+
+
 class AuditLog:
     """Append-only, hash-chained event log for one bucket."""
 
@@ -121,6 +208,27 @@ class AuditLog:
         # interleave would otherwise produce records chained to the same
         # predecessor, which verify() would (correctly) reject.
         self._lock = threading.Lock()
+        # Cached (pk, sk) once a stick keypair is found; the key files are tiny
+        # and fixed while the log grows unbounded, so caching avoids re-reading
+        # them on every append.
+        self._signing_keys: Optional[Tuple[bytes, bytes]] = None
+
+    def _load_signing_keys(self) -> Tuple[Optional[bytes], Optional[bytes]]:
+        """The stick's ML-DSA keypair for signing, or ``(None, None)``.
+
+        Absent keys are *not* cached: a stick provisioned mid-process should start
+        signing on its next event rather than after a restart, and the probe is
+        two ``exists()`` calls.
+        """
+        if self._signing_keys is not None:
+            return self._signing_keys
+        try:
+            pk, sk = pqc.load_stick_keys(self.root)
+        except Exception:
+            return None, None
+        if pk and sk:
+            self._signing_keys = (pk, sk)
+        return pk, sk
 
     # -- reading -----------------------------------------------------------
     def read_all(self) -> List[Dict[str, Any]]:
@@ -182,6 +290,7 @@ class AuditLog:
                 "prev_hash": prev_hash,
             }
             record["hash"] = compute_hash(record)
+            self._sign(record)
 
             try:
                 self.state_dir.mkdir(parents=True, exist_ok=True)
@@ -196,17 +305,65 @@ class AuditLog:
                 record["__unwritten__"] = str(exc)
             return record
 
+    def _sign(self, record: Dict[str, Any]) -> None:
+        """Attach an ML-DSA-65 signature over the record's chain hash, in place.
+
+        Signs ``record["hash"]`` -- the SHA-256 that already commits to the full
+        record *and* its predecessor -- so the signature binds the record to its
+        exact position in the chain (hash-then-sign). The signature fields are
+        deliberately outside :func:`_canonical`, so they never feed back into the
+        hash they sign.
+
+        Never raises: a stick with no keypair (or without dilithium-py) simply
+        writes an unsigned record. Durability of the audit write outranks signing;
+        an audit trail that refused to record because a key was missing would be a
+        worse failure than one that recorded without a signature.
+        """
+        pk, sk = self._load_signing_keys()
+        if not (pk and sk):
+            return
+        try:
+            signature = pqc.sign_bytes(sk, record["hash"].encode("ascii"))
+        except Exception:
+            return
+        record["sig"] = base64.b64encode(signature).decode("ascii")
+        record["sig_alg"] = SIG_ALG
+        record["sig_key"] = _pubkey_fingerprint(pk)
+
     # -- verification (AU-9) ----------------------------------------------
-    def verify(self, expected_head: Optional[str] = None) -> Tuple[bool, str]:
+    def verify(
+        self,
+        expected_head: Optional[str] = None,
+        pubkey: Optional[bytes] = None,
+        require_signatures: bool = False,
+    ) -> Tuple[bool, str]:
         """Re-derive the chain. Returns ``(ok, problem)``.
 
         Pass *expected_head* -- a value previously obtained from :meth:`head` and
         stored outside this file -- to also detect tail truncation, which a
         self-contained chain cannot see: removing the newest records leaves a
         shorter history that is internally consistent.
+
+        Signature checking (N3): every record carrying an ML-DSA signature is
+        verified. Pass *pubkey* to pin an off-medium key -- a record signed by any
+        other key is then rejected, so re-signing the whole log under a swapped
+        keypair is caught even by an adversary who could rewrite the file. With no
+        *pubkey* the stick's own public key is used (self-consistency: still
+        defeats a forger who cannot reach the secret key). Set *require_signatures*
+        to additionally reject any unsigned record, so a silently stripped
+        signature cannot pass itself off as a legitimately unsigned one.
         """
         entries = self.read_all()
         prev_hash = GENESIS_HASH
+
+        verify_pk = pubkey
+        if verify_pk is None:
+            try:
+                verify_pk, _ = pqc.load_stick_keys(self.root)
+            except Exception:
+                verify_pk = None
+        ml_dsa_available = pqc.get_pqc_status().get("ml_dsa_65", False)
+        expected_fp = _pubkey_fingerprint(verify_pk) if verify_pk else None
 
         for index, entry in enumerate(entries, start=1):
             if entry.get("__malformed__"):
@@ -227,6 +384,13 @@ class AuditLog:
                     f"record {index}: contents do not match its hash -- the record "
                     "was modified after it was written"
                 )
+
+            problem = _verify_record_signature(
+                index, entry, verify_pk, expected_fp, ml_dsa_available, require_signatures
+            )
+            if problem:
+                return False, problem
+
             prev_hash = str(entry["hash"])
 
         if expected_head is not None and prev_hash != expected_head:

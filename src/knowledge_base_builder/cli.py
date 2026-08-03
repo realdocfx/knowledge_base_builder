@@ -1875,6 +1875,41 @@ GUEST_IMAGE_FILES = ("kbb_guest.img", "vmlinuz-kbb", "initramfs-kbb")
 GUEST_IMAGE_OPTIONAL = (BAREMETAL_INITRAMFS,)
 
 
+def _provision_signing_identity(root: Path) -> None:
+    """Generate the per-stick ML-DSA-65 signing identity (audit N3).
+
+    The tamper-evident audit log signs every record with this keypair, so a forger
+    who can rewrite the log still cannot forge valid signatures (see
+    :mod:`.audit`). Generating it here -- once, on the build host, at provisioning
+    time -- means the running stick signs with no key-management step of its own.
+
+    Idempotent and non-fatal: a build host without dilithium-py ships a stick whose
+    audit log chains (SHA-256) but does not sign, rather than failing the whole
+    provision. Publish ``<root>/.kbb_pubkey.bin`` (or its fingerprint) off the
+    medium to anchor verification against a swapped keypair.
+    """
+    from . import pqc
+
+    if not pqc.get_pqc_status().get("ml_dsa_65", False):
+        console.print(
+            "[yellow]dilithium-py unavailable; skipping the audit signing "
+            "identity.[/yellow] The stick's audit log will chain (SHA-256) but not "
+            "sign. Install dilithium-py to enable ML-DSA-signed audit records."
+        )
+        return
+    try:
+        pk_path, _sk_path = pqc.generate_stick_keypair(root)
+    except Exception as exc:
+        console.print(f"[yellow]Could not generate the signing identity: {exc}[/yellow]")
+        return
+    fingerprint = hashlib.sha256(pk_path.read_bytes()).hexdigest()[:16]
+    console.print(
+        f"[green]Audit signing identity ready[/green] "
+        f"(public key {pk_path.name}, fingerprint {fingerprint}). "
+        "Anchor this fingerprint off the medium to detect a key swap."
+    )
+
+
 def _install_guest_image(root: Path, source: Optional[str] = None) -> None:
     """Place the prebuilt guest image at the drive root.
 
@@ -3316,6 +3351,10 @@ def portable(
     ))
 
     try:
+        # The stick's cryptographic identity comes first: the audit log signs its
+        # very first record (which the steps below may write), so the keypair must
+        # exist before anything is provisioned.
+        _provision_signing_identity(root)
         python_dir = _provision_python_runtime(root, python_version, target_os, bundle_path, allow_insecure_network)
         _bootstrap_pip(python_dir, target_os, bundle_path, allow_insecure_network)
         _install_portable_packages(
