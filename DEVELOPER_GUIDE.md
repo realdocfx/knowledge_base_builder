@@ -166,41 +166,50 @@ knowledge_base_builder/
 
 The `portable` command provisions a USB drive with three additive, non-destructive flags:
 
-| Flag | Mode | What it provisions |
-|------|------|-------------------|
-| *(default)* | B | `.kb_env/` (Python, kiwix, packages), `C2_Portal.bat`/`.sh` |
-| `--with-launcher` | B | `Launch_KBB.exe` (Rust/Tauri), WebView2 runtime |
-| `--with-alpine` | A | `/boot/` (Alpine kernel, initramfs, modloop, kiosk overlay), `/EFI/BOOT/` (GRUB2 + grub.cfg) |
-| `--with-qemu` | C | `/qemu/` (portable QEMU per platform), `start_sandbox.bat`/`.sh` |
+| Flag | Mode | What it provisions | Also needs |
+|------|------|-------------------|------------|
+| *(default)* | B | `.kb_env/` (Python, kiwix, packages), `C2_Portal.bat`/`.sh` | — |
+| `--with-launcher` | B | `Launch_KBB.exe` (Rust/Tauri), WebView2 runtime | — |
+| `--with-alpine` | A | `kbb_guest.img` + `vmlinuz-kbb` + `initramfs-kbb-baremetal`, `/EFI/BOOT/` (GRUB2 + `grub.cfg`) | `--guest-image-from` |
+| `--with-qemu` | C | `kbb_guest.img` + kernel + `initramfs-kbb`, `/qemu/` (portable QEMU per platform), `start_sandbox.bat`/`.sh`, `kbb_drivegen.ps1`, `kbb_mediagen.py` | `--guest-image-from` |
 
-All flags compose: `--with-alpine --with-qemu` provisions both. Alpine boot artefacts are **shared** between Modes A and C (the same `vmlinuz-lts` + `initramfs-lts` serve both).
+All flags compose. Modes A and C share the same guest image + `vmlinuz-kbb`;
+only the initramfs differs (`initramfs-kbb` virtio root vs `initramfs-kbb-baremetal`
+loop-mount). Both require `--guest-image-from <dir>` (the unzipped `kbb-guest-image`
+CI artefact) — the image is built and boot-tested by `.github/workflows/sandbox.yml`,
+not on the provisioning host (which may be Windows and lacks `apk`/musl).
 
 **Key constants** (in `cli.py`):
-- `ALPINE_VERSION` / `ALPINE_RELEASE` — pinned Alpine LTS version
+- `ALPINE_VERSION` / `ALPINE_RELEASE` — pinned Alpine LTS version (for kiwix/QEMU deps)
 - `QEMU_WIN_BUILD` / `QEMU_RELEASE` — portable QEMU build identifiers
+- `BAREMETAL_INITRAMFS` / `BAREMETAL_ROOT_IMAGE` — Mode A boot artefact names
 - `PROVISIONING_HASHES` — SHA-256 pins for all downloaded artefacts
 
 **Testing the tri-modal provisioning:**
 
 ```bash
-# Run only the tactical provisioning tests (20 tests)
-pytest tests/test_tactical_provision.py -v
+pytest tests/test_tactical_provision.py tests/test_baremetal_boot.py \
+       tests/test_scsi_sandbox.py tests/test_media_iso.py -v
 
 # Key test areas:
-# - Constants and hash entries exist
-# - Alpine boot directory creation
-# - EFI structure + grub.cfg content
-# - apkovl.tar.gz contains kiosk init, USB mount script, runlevel links
-# - apkovl reuses .kb_env/python (SSOT verification)
-# - QEMU URLs cover all 3 platforms
-# - Sandbox launchers use raw passthrough (NOT vvfat)
+# - EFI structure + grub.cfg boots vmlinuz-kbb + initramfs-kbb-baremetal (Mode A)
+# - baremetal_init_script() assembles the overlay root and switch_roots (Mode A)
+# - Sandbox launchers use file-backed SCSI drives (NOT raw passthrough / vvfat)
+# - kbb_mediagen.py packs non-ZIM media into a mountable ISO (Mode C)
 # - Non-destructive: existing files untouched after provision
-# - Idempotent: running twice produces identical output
+# The end-to-end boots (Mode A, Mode C, content passthrough) run in CI, sandbox.yml.
 ```
 
-**Why raw disk passthrough instead of QEMU vvfat:**
+**Why file-backed SCSI drives (not raw passthrough or vvfat):**
 
-QEMU's `vvfat` (virtual FAT) driver reconstructs a FAT filesystem in memory from a host directory. It has a hard limit on root directory entries and cannot handle sticks with many files (the typical KBB stick has 100+ items at the root). The `start_sandbox.bat` script instead passes `\\.\PhysicalDriveN` directly — the guest Alpine kernel sees the real FAT32 partition and mounts it normally. This works with any number of files, any file size, and any directory depth.
+Two earlier Mode C approaches were abandoned. QEMU `vvfat` synthesises a ~516 MB
+volume and cannot carry a 119 GB archive. Raw `\\.\PhysicalDriveN` passthrough
+hangs QEMU in an uninterruptible driver read because Windows owns the mounted
+volume, and needs admin. The launcher instead attaches each ZIM slice as a
+**file-backed disk** on a `virtio-scsi-pci` controller (normal cached file handle
+— no admin, no 2 GB limit) and `kbb-blkfuse` presents each as a true-sized file so
+libzim can read it. See `memory` / `project-windows-qemu-disk-access` for the full
+mechanism comparison.
 
 ## Coding Standards
 

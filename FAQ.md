@@ -21,10 +21,37 @@ Knowledge-Base-Builder offers several advantages over manual web downloads:
 
 ### What operating systems does Knowledge-Base-Builder support?
 
-Knowledge-Base-Builder supports:
-- **Windows 10/11** (PowerShell)
-- **macOS** (bash/zsh)
-- **Linux** (bash)
+The CLI runs on **Windows 10/11**, **macOS**, and **Linux**. A provisioned USB
+stick adds three portable run modes with their own host support — see the next
+question and the [Field Manual](src/knowledge_base_builder/docs/MANUAL.md) host
+matrix.
+
+### What are Modes A, B, and C, and which should I use?
+
+A KBB stick runs three ways:
+
+- **Mode B — Host-native** (default, easiest): double-click a launcher and the
+  portal runs on the host OS. `Launch_KBB.exe` on Windows (bundled WebView2
+  window); `C2_Portal.sh` on Linux/macOS (opens your browser). Use this unless
+  you need isolation or a bootable appliance.
+- **Mode A — Bare-metal / live-USB** (most secure, amnesic): boot the *machine
+  itself* from the stick. Runs entirely from a RAM overlay — power off and there
+  is zero trace on the host. Needs an **x86-64 UEFI** machine (Intel Macs work;
+  **Apple Silicon cannot boot it**).
+- **Mode C — QEMU sandbox** (isolated on any host): runs the portal inside a
+  QEMU VM, shielded from host EDR/DLP. Works on Windows/Linux/macOS (on Apple
+  Silicon it emulates x86-64, so it's slower).
+
+Modes A and C boot the same x86-64 guest image. On **Apple Silicon**, use Mode B
+(via Rosetta 2) or Mode C (emulated); Mode A is not available. Full step-by-step
+per host is in the Field Manual, and mode-specific fixes are in
+[TROUBLESHOOTING](TROUBLESHOOTING.md#tri-modal-deployment-modes-a--b--c).
+
+### Which mode leaves no trace on the host?
+
+**Mode A** (bare-metal). It loop-mounts the guest image read-only and writes only
+to a RAM (tmpfs) overlay, so power-off erases everything. Mode C is process-level
+isolated but runs under the host OS; Mode B runs as an ordinary host process.
 
 ### Is Knowledge-Base-Builder free to use?
 

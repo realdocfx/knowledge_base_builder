@@ -158,10 +158,11 @@ Knowledge-Base-Builder is a Python-based CLI tool that treats local storage (typ
 ### 5. Tri-Modal Deployment Layer (`cli.py` provisioning functions)
 
 **Responsibilities:**
-- Provision Alpine Linux bare-metal boot infrastructure (Mode A)
-- Provision QEMU sandbox hypervisor binaries (Mode C)
-- Generate platform-specific sandbox launchers with file-backed SCSI drives
-- Build the Alpine kiosk overlay (`apkovl.tar.gz`) that reuses `.kb_env/python`
+- Install the shared prebuilt guest image (`kbb_guest.img` + `vmlinuz-kbb` +
+  initramfs) used by both bare-metal (Mode A) and the QEMU sandbox (Mode C)
+- Provision the UEFI/GRUB bootloader for bare-metal boot (Mode A)
+- Provision QEMU sandbox hypervisor binaries + launchers with file-backed SCSI
+  drives and the media ISO packer (Mode C)
 - Extend `cloning.py` so drive duplication includes boot/QEMU infrastructure
 
 **Execution Modes:**
@@ -176,17 +177,17 @@ Knowledge-Base-Builder is a Python-based CLI tool that treats local storage (typ
 │  │  Alpine Boot │  │  Execution   │  │   (Hypervisor)         │ │
 │  │              │  │              │  │                        │ │
 │  │ EFI/BOOT/ ──►│  │ Launch_KBB ──►│  │ start_sandbox.bat ──►  │ │
-│  │ boot/     ──►│  │ C2_Portal  ──►│  │ qemu/win/ ──►          │ │
+│  │ (loop-mount) │  │ C2_Portal  ──►│  │ qemu/win/ ──►          │ │
 │  └──────┬───────┘  └──────┬───────┘  └──────┬─────────────────┘ │
 │         │                 │                 │                    │
 │         ▼                 ▼                 ▼                    │
 │  ┌──────────────────────────────────────────────────────────────┐│
 │  │              Shared Components (DRY / SSOT)                  ││
-│  │  .kb_env/python  — single Python runtime for all modes       ││
-│  │  .kb_env/kiwix   — kiwix-serve binary                       ││
-│  │  boot/vmlinuz-lts — Alpine kernel (Mode A + C share it)     ││
-│  │  boot/initramfs-lts — Alpine initramfs (Mode A + C)         ││
-│  │  boot/apkovl.tar.gz — KBB kiosk overlay (Mode A + C)       ││
+│  │  kbb_guest.img   — prebuilt guest image (Mode A + C boot it)  ││
+│  │  vmlinuz-kbb     — guest kernel (Mode A + C share it)         ││
+│  │  initramfs-kbb   — virtio root (Mode C)                       ││
+│  │  initramfs-kbb-baremetal — loop-mounts the image (Mode A)     ││
+│  │  .kb_env/python  — host runtime for Mode B; kiwix-serve       ││
 │  └──────────────────────────────────────────────────────────────┘│
 │                                                                  │
 │  ┌──────────────────────────────────────────────────────────────┐│
@@ -200,20 +201,20 @@ Knowledge-Base-Builder is a Python-based CLI tool that treats local storage (typ
 
 **Key Design Decisions:**
 - **Non-destructive provisioning**: `--with-alpine` and `--with-qemu` only add files; existing content is never moved or deleted
-- **Shared kernel**: `boot/vmlinuz-lts` and `boot/initramfs-lts` serve both bare-metal UEFI boot and QEMU direct-kernel-boot — one artefact, two execution contexts
-- **SSOT Python runtime**: the Alpine kiosk overlay mounts the USB and runs `.kb_env/python/bin/python3` directly — no second Python installation inside the RAM disk
-- **File-backed SCSI drives**: each ZIM slice is attached as a read-only disk on a single `virtio-scsi-pci` controller (up to 256 targets). A manifest disk at SCSI target 0 maps `/dev/sdX` → filename. `kbb-blkfuse` presents each block device as a regular file of its true size (libzim cannot `fstat()` a block device). No admin elevation is needed — QEMU reads ordinary cached file handles
+- **One guest image, two boot paths**: Modes A and C boot the same `kbb_guest.img` + `vmlinuz-kbb`, so they run byte-identical userspace. Only the initramfs differs — `initramfs-kbb` (virtio root, Mode C) vs `initramfs-kbb-baremetal` (loop-mounts the image with a tmpfs overlay, Mode A). The old Alpine *diskless* boot (an apkovl + an offline apk repo) was removed: the repo was never reliably carried and left Mode A unable to reach the UI
+- **Amnesic by construction**: Mode A stacks a tmpfs upperdir over the read-only image (== Mode C's `snapshot=on`), so every write lands in RAM and power-off leaves nothing on host storage
+- **File-backed SCSI drives**: each ZIM slice is attached as a read-only disk on a single `virtio-scsi-pci` controller (up to 256 targets). A manifest disk at SCSI target 0 maps `/dev/sdX` → filename. `kbb-blkfuse` presents each block device as a regular file of its true size (libzim cannot `fstat()` a block device). Non-ZIM media is packed into a read-only ISO (`/dev/vdb`). No admin elevation is needed — QEMU reads ordinary cached file handles
 - **No elevation**: `start_sandbox.bat` needs no UAC; `start_sandbox.sh` needs no sudo — file-backed drives use normal file I/O
 
 **Provisioning Functions (in `cli.py`):**
 
 | Function | Purpose | Used by |
 |---|---|---|
-| `_provision_alpine_boot()` | Fetch kernel/initramfs/modloop from Alpine CDN | Mode A, C |
-| `_provision_efi_bootloader()` | Inject GRUB2 EFI binary + `grub.cfg` | Mode A |
+| `_install_guest_image()` | Copy `kbb_guest.img` + kernel + both initramfs to the drive root | Mode A, C |
+| `_provision_efi_bootloader()` | Inject GRUB2 EFI binary + `grub.cfg` (boots `vmlinuz-kbb` + `initramfs-kbb-baremetal`) | Mode A |
+| `baremetal_init_script()` | The bare-metal initramfs `/init` (loop-mount + overlay + switch_root) | Mode A |
 | `_provision_qemu_runtime()` | Fetch portable QEMU per platform | Mode C |
-| `_write_sandbox_launchers()` | Generate `start_sandbox.bat`/`.sh` | Mode C |
-| `_build_alpine_overlay()` | Build `apkovl.tar.gz` kiosk overlay | Mode A, C |
+| `_write_sandbox_launchers()` | Generate `start_sandbox.bat`/`.sh`, `kbb_drivegen.ps1`, `kbb_mediagen.py` | Mode C |
 
 ## Data Flow
 

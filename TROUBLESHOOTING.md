@@ -13,6 +13,7 @@ This guide provides comprehensive troubleshooting information for common issues 
 - [Download Failures](#download-failures)
 - [API Rate Limits](#api-rate-limits)
 - [Platform-Specific Issues](#platform-specific-issues)
+- [Tri-Modal Deployment (Modes A / B / C)](#tri-modal-deployment-modes-a--b--c)
 - [Error Message Reference](#error-message-reference)
 - [Log File Analysis](#log-file-analysis)
 - [Getting Help](#getting-help)
@@ -598,6 +599,130 @@ sudo setenforce 0
 # Set proper context
 chcon -R -t user_home_t /path/to/bucket
 ```
+
+## Tri-Modal Deployment (Modes A / B / C)
+
+A KBB stick runs three ways — **Mode A** bare-metal / live-USB, **Mode B**
+host-native launcher, **Mode C** QEMU sandbox. See the
+[Field Manual](src/knowledge_base_builder/docs/MANUAL.md) for the full host/mode
+compatibility matrix. Provisioning Modes A and C requires the guest image:
+`--with-alpine` / `--with-qemu` **plus `--guest-image-from <dir>`** (the unzipped
+`kbb-guest-image` CI artefact — it contains `kbb_guest.img`, `vmlinuz-kbb`,
+`initramfs-kbb`, `initramfs-kbb-baremetal`).
+
+> **Golden rule for A and C:** ship the four guest-image files from **one build**.
+> Mixing a `kbb_guest.img` and an `initramfs-*` from different builds causes
+> kernel/module mismatches (loop or ext4 mount failures). Re-provision from a
+> single unzipped artefact.
+
+### Diagnostics: flight-recorder logs and markers
+
+Both the sandbox (Mode C) and the guest print progress markers you can grep for:
+
+| Marker | Meaning |
+|---|---|
+| `KBB-HEAD-STARTED` | cage launched the UI process |
+| `KBB-UI-ALIVE` | the Tauri/WebKit UI stayed up |
+| `KBB-PORTAL-OK` | the portal served a page |
+| `KBB-ZIM-MOUNTED N` | N ZIM slices mounted (Mode C) |
+| `KBB-BAREMETAL-ROOT-READY` | Mode A assembled the overlay root and switch_root'd |
+| `KBB-BAREMETAL-FAIL: <step>` | Mode A initramfs failed at `<step>`; it drops to a shell |
+
+**Mode C flight-recorder files** (Windows host, in `%TEMP%`):
+- `kbb_sandbox.log` — the guest console (kernel + kiosk markers).
+- `kbb_qemu.log` — QEMU's own stderr (empty on a clean run).
+
+On Linux/macOS these are under `${TMPDIR:-/tmp}/kbb_sandbox.log` / `kbb_qemu.log`.
+
+### Mode A — bare-metal / live-USB
+
+**The stick is not offered in the UEFI boot menu.**
+- Enable **USB boot** and **UEFI** (not Legacy/CSM — KBB is UEFI-only) in firmware.
+- Intel Mac: hold **Option (⌥)** at power-on; in **Startup Security Utility**
+  allow booting from external media.
+- The stick must be **FAT32** with `EFI/BOOT/BOOTX64.EFI` present. Re-provision
+  with `--with-alpine --guest-image-from …` if `EFI/BOOT/` is missing.
+
+**GRUB shows "Secure Boot" / "Invalid signature" and refuses to boot.**
+- Disable Secure Boot in UEFI settings, or replace `EFI\BOOT\BOOTX64.EFI` with a
+  shim-signed GRUB your firmware trusts.
+
+**Boot drops to a shell printing `KBB-BAREMETAL-FAIL: <step>`.** The step names
+the exact failure:
+- `kbb_guest.img not found on any USB/vfat partition` — the image isn't on the
+  stick (re-provision), or the USB controller enumerated too slowly / on an
+  unusual port (try another port; the init waits 60 s).
+- `losetup (loop bind) failed` or `loop driver ABSENT` — the initramfs lacks the
+  loop driver; you shipped a mismatched initramfs. Re-provision the full set.
+- `guest image (ext4) mount failed` (often preceded by `Cannot load crc32c`) —
+  kernel/initramfs mismatch with the image. Re-provision from **one** artefact.
+- `overlay assembly failed` — the kernel lacks overlayfs; re-provision.
+
+**`KBB-BAREMETAL-ROOT-READY` appears but the screen stays black.**
+- cage needs a working DRM node. Most hardware is fine (virtio-gpu in Mode C, a
+  real GPU bare-metal); a few exotic GPUs may not bring up KMS. Use Mode C on
+  that host instead.
+
+**Apple Silicon Mac / ARM machine won't boot it.**
+- Expected — the guest image is x86-64. Use **Mode B** (Rosetta) or **Mode C**
+  (x86-64 emulation) on Apple Silicon.
+
+### Mode B — host-native launcher
+
+**`Launch_KBB.exe` shows the loading screen forever, then an error.**
+- The Python backend failed to start. Check free space, then re-provision the
+  drive (Scenario 1). The portal, if it did start, is also reachable in a browser
+  at the `http://127.0.0.1:<port>/?t=…` URL the launcher logs.
+
+**`C2_Portal.sh`: "Permission denied".**
+- `chmod +x C2_Portal.sh` and re-run (FAT32 loses the executable bit).
+
+**`C2_Portal.sh`: "cannot execute binary file" / "bad CPU type".**
+- `.kb_env/python` is built for a **different OS/arch** than this host. The
+  embedded runtime is host-specific (and x86-64). Provision the stick on this OS,
+  or on Apple Silicon install Rosetta 2 (`softwareupdate --install-rosetta`).
+
+**"Missing web dependencies" on launch.**
+- The chosen interpreter lacks FastAPI/uvicorn. Re-provision so `.kb_env/python`
+  has the `[web]` extra, or run Mode C (its guest image bundles the web stack).
+
+**Portal opens but every `/api` panel says "LINK DOWN".**
+- You opened a bare `http://127.0.0.1:<port>/` without the token. Use the
+  tokenised URL the launcher/CLI printed (`…/?t=…`).
+
+### Mode C — QEMU sandbox
+
+**`start_sandbox.bat` flashes and closes; "QEMU missing".**
+- The stick wasn't provisioned with QEMU. Run
+  `kb-builder portable D:\ --with-qemu --guest-image-from …`.
+
+**QEMU window opens but is black / "not responding" (Windows AppHangB1).**
+- This was the old SDL fullscreen hang; the launcher now uses `-display gtk`.
+  If you see it, regenerate the launchers (re-provision `--with-qemu`) so
+  `start_sandbox.bat` uses `-full-screen -display gtk,zoom-to-fit=on`.
+
+**Guest boots but the library / file browser is empty.**
+- The **guest image is old** (predates the media mount) — re-provision the guest
+  image from a current artefact. Confirm in `%TEMP%\kbb_sandbox.log`: you should
+  see `KBB-ZIM-MOUNTED N` and a media-mount line, and `bucket:` resolving to the
+  content dir. ZIMs are intentionally hidden from the file browser (they open in
+  the kiwix reader); the browser shows only non-ZIM media.
+
+**Non-ZIM media (PDFs/EPUBs/folders) don't appear in Mode C.**
+- The media ISO is built at launch by `kbb_mediagen.py`, which needs **pycdlib**
+  in `.kb_env/python`. If `kbb_sandbox.log` shows "pycdlib not installed", it was
+  skipped — re-provision (the `[web]`/`sandbox` extras include pycdlib). The first
+  launch after adding content builds the ISO once (minutes for large sets) then
+  caches it in `%TEMP%`.
+
+**Very slow on Apple Silicon (or any ARM host).**
+- `qemu-system-x86_64` emulates x86-64 in software (TCG). Expected; there is no
+  ARM guest image. Use Mode B for speed where possible.
+
+**No admin/UAC prompt appears — is that right?**
+- Yes. Mode C attaches content as **file-backed** drives read through ordinary
+  file handles, so no elevation is needed. A UAC prompt would indicate an old
+  raw-`PhysicalDrive` launcher; re-provision.
 
 ## Error Message Reference
 

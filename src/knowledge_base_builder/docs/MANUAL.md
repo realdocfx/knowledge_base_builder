@@ -1,24 +1,54 @@
-# KBB Field Manual — Building & Duplicating a Stick
+# KBB Field Manual — Building, Running & Duplicating a Stick
 
 A **KBB stick** is a portable USB drive that runs the Knowledge Base portal in
-three modes: **host-native** (single click on any Windows/Linux/macOS host),
-**bare-metal Alpine boot** (amnesic RAM execution, zero host trace), and **QEMU
-sandbox** (hypervisor-isolated from host EDR/DLP). All three share one Python
-runtime, one Alpine kernel, and one dataset — no duplication.
+**three execution modes**:
 
-This manual covers five scenarios:
+- **Mode B — Host-native** (default): a single click launches the portal on the
+  host OS using an embedded Python runtime. No install, no admin. On Windows the
+  Tauri app `Launch_KBB.exe` renders it in a bundled WebView2 window; on
+  Linux/macOS `C2_Portal.sh` opens it in your default browser.
+- **Mode A — Bare-metal / live-USB** (amnesic): boot the *machine itself* from
+  the stick. It loop-mounts the same guest image Mode C uses, stacks a RAM
+  overlay, and runs the portal in a fullscreen Cage/WebKitGTK kiosk. Every write
+  goes to RAM — **power off = zero trace** on host storage.
+- **Mode C — QEMU sandbox** (isolated): run the portal inside a QEMU virtual
+  machine on the host OS, isolating OSINT processing from host EDR/DLP/AV.
 
-| # | Goal | Needs a terminal? | Needs internet? |
-|---|------|-------------------|-----------------|
-| 1 | First build from GitHub onto an empty drive | **Yes** (one-time, on a build PC) | Yes (to download the runtime + content) |
-| 2 | Make a **virgin** stick from an existing one | No — done in the portal UI | No |
-| 3 | **Full duplicate** of a stick to a new one | No — done in the portal UI | No |
-| 4 | **Bare-metal boot** from the stick (Mode A) | No — UEFI boot menu | No |
-| 5 | **QEMU sandbox** from the stick (Mode C) | No — double-click launcher | No |
+Modes A and C boot the **same finished guest image** (`kbb_guest.img`), so they
+run byte-identical userspace. Mode B shares the same content and dataset.
+
+## Host & mode compatibility
+
+"Machine architecture", not the installed OS, decides Mode A (it *replaces* the
+OS). The embedded Python, kiwix and the guest image are **x86-64**; there is no
+ARM build, so on Apple Silicon the x86-64 binaries run under **Rosetta 2** and
+QEMU always emulates x86-64.
+
+| Host / machine | Mode A (bare-metal) | Mode B (host-native) | Mode C (QEMU sandbox) |
+|---|---|---|---|
+| **Windows** (x86-64) | ✅ boot the PC from USB | ✅ `Launch_KBB.exe` / `C2_Portal.bat` | ✅ `start_sandbox.bat` |
+| **Linux** (x86-64) | ✅ boot the PC from USB | ✅ `C2_Portal.sh` | ✅ `start_sandbox.sh` |
+| **macOS — Intel** | ✅ boot the Mac from USB¹ | ✅ `C2_Portal.sh` | ✅ `start_sandbox.sh` |
+| **macOS — Apple Silicon** | ❌ can't boot an x86-64 image on ARM | ⚠️ works via Rosetta 2 | ✅ `start_sandbox.sh` (x86-64 emulated, slower) |
+| **ARM PC / ARM Linux** | ❌ image is x86-64 | ❌ no ARM runtime build | ⚠️ QEMU emulates x86-64 (slow) |
+
+¹ Intel Macs: in **Startup Security Utility** (recovery), allow booting from
+external media, and hold **Option (⌥)** at power-on to pick the USB.
+
+This manual covers six scenarios:
+
+| # | Goal | Mode | Needs a terminal? | Needs internet? |
+|---|------|------|-------------------|-----------------|
+| 1 | First build from GitHub onto an empty drive | — | **Yes** (one-time, on a build PC) | Yes (runtime + content) |
+| 2 | Make a **virgin** stick from an existing one | — | No — in the portal UI | No |
+| 3 | **Full duplicate** of a stick to a new one | — | No — in the portal UI | No |
+| 4 | **Run the portal** on the host OS | **B** | No — double-click a launcher | No |
+| 5 | **Bare-metal boot** from the stick | **A** | No — UEFI boot menu | No |
+| 6 | **QEMU sandbox** from the stick | **C** | No — double-click a launcher | No |
 
 Scenarios 2–3 are performed from the portal's **Drive Provisioning** panel.
-Scenarios 4–5 require one-time provisioning (Scenario 1 with `--with-alpine`
-and/or `--with-qemu`).
+Scenarios 5–6 require one-time provisioning (Scenario 1 with `--with-alpine`
+and/or `--with-qemu` **plus `--guest-image-from`**).
 
 ---
 
@@ -27,9 +57,15 @@ and/or `--with-qemu`).
 This is the one-time bootstrap on a "build PC" that has internet. Everything after
 this can be done offline via Scenarios 2–3.
 
-**You need:** a Windows build PC with [Python 3.13+](https://www.python.org/) and
-[Rust](https://rustup.rs/) installed, an internet connection, and an empty USB drive
-(e.g. `E:`). FAT32 is fine — large ZIMs are auto-split into `≤4 GB` slices.
+**You need:** a build PC with [Python 3.13+](https://www.python.org/), an
+internet connection, and an empty USB drive (e.g. `E:`). FAT32 is fine — large
+ZIMs are auto-split into `≤4 GB` slices.
+
+> **Build host:** provisioning runs on **Windows, Linux, or macOS** — the
+> embedded runtime is fetched for the OS you build on (so build on the OS you'll
+> run Mode B on). Only `--with-launcher` (the `Launch_KBB.exe` Tauri app) is
+> Windows-only and needs [Rust](https://rustup.rs/); Modes A and C are
+> OS-independent (they ship the prebuilt guest image via `--guest-image-from`).
 
 1. **Get the code and install KBB** (in a terminal on the build PC):
    ```bash
@@ -118,55 +154,96 @@ items, ZIM slices, search state).
 
 ---
 
-## Scenario 4 — Bare-metal boot from the stick (Mode A, offline, no terminal)
+## Scenario 4 — Run the portal on the host OS (Mode B, offline, no terminal)
 
-Boot the target hardware directly from the USB stick. Alpine Linux loads entirely
-into RAM — **zero trace** on host storage upon power-off or physical device
-detachment. The KBB portal runs in a Cage/WebKitGTK kiosk (the same Tauri UI as
-host-native Mode B).
+The default, lowest-friction mode: the portal runs directly on the host using
+the stick's embedded Python — no install, no admin, no VM.
 
-**One-time preparation** (on the build PC, once per stick):
-```bash
-kb-builder portable E:\ --with-alpine --allow-insecure-network
-```
-This downloads the Alpine kernel, initramfs, modloop, and GRUB2 EFI bootloader
-(~175 MB), and generates the KBB kiosk overlay (`apkovl.tar.gz`).
+**Windows**
+1. Insert the stick.
+2. Double-click **`Launch_KBB.exe`** (built with `--with-launcher`) — the portal
+   opens in a bundled WebView2 window; a loading screen shows until the backend
+   is ready. If the stick was provisioned without `--with-launcher`, double-click
+   **`C2_Portal.bat`** instead; it opens the portal in your default browser.
 
-**Using it in the field:**
-1. Insert the stick into the target hardware.
-2. Enter the UEFI/BIOS boot menu (typically **F12**, **F2**, or **Esc** at power-on).
-3. Select the USB drive. GRUB shows: **"KBB Tactical OSINT Appliance (Amnesic RAM)"**.
-4. Press Enter. Alpine loads into RAM (~5 seconds), mounts the stick read-only,
-   and starts the KBB portal in a fullscreen Cage/WebKitGTK kiosk.
-5. **Power off = total erasure.** Nothing is written to the host's internal storage.
+**Linux / macOS**
+1. Insert the stick and open a terminal at its root (or `cd` to it).
+2. Run **`./C2_Portal.sh`**. It starts the embedded Python portal and opens your
+   default browser at the tokenised `http://127.0.0.1:<port>/?t=…` URL.
+   - First run may need `chmod +x C2_Portal.sh`.
+   - **Apple Silicon:** the embedded runtime is x86-64, so macOS runs it under
+     **Rosetta 2** (install once with `softwareupdate --install-rosetta` if
+     prompted). It works, just slightly slower to start.
 
-**Requirements:**
-- UEFI firmware (most hardware since ~2012). Legacy BIOS/CSM is not supported.
-- FAT32 USB partition (the stick must be FAT32 for UEFI boot — this is the
-  standard KBB format).
-- The stick's content is mounted **read-only** inside the Alpine guest.
-
-> **Secure Boot:** if Secure Boot is enabled, the host firmware must trust the
-> GRUB2 binary at `EFI\BOOT\BOOTX64.EFI`. Unsigned GRUB will be rejected.
-> Either disable Secure Boot in UEFI settings or replace the binary with a
-> shim-signed version (e.g., from Ubuntu's `shim-signed` package).
+> **The runtime is built for the OS you provisioned on.** `.kb_env/python` is the
+> host-native Python of the build machine, so a stick built on Windows runs
+> Mode B on Windows; to run Mode B on Linux/macOS as well, provision on that OS
+> too (Scenario 1) or use Mode C, whose guest image is OS-independent.
 
 ---
 
-## Scenario 5 — QEMU sandbox from the stick (Mode C, offline, no terminal)
+## Scenario 5 — Bare-metal boot from the stick (Mode A, offline, no terminal)
+
+Boot the *machine itself* from the USB stick — no host OS involved. Mode A boots
+the **same guest image Mode C uses** (`kbb_guest.img`): a bare-metal initramfs
+loop-mounts it read-only and stacks a **tmpfs (RAM) overlay**, so every write
+lands in RAM and **power-off leaves zero trace** on host storage. The portal runs
+in a fullscreen Cage/WebKitGTK kiosk — the same UI as Modes B and C.
+
+**One-time preparation** (on the build PC, once per stick). Mode A needs the
+prebuilt guest image, exactly like Mode C:
+```bash
+# 1. Get the guest image: download the "kbb-guest-image" artefact from the
+#    project's `sandbox` GitHub Actions run and unzip it into a folder, e.g. .\guest\
+#    (it contains kbb_guest.img, vmlinuz-kbb, initramfs-kbb, initramfs-kbb-baremetal).
+# 2. Provision Mode A onto the stick:
+kb-builder portable E:\ --with-alpine --guest-image-from .\guest\ --allow-insecure-network
+```
+This installs the guest image + `initramfs-kbb-baremetal`, and writes the UEFI
+GRUB entry at `EFI\BOOT\` (`BOOTX64.EFI` + `grub.cfg`). No Alpine package repo,
+no network at boot.
+
+**Using it in the field:**
+1. Insert the stick into an **x86-64 UEFI machine** (any PC since ~2012, or an
+   Intel Mac — see the compatibility matrix; Apple Silicon cannot boot it).
+2. Enter the UEFI boot menu (typically **F12**, **F2**, or **Esc** at power-on;
+   Intel Mac: hold **Option (⌥)**).
+3. Select the USB drive. GRUB shows **"KBB Tactical OSINT Appliance (Amnesic)"**.
+4. Press Enter. The initramfs finds the stick, loop-mounts `kbb_guest.img` with a
+   RAM overlay, and starts the KBB kiosk. The stick's `library/archive/` content
+   (ZIMs + media) is served from the FAT32 partition.
+5. **Power off = total erasure.** Nothing is written to host internal storage.
+
+**Requirements:**
+- An **x86-64** machine with **UEFI** firmware. Legacy BIOS/CSM and ARM/Apple
+  Silicon are not supported (the image is x86-64).
+- FAT32 USB partition (the standard KBB format; also what UEFI boots from).
+
+> **Secure Boot:** the firmware must trust `EFI\BOOT\BOOTX64.EFI`. Either disable
+> Secure Boot in UEFI settings, or replace the binary with a shim-signed GRUB.
+>
+> **Boot fails to a shell (`KBB-BAREMETAL-FAIL: …`)?** The message names the exact
+> step (e.g. stick not found, `losetup`, ext4 mount). See TROUBLESHOOTING.md →
+> *Mode A*.
+
+---
+
+## Scenario 6 — QEMU sandbox from the stick (Mode C, offline, no terminal)
 
 Run the KBB portal **inside a hypervisor** on the host OS. The QEMU virtual
 machine isolates OSINT processing from the host's EDR, DLP, and antivirus
 telemetry. Each ZIM slice on the stick is delivered to the guest as a
 **file-backed SCSI disk** — zero-copy, no admin elevation, no file-size limits.
 
-**One-time preparation** (on the build PC, once per stick):
+**One-time preparation** (on the build PC, once per stick). Like Mode A, Mode C
+boots the prebuilt guest image, so pass `--guest-image-from` (the same folder):
 ```bash
-kb-builder portable E:\ --with-qemu --allow-insecure-network
+kb-builder portable E:\ --with-qemu --guest-image-from .\guest\ --allow-insecure-network
 ```
-This downloads the portable QEMU binary (~240 MB for Windows), generates the
-sandbox launcher scripts (`start_sandbox.bat`, `start_sandbox.sh`), and writes
-the ZIM enumerator (`kbb_drivegen.ps1`).
+This downloads the portable QEMU binary (~240 MB for Windows; Linux/macOS builds
+too), installs the guest image, generates the sandbox launchers
+(`start_sandbox.bat`, `start_sandbox.sh`), and writes the ZIM enumerator
+(`kbb_drivegen.ps1`) and the non-ZIM media packer (`kbb_mediagen.py`).
 
 **Using it in the field:**
 
@@ -179,16 +256,24 @@ the ZIM enumerator (`kbb_drivegen.ps1`).
 5. The operator interacts with the QEMU window directly — no host browser needed.
 
 ### Linux / macOS
-1. Insert the stick and note the mount point.
-2. Run `./start_sandbox.sh` from the stick root.
+1. Insert the stick and open a terminal at its root.
+2. Run `./start_sandbox.sh` from the stick root (`chmod +x` it on first run).
 3. **No sudo needed** — QEMU reads ordinary files.
 4. The QEMU window shows the KBB UI fullscreen.
+   - **Apple Silicon:** `qemu-system-x86_64` emulates x86-64 in software (TCG),
+     so the guest boots and runs correctly but noticeably slower than on an
+     x86-64 host. This is expected — there is no ARM guest image.
 
 **How it works:**
 - The launcher enumerates every `.zim*` file in `library/archive/` and attaches
   each as a read-only disk on a single `virtio-scsi-pci` controller (up to 256
   targets). A manifest disk at SCSI target 0 carries a V2 text manifest:
   `<target> <filename> <true_size>`.
+- **Non-ZIM media** (Archive.org PDFs, EPUBs, folders) can't be a block device,
+  so the launcher packs `library/archive/` minus the ZIMs into a read-only ISO
+  (`kbb_mediagen.py`, cached in `%TEMP%`) and attaches it as `/dev/vdb`. The
+  guest mounts it and unifies it with the ZIMs into one bucket, so the file
+  browser shows the same media as Modes A and B.
 - QEMU boots a **prebuilt Alpine guest image** (`kbb_guest.img`) — direct-kernel-
   boot with `vmlinuz-kbb` + `initramfs-kbb`, no BIOS emulation.
 - The guest loads `virtio_scsi` + `sd_mod` post-boot, reads the manifest from
@@ -212,12 +297,14 @@ the ZIM enumerator (`kbb_drivegen.ps1`).
 ## Provisioning both modes at once
 
 ```bash
-kb-builder portable E:\ --with-alpine --with-qemu --allow-insecure-network
+kb-builder portable E:\ --with-alpine --with-qemu --guest-image-from .\guest\ --allow-insecure-network
 ```
 
 All flags are **additive and non-destructive** — existing content on the stick
-is never touched. The Alpine kernel + initramfs are shared between Modes A and C
-(single source of truth).
+is never touched. Modes A and C share the **same guest image and kernel**
+(`kbb_guest.img` + `vmlinuz-kbb`); only the initramfs differs — `initramfs-kbb`
+(virtio root, Mode C) vs `initramfs-kbb-baremetal` (loop-mounts the image,
+Mode A). One artefact, two boot paths — single source of truth.
 
 ---
 
@@ -280,10 +367,11 @@ wait), and the embedded ZIM reader shows a spinner until the first page loads.
 | Item | Virgin | Full |
 |------|:------:|:----:|
 | `.kb_env/` (Python, kiwix, WebView2) | ✅ | ✅ |
-| `Launch_KBB.exe` + launcher scripts | ✅ | ✅ |
-| `EFI/` + `boot/` (Mode A infrastructure) | ✅ | ✅ |
-| `qemu/` + sandbox launchers (Mode C infrastructure) | ✅ | ✅ |
-| Downloaded Archive.org items | ❌ | ✅ |
+| `Launch_KBB.exe` / `C2_Portal.*` (Mode B) | ✅ | ✅ |
+| `kbb_guest.img` + `vmlinuz-kbb` (shared A/C) | ✅ | ✅ |
+| `EFI/` + `initramfs-kbb-baremetal` (Mode A boot) | ✅ | ✅ |
+| `qemu/` + `initramfs-kbb` + sandbox launchers (Mode C) | ✅ | ✅ |
+| Downloaded Archive.org items (`library/archive/`) | ❌ | ✅ |
 | ZIM archives / split slices | ❌ | ✅ |
 | Sync state / search index | ❌ (fresh) | rebuilt on first run |
 
