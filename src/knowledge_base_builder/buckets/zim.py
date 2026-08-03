@@ -687,6 +687,15 @@ class ZimBucket(BaseBucket):
     @staticmethod
     def _slice_suffix(index: int) -> str:
         """Alphabetical slice suffix: aa, ab, ..., az, ba, bb, ..."""
+        # 26*26 = 676 two-letter suffixes (aa..zz). Past index 675 the arithmetic
+        # overflows 'z' to '{' and beyond, silently producing filenames libzim
+        # cannot reassemble (audit N28). 676 slices is ~1.22 TiB at 1900 MiB --
+        # beyond any single archive today -- so fail loudly rather than corrupt.
+        if index > 675:
+            raise ValueError(
+                f"ZIM split exceeded 676 slices (index {index}); the archive is "
+                "too large for the .zimaa..zimzz two-letter naming scheme"
+            )
         return f"{chr(ord('a') + index // 26)}{chr(ord('a') + index % 26)}"
 
     def _slice_temp_path(self, identifier: str, index: int) -> Path:
