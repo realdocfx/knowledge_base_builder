@@ -371,9 +371,13 @@ class ZimBucket(BaseBucket):
                 self._hash_file(hasher, temp_file, 0, total_size)
                 return self._verify_and_finalize(temp_file, target_file, hasher, total_size)
 
-        headers = {"Range": f"bytes={bytes_written}-"} if bytes_written > 0 else {}
-        if headers:
-            response_stream = self._reopen_stream(response_stream.url, headers)
+        if bytes_written > 0:
+            response_stream = self._reopen_stream(
+                response_stream.url, {"Range": f"bytes={bytes_written}-"})
+            if self._resume_start_offset(response_stream, bytes_written) == 0:
+                # Mirror ignored Range and is resending the whole object;
+                # truncate and rewrite from 0 rather than append it (audit P5).
+                bytes_written = 0
 
         last_state_flush = bytes_written
         with open(temp_file, 'ab' if bytes_written > 0 else 'wb') as f:
@@ -436,9 +440,18 @@ class ZimBucket(BaseBucket):
             active_size = 0
             active_path = self._slice_temp_path(identifier, current_slice)
 
-        headers = {"Range": f"bytes={bytes_written}-"} if bytes_written > 0 else {}
-        if headers:
-            response_stream = self._reopen_stream(response_stream.url, headers)
+        if bytes_written > 0:
+            response_stream = self._reopen_stream(
+                response_stream.url, {"Range": f"bytes={bytes_written}-"})
+            if self._resume_start_offset(response_stream, bytes_written) == 0:
+                # Mirror ignored Range and is resending the whole object; restart
+                # the slice geometry from scratch rather than appending the full
+                # body onto the partial slices (audit P5).
+                bytes_written = 0
+                current_slice = 0
+                slice_offsets = []
+                active_size = 0
+                active_path = self._slice_temp_path(identifier, current_slice)
 
         current_file = open(active_path, 'ab' if active_size > 0 else 'wb')
         slice_bytes = active_size
@@ -674,6 +687,15 @@ class ZimBucket(BaseBucket):
     @staticmethod
     def _slice_suffix(index: int) -> str:
         """Alphabetical slice suffix: aa, ab, ..., az, ba, bb, ..."""
+        # 26*26 = 676 two-letter suffixes (aa..zz). Past index 675 the arithmetic
+        # overflows 'z' to '{' and beyond, silently producing filenames libzim
+        # cannot reassemble (audit N28). 676 slices is ~1.22 TiB at 1900 MiB --
+        # beyond any single archive today -- so fail loudly rather than corrupt.
+        if index > 675:
+            raise ValueError(
+                f"ZIM split exceeded 676 slices (index {index}); the archive is "
+                "too large for the .zimaa..zimzz two-letter naming scheme"
+            )
         return f"{chr(ord('a') + index // 26)}{chr(ord('a') + index % 26)}"
 
     def _slice_temp_path(self, identifier: str, index: int) -> Path:
@@ -724,6 +746,31 @@ class ZimBucket(BaseBucket):
         # Shorter read timeout so a stalled mirror trips quickly and the caller
         # can retry/resume instead of hanging forever.
         return requests.get(url, headers=headers, stream=True, timeout=(30, 60))
+
+    @staticmethod
+    def _resume_start_offset(response, requested_offset: int) -> int:
+        """Byte offset the resumed body actually starts at (audit P5).
+
+        On resume we send ``Range: bytes=N-``. A well-behaved mirror replies
+        **206** and the body begins at N, so we append. A mirror that ignores
+        Range replies **200** with the WHOLE object from offset 0 — appending
+        that to the N-byte partial corrupts it, the corruption is only caught by
+        the final hash, and ``_verify_and_finalize_split`` then deletes every
+        slice: a multi-hour transfer turned into a destructive no-op. Detect the
+        200 and tell the caller to restart from 0 instead; raise on anything
+        unexpected rather than write blindly.
+        """
+        if requested_offset <= 0:
+            return 0
+        status = getattr(response, "status_code", None)
+        if status == 206:
+            return requested_offset
+        if status == 200:
+            return 0  # mirror ignored Range; it is resending the whole object
+        raise RuntimeError(
+            f"resume expected HTTP 206, got {status}; refusing to append "
+            f"(would corrupt the {requested_offset}-byte partial download)"
+        )
 
     @staticmethod
     def _format_bytes(bytes_count: int) -> str:

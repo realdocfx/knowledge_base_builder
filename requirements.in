@@ -10,3 +10,11 @@ fastapi==0.139.2
 uvicorn[standard]==0.51.0
 httpx==0.28.1
 # Note: xapian-bindings is provisioned via custom wheel, not from PyPI
+
+# Content rendering + sandbox provisioning (audit P4: these are declared in
+# pyproject -- pypdf core, pymupdf [web], pycdlib [sandbox] -- but were missing
+# from the hash-pinned closure, so a stick provisioned by `kb-builder portable`
+# shipped without server-side PDF rendering or the non-ZIM media ISO).
+pypdf==6.14.2
+pymupdf==1.28.0
+pycdlib==1.16.0

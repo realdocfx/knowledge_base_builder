@@ -214,3 +214,61 @@ def test_runtime_mode_still_excludes_content(tmp_path):
     assert status["state"] == "done", status
     assert (dst / ".kb_env" / "python" / "python.exe").exists()
     assert not (dst / "AnItem").exists()
+
+
+# --------------------------------------------------------------------------
+# P2: the runtime ("virgin") clone must carry the bootable guest image
+# --------------------------------------------------------------------------
+def test_runtime_items_cover_sandbox_infra():
+    """`_RUNTIME_ITEMS` must carry every bootable artefact (audit P2).
+
+    The guest-image rework moved kbb_guest.img + the kernel + both initramfs to
+    the drive root but never updated `_RUNTIME_ITEMS`, so a virgin clone reported
+    success yet booted neither Mode A nor Mode C. Bind the list to
+    `cli.SANDBOX_INFRA_NAMES` so the two cannot silently drift again.
+    """
+    from knowledge_base_builder import cli
+
+    runtime = set(cloning._RUNTIME_ITEMS)
+    # Entries in SANDBOX_INFRA_NAMES that are NOT part of the bootable runtime:
+    # mutable state (fresh on a virgin stick), per-user creds, bundled docs, and
+    # Windows system dirs that must never be copied.
+    not_runtime = {".kb_state", ".ia_state", "docs",
+                   "System Volume Information", "$RECYCLE.BIN"}
+    must_clone = set(cli.SANDBOX_INFRA_NAMES) - not_runtime
+    missing = must_clone - runtime
+    assert not missing, (
+        f"_RUNTIME_ITEMS omits bootable infra {sorted(missing)} -- a virgin "
+        "clone would report success but not boot Mode A/C (audit P2)"
+    )
+    # The exact files the boot chain dereferences (grub.cfg + start_sandbox.bat).
+    for f in ("kbb_guest.img", "vmlinuz-kbb", "initramfs-kbb-baremetal",
+              "start_sandbox.bat", "kbb_drivegen.ps1", "kbb_mediagen.py"):
+        assert f in runtime, f"boot chain needs {f}; not in _RUNTIME_ITEMS"
+
+
+def test_runtime_clone_carries_the_guest_image(tmp_path):
+    """Reproduce audit P2 end to end: the runtime clone copies the guest image."""
+    src = _make_source(tmp_path / "src")
+    guest_files = (
+        "kbb_guest.img", "vmlinuz-kbb", "initramfs-kbb",
+        "initramfs-kbb-baremetal", "kbb_drivegen.ps1", "kbb_mediagen.py",
+        "start_sandbox.bat", "start_sandbox.sh",
+    )
+    for name in guest_files:
+        (src / name).write_bytes(b"x" * 512)
+    (src / "EFI" / "BOOT").mkdir(parents=True)
+    (src / "EFI" / "BOOT" / "grub.cfg").write_text(
+        "linux /vmlinuz-kbb\ninitrd /initramfs-kbb-baremetal\n", encoding="utf-8"
+    )
+    dst = tmp_path / "dst"
+    dst.mkdir()
+
+    status = cloning.clone(src, dst, mode="runtime")
+
+    assert status["state"] == "done", status
+    for name in ("kbb_guest.img", "vmlinuz-kbb", "initramfs-kbb-baremetal",
+                 "kbb_drivegen.ps1", "kbb_mediagen.py"):
+        assert (dst / name).exists(), f"runtime clone dropped {name} (audit P2)"
+    assert (dst / "EFI" / "BOOT" / "grub.cfg").exists()
+    assert not (dst / "AnItem").exists(), "content leaked into a virgin clone"

@@ -298,7 +298,9 @@ class WikipediaEngine(BaseEngine):
         snapshot_id = f"{language}{project}_namespace_{namespace}"
         endpoint = f"{self.WIKIMEDIA_BASE_URL}/snapshots/{snapshot_id}/download"
 
-        response = self.session.get(endpoint, stream=True)
+        # A stalled mirror must trip rather than hang the stream forever (audit
+        # D15). Same (connect, read) budget as the other large-download paths.
+        response = self.session.get(endpoint, stream=True, timeout=(30, 300))
         response.raise_for_status()
 
         with tarfile.open(fileobj=response.raw, mode="r|gz") as tar:

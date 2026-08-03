@@ -64,3 +64,18 @@ def test_limit_is_not_pointlessly_small():
 def test_ceiling_reflects_what_was_measured(size, fits):
     """Pin the boundary against the observation that produced it."""
     assert (size <= VVFAT_CEILING) is fits
+
+
+# --------------------------------------------------------------------------
+# N28: the two-letter slice suffix must fail loudly past 'zz', not corrupt
+# --------------------------------------------------------------------------
+def test_slice_suffix_overflow_raises_not_corrupts():
+    """676 suffixes exist (aa..zz); index 676 would overflow 'z' -> '{' (N28)."""
+    import pytest
+
+    from knowledge_base_builder.buckets.zim import ZimBucket
+
+    assert ZimBucket._slice_suffix(0) == "aa"
+    assert ZimBucket._slice_suffix(675) == "zz"
+    with pytest.raises(ValueError):
+        ZimBucket._slice_suffix(676)
