@@ -46,6 +46,10 @@ dependencies = [
     "requests>=2.28.0",
     "libzim>=3.0.0",
     "pypdf>=4.0.0",
+    # Post-Quantum Cryptography (FIPS 203/204/205)
+    "dilithium-py>=1.0.0",    # ML-DSA-65 (FIPS 204/205) signing
+    "cryptography>=41.0.0",   # AES-256-GCM, ECDSA-P256, key serialization
+    "argon2-cffi>=23.1.0",    # Argon2id KDF for passphrase-derived keys
 ]
 
 [project.optional-dependencies]

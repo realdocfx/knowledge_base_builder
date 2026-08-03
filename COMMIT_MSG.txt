@@ -1,1 +1,1 @@
-fix: pymupdf via pip [web] extra, not Alpine apk (py3-pymupdf does not exist)
+feat: PQC module (FIPS 203/204/205) - ML-DSA signing, hybrid auth, AES-256-GCM encryption
