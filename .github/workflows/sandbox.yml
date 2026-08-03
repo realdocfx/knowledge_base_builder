@@ -567,17 +567,22 @@ jobs:
           python3 -c "from knowledge_base_builder.cli import baremetal_init_script; import sys; sys.stdout.write(baremetal_init_script())" > init-baremetal
           sudo cp init-baremetal rootfs/tmp/init-baremetal
           sudo mkdir -p rootfs/etc/mkinitfs/features.d
+          # loop + FAT/NLS have no stock mkinitfs feature, so list them here. The
+          # ext4/overlayfs/squashfs FEATURES are reused from stock (same as the
+          # Mode C initramfs) because they pull ext4's crc32c dependency, which a
+          # bare kernel/fs/ext4 glob does NOT -- ext4 requests crc32c through the
+          # crypto API at mount time, so it is not in modules.dep. crc32c is also
+          # listed explicitly as belt-and-braces.
           printf '%s\n' \
             'kernel/drivers/block/loop.ko*' \
             'kernel/fs/fat/*.ko*' \
             'kernel/fs/nls/*.ko*' \
-            'kernel/fs/overlayfs/*.ko*' \
-            'kernel/fs/ext4/*.ko*' \
-            'kernel/fs/squashfs/*.ko*' \
+            'kernel/crypto/crc32c_generic.ko*' \
+            'kernel/lib/libcrc32c.ko*' \
             | sudo tee rootfs/etc/mkinitfs/features.d/kbbmedia.modules
           docker run --rm -v "$PWD/rootfs:/rootfs" alpine:3.20 \
             chroot /rootfs /sbin/mkinitfs -i /tmp/init-baremetal \
-              -F "base usb scsi kbbmedia" \
+              -F "base usb scsi ext4 overlayfs squashfs kbbmedia" \
               -o "/boot/initramfs-kbb-baremetal" "$KVER"
           sudo ls -lh rootfs/boot/initramfs-kbb-baremetal
 
