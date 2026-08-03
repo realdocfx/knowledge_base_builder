@@ -155,6 +155,12 @@ def _safe_content_path(root: Path, path: str) -> Optional[Path]:
     lexical = Path(os.path.normpath(str(base / path)))
     if not _within(lexical, base):  # blocks ../ regardless of symlinks
         return None
+    # Internal dirs must never be served, not merely hidden from the listing
+    # (audit P8): .kb_state holds sync_state.json, clone_manifest.json and the
+    # FTS index of every PDF/EPUB's extracted body text; .kb_env is the runtime;
+    # .ia_state holds Archive.org credentials. Reject any dot-prefixed component.
+    if any(part.startswith(".") for part in path.replace("\\", "/").split("/") if part):
+        return None
     real = lexical.resolve()
     if _within(real, base):
         return lexical

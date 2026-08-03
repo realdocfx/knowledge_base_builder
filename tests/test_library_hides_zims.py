@@ -182,3 +182,38 @@ def test_safe_path_follows_only_trusted_symlinks(tmp_path, monkeypatch):
     assert web._safe_content_path(bucket, "leak/secret.txt") is None, (
         "a symlink into an untrusted root must not be followed"
     )
+
+
+# --------------------------------------------------------------------------
+# P8: internal dirs must not be served (not merely hidden from the listing)
+# --------------------------------------------------------------------------
+def test_internal_dirs_are_not_served_directly(media_bucket):
+    """`.kb_state`/`.kb_env`/`.ia_state` hold sync state, the FTS body-text index
+    and Archive.org credentials; a direct GET must 404, not just be hidden from
+    the listing (audit P8)."""
+    (media_bucket / ".kb_state").mkdir(exist_ok=True)
+    (media_bucket / ".kb_state" / "sync_state.json").write_text("{}", encoding="utf-8")
+    (media_bucket / ".kb_state" / "clone_manifest.json").write_text("{}", encoding="utf-8")
+    (media_bucket / ".ia_state").mkdir(exist_ok=True)
+    (media_bucket / ".ia_state" / "creds").write_text("secret", encoding="utf-8")
+    client = TestClient(web.content_app)
+    for leak in (
+        "/files/.kb_state/sync_state.json",
+        "/files/.kb_state/clone_manifest.json",
+        "/files/.ia_state/creds",
+        "/files/.kb_state/",
+    ):
+        r = client.get(leak, follow_redirects=False)
+        # Denied (not served). 403 like the ../ traversal blocks; never 200.
+        assert r.status_code in (403, 404), f"{leak} leaked internal data ({r.status_code})"
+        assert r.status_code != 200
+
+
+def test_safe_content_path_rejects_dot_components(tmp_path):
+    (tmp_path / ".kb_state").mkdir()
+    (tmp_path / ".kb_state" / "x").write_text("s")
+    assert web._safe_content_path(tmp_path, ".kb_state/x") is None
+    assert web._safe_content_path(tmp_path, ".ia_state") is None
+    # Ordinary media still resolves.
+    (tmp_path / "book").mkdir()
+    assert web._safe_content_path(tmp_path, "book") is not None
