@@ -554,6 +554,33 @@ jobs:
             chroot /rootfs /sbin/modprobe -S "$KVER" --dry-run --show-depends overlay
           sudo ls -lh rootfs/boot/
 
+      - name: Generate the bare-metal initramfs (Mode A loop-mounts the guest image)
+        run: |
+          set -eux
+          KVER=$(ls rootfs/lib/modules | head -1)
+          # Mode A (bare-metal) reuses THIS image, not an Alpine diskless install:
+          # its initramfs loop-mounts kbb_guest.img off the FAT32 stick with a
+          # tmpfs overlay, so bare-metal and the QEMU sandbox run identical
+          # userspace. Emit the /init from the shipping code so it cannot drift,
+          # and give mkinitfs the USB/vfat/loop/overlay/ext4 modules it needs to
+          # assemble the root (a diskless-style virtio initramfs cannot do this).
+          python3 -c "from knowledge_base_builder.cli import baremetal_init_script; import sys; sys.stdout.write(baremetal_init_script())" > init-baremetal
+          sudo cp init-baremetal rootfs/tmp/init-baremetal
+          sudo mkdir -p rootfs/etc/mkinitfs/features.d
+          printf '%s\n' \
+            'kernel/drivers/block/loop.ko*' \
+            'kernel/fs/fat/*.ko*' \
+            'kernel/fs/nls/*.ko*' \
+            'kernel/fs/overlayfs/*.ko*' \
+            'kernel/fs/ext4/*.ko*' \
+            'kernel/fs/squashfs/*.ko*' \
+            | sudo tee rootfs/etc/mkinitfs/features.d/kbbmedia.modules
+          docker run --rm -v "$PWD/rootfs:/rootfs" alpine:3.20 \
+            chroot /rootfs /sbin/mkinitfs -i /tmp/init-baremetal \
+              -F "base usb scsi kbbmedia" \
+              -o "/boot/initramfs-kbb-baremetal" "$KVER"
+          sudo ls -lh rootfs/boot/initramfs-kbb-baremetal
+
       - name: Package the image
         run: |
           set -eux
@@ -564,8 +591,9 @@ jobs:
           sudo /sbin/e2fsck -fn kbb_guest.img || true
           sudo cp rootfs/boot/vmlinuz-lts vmlinuz-kbb
           sudo cp rootfs/boot/initramfs-kbb initramfs-kbb
-          sudo chown "$(id -u):$(id -g)" kbb_guest.img vmlinuz-kbb initramfs-kbb
-          ls -lh kbb_guest.img vmlinuz-kbb initramfs-kbb
+          sudo cp rootfs/boot/initramfs-kbb-baremetal initramfs-kbb-baremetal
+          sudo chown "$(id -u):$(id -g)" kbb_guest.img vmlinuz-kbb initramfs-kbb initramfs-kbb-baremetal
+          ls -lh kbb_guest.img vmlinuz-kbb initramfs-kbb initramfs-kbb-baremetal
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
@@ -574,6 +602,7 @@ jobs:
             kbb_guest.img
             vmlinuz-kbb
             initramfs-kbb
+            initramfs-kbb-baremetal
           retention-days: 7
           compression-level: 6
 
@@ -830,4 +859,115 @@ jobs:
         with:
           name: archive-boot-log
           path: archive.log
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # Mode A: bare-metal boot from the stick.
+  #
+  # A real machine cannot be handed a virtio block device the way QEMU is, and
+  # the FAT32 stick must stay Windows-readable, so bare-metal cannot mount an
+  # ext4 partition as root. Instead it reuses the SAME finished image the QEMU
+  # sandbox boots: the bare-metal initramfs loop-mounts kbb_guest.img off the
+  # FAT32 with a tmpfs overlay (amnesic), switch_roots into it, and the kiosk
+  # serves ZIMs + media from the same stick. This proves Mode A reaches the UI
+  # with content -- 1:1 with Mode C -- rather than trusting that it would.
+  #
+  # GRUB/UEFI is a thin loader for exactly this kernel+initramfs; direct-kernel
+  # boot exercises the load-bearing part (the initramfs assembly and the kiosk)
+  # without an OVMF dependency, the same way guest-boot does for Mode C.
+  # ---------------------------------------------------------------------------
+  baremetal-boot:
+    name: Mode A boots from the stick
+    runs-on: ubuntu-latest
+    needs: [guest-image]
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: kbb-guest-image
+
+      - name: Tooling
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-system-x86 dosfstools mtools fdisk
+
+      - name: Build a bootable FAT32 stick carrying the guest image + content
+        run: |
+          set -eux
+          # The stick holds the ext4 image as an ordinary file plus the content
+          # tree, exactly like the field. Size the FAT32 partition to fit the
+          # ~3 GB image with headroom.
+          IMG_MB=$(( ( $(stat -c%s kbb_guest.img) / 1048576 ) + 400 ))
+          echo "partition size: ${IMG_MB} MiB"
+          dd if=/dev/zero of=part.img bs=1M count="$IMG_MB" status=none
+          mkfs.vfat -F 32 -n KBBDATA part.img
+          # Content beside the image: a media folder + a prebuilt index, so the
+          # kiosk resolves the nested bucket and serves without re-indexing.
+          mkdir -p content/library/archive/.kb_state content/library/archive/Some_Book
+          echo 'BAREMETAL-CANARY' > content/library/archive/Some_Book/index.txt
+          echo 'prebuilt-index-stand-in' > content/library/archive/.kb_state/archive_index.db
+          mcopy -i part.img kbb_guest.img ::/kbb_guest.img
+          mcopy -i part.img -s content/library ::/
+          # Wrap the partition in an MBR so it presents as /dev/sda1 (a whole USB
+          # disk with a partition table), which is what a real stick looks like.
+          dd if=/dev/zero of=stick.img bs=1M count=$((IMG_MB + 2)) status=none
+          printf 'label: dos\n1 : start=2048, type=c\n' | sfdisk stick.img
+          dd if=part.img of=stick.img bs=512 seek=2048 conv=notrunc status=none
+          rm -f part.img
+          sfdisk -l stick.img
+
+      - name: Boot bare-metal (loop-mounted guest image, USB stick)
+        timeout-minutes: 15
+        run: |
+          set -eux
+          # No -drive for the root: the bare-metal initramfs finds the FAT32
+          # stick, loop-mounts kbb_guest.img and switch_roots. The stick is a USB
+          # mass-storage device -> /dev/sda, exactly like the field.
+          timeout 600 qemu-system-x86_64 \
+            -M q35 -m 3072 -smp 2 -no-reboot \
+            -kernel vmlinuz-kbb -initrd initramfs-kbb-baremetal \
+            -append "console=tty0 console=ttyS0 kbb_mode=baremetal" \
+            -device qemu-xhci,id=xhci \
+            -drive if=none,id=stick,file=stick.img,format=raw \
+            -device usb-storage,bus=xhci.0,drive=stick \
+            -device virtio-vga \
+            -device virtio-keyboard-pci -device virtio-tablet-pci \
+            -display none -serial stdio \
+            2>&1 | tee baremetal.log || true
+          echo "--- tail ---"; tail -50 baremetal.log
+
+      - name: Assert bare-metal reached the UI with content
+        run: |
+          set -eux
+          if grep -qiE "emergency|init not found|Kernel panic" baremetal.log; then
+            echo "::error::guest did not reach userspace"
+            grep -iE -B3 "emergency|init not found|Kernel panic" baremetal.log | tail -12
+            exit 1
+          fi
+          # The initramfs assembled the overlay root and handed off.
+          grep -qa "KBB-BAREMETAL-ROOT-READY" baremetal.log || {
+            echo "::error::the bare-metal initramfs did not assemble the guest image"
+            grep -a "KBB-BAREMETAL" baremetal.log || true
+            exit 1
+          }
+          # The kiosk served content from the stick that the initramfs carried in.
+          grep -qa "bucket: /media/kbb/library/archive" baremetal.log || {
+            echo "::error::bucket did not resolve to the stick's library/archive"
+            grep -a "bucket:\|bare-metal:" baremetal.log || true
+            exit 1
+          }
+          # The UI came up and the portal served -- 1:1 with Mode C.
+          grep -qa "KBB-HEAD-STARTED" baremetal.log || { echo "::error::cage did not start"; exit 1; }
+          grep -qa "KBB-UI-ALIVE" baremetal.log || { echo "::error::the Tauri UI did not stay running"; exit 1; }
+          grep -qa "KBB-PORTAL-OK" baremetal.log || {
+            echo "::error::the portal did not serve a page"
+            grep -a "KBB-" baremetal.log | tail -20
+            exit 1
+          }
+          echo "Mode A booted from the stick, mounted content, UI + portal serving"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        if: always()
+        with:
+          name: baremetal-boot-log
+          path: baremetal.log
           retention-days: 7
