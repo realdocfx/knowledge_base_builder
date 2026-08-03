@@ -1699,7 +1699,13 @@ done
 [ -n "$IMG" ] || fail "kbb_guest.img not found on any USB/vfat partition"
 
 # Loop-mount the image read-only (lowerdir); tmpfs upperdir keeps it amnesic.
-$BB losetup -r /dev/loop0 "$IMG" 2>/dev/null || fail "losetup failed"
+# devtmpfs creates loop devices on demand (only /dev/loop-control exists up
+# front), so the /dev/loop0 node must be created explicitly (loop major is 7)
+# before losetup can bind the image to it.
+[ -e /dev/loop-control ] && echo "KBB-BAREMETAL: loop driver present" \
+    || echo "KBB-BAREMETAL: loop driver ABSENT"
+[ -b /dev/loop0 ] || $BB mknod /dev/loop0 b 7 0
+$BB losetup -r /dev/loop0 "$IMG" 2>/dev/null || fail "losetup (loop bind) failed"
 $BB mount -t ext4 -o ro /dev/loop0 /lower || fail "guest image (ext4) mount failed"
 $BB mount -t tmpfs tmpfs /over || fail "tmpfs overlay store failed"
 $BB mkdir -p /over/up /over/work
