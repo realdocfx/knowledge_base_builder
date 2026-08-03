@@ -1626,6 +1626,106 @@ def _provision_rust_launcher(root: Path, target_os: str, local_bundle: Optional[
 # Tri-modal tactical deployment provisioning (Phases 0–2)
 # ==========================================================================
 
+# The file, on the FAT32 stick, that the bare-metal initramfs loop-mounts as the
+# root filesystem. It is the SAME image the QEMU sandbox (Mode C) boots, so the
+# two modes run byte-identical userspace -- 1:1 by construction.
+BAREMETAL_ROOT_IMAGE = "kbb_guest.img"
+BAREMETAL_INITRAMFS = "initramfs-kbb-baremetal"
+
+
+def baremetal_init_script() -> str:
+    r"""The initramfs ``/init`` for bare-metal boot (Mode A).
+
+    Mode A reuses Mode C's finished root image instead of an Alpine diskless
+    install, so the two modes are identical userspace. A real machine cannot be
+    handed a virtio block device the way QEMU is, and the FAT32 stick has to stay
+    Windows-readable, so the ext4 root lives as an ordinary file
+    (``kbb_guest.img``) on the stick. This init:
+
+      1. loads USB / vfat / loop / ext4 / overlay modules and waits for the stick,
+      2. loop-mounts the image read-only as the overlay lowerdir,
+      3. stacks a tmpfs upperdir on top -- so every write lands in RAM and the
+         appliance is amnesic, exactly like Mode C's ``snapshot=on``,
+      4. carries the stick to ``/media/kbb`` so the kiosk serves ZIMs + media
+         from it without a second scan,
+      5. ``switch_root`` into the assembled root.
+
+    Emits ``KBB-BAREMETAL-*`` markers so a boot log can be asserted on.
+    """
+    return r"""#!/bin/sh
+# KBB bare-metal init (Mode A): loop-mount the shared guest image with a tmpfs
+# overlay, then switch_root -- identical userspace to the QEMU sandbox.
+PATH=/sbin:/bin:/usr/sbin:/usr/bin
+BB=/bin/busybox
+$BB mkdir -p /proc /sys /dev /newroot /lower /over /stickboot
+$BB mount -t proc none /proc 2>/dev/null
+$BB mount -t sysfs none /sys 2>/dev/null
+$BB mount -t devtmpfs none /dev 2>/dev/null || $BB mdev -s
+
+fail() {
+    echo "KBB-BAREMETAL-FAIL: $1"
+    # Drop to a shell so the failure is inspectable rather than a silent hang.
+    exec $BB sh
+}
+
+# Storage + filesystem modules. Failures are fine: some are built into the
+# kernel, and the feature set only ships what this kernel needs.
+for m in usbcore usb-common ehci-hcd ehci-pci ohci-hcd ohci-pci uhci-hcd \
+         xhci-hcd xhci-pci usb-storage uas scsi_mod sd_mod \
+         nls_cp437 nls_iso8859-1 nls_utf8 vfat loop ext4 overlay squashfs; do
+    modprobe "$m" 2>/dev/null
+done
+
+# USB enumeration is asynchronous; poll for the FAT32 partition that carries the
+# guest image. Re-run mdev each pass so newly-probed nodes appear.
+IMG=""
+i=0
+while [ $i -lt 60 ]; do
+    $BB mdev -s 2>/dev/null
+    for d in /dev/sd*1 /dev/sd[a-z] /dev/vd*1 /dev/vd[a-z] /dev/mmcblk*p1; do
+        [ -b "$d" ] || continue
+        $BB mount -t vfat -o ro "$d" /stickboot 2>/dev/null || continue
+        if [ -f /stickboot/kbb_guest.img ]; then
+            IMG=/stickboot/kbb_guest.img
+            echo "KBB-BAREMETAL: guest image found on $d"
+            break
+        fi
+        $BB umount /stickboot 2>/dev/null
+    done
+    [ -n "$IMG" ] && break
+    i=$((i + 1))
+    $BB sleep 1
+done
+[ -n "$IMG" ] || fail "kbb_guest.img not found on any USB/vfat partition"
+
+# Loop-mount the image read-only (lowerdir); tmpfs upperdir keeps it amnesic.
+# devtmpfs creates loop devices on demand (only /dev/loop-control exists up
+# front), so the /dev/loop0 node must be created explicitly (loop major is 7)
+# before losetup can bind the image to it.
+[ -e /dev/loop-control ] && echo "KBB-BAREMETAL: loop driver present" \
+    || echo "KBB-BAREMETAL: loop driver ABSENT"
+[ -b /dev/loop0 ] || $BB mknod /dev/loop0 b 7 0
+$BB losetup -r /dev/loop0 "$IMG" 2>/dev/null || fail "losetup (loop bind) failed"
+$BB mount -t ext4 -o ro /dev/loop0 /lower || fail "guest image (ext4) mount failed"
+$BB mount -t tmpfs tmpfs /over || fail "tmpfs overlay store failed"
+$BB mkdir -p /over/up /over/work
+$BB mount -t overlay overlay \
+    -o lowerdir=/lower,upperdir=/over/up,workdir=/over/work /newroot \
+    || fail "overlay assembly failed"
+
+# Carry the stick into the new root at the kiosk's content path so it serves
+# ZIMs + media without re-scanning, and the loop's backing file stays mounted.
+$BB mkdir -p /newroot/media/kbb
+$BB mount --move /stickboot /newroot/media/kbb 2>/dev/null
+
+echo "KBB-BAREMETAL-ROOT-READY"
+$BB mount --move /dev /newroot/dev 2>/dev/null
+$BB mount --move /proc /newroot/proc 2>/dev/null
+$BB mount --move /sys /newroot/sys 2>/dev/null
+exec $BB switch_root /newroot /sbin/init
+"""
+
+
 def _provision_alpine_boot(root: Path, local_bundle: Optional[Path] = None,
                            allow_insecure: bool = False) -> Path:
     """Fetch Alpine LTS netboot artefacts into ``/boot/`` on the target drive.
@@ -1688,17 +1788,20 @@ def _provision_efi_bootloader(root: Path, local_bundle: Optional[Path] = None,
         console.print("[yellow]BOOTX64.EFI already present; skipping.[/yellow]")
 
     grub_cfg = efi_dir / "grub.cfg"
-    grub_content = """\
+    # Mode A reuses Mode C's finished root image: boot the same kernel and
+    # loop-mount kbb_guest.img via the bare-metal initramfs (see
+    # baremetal_init_script). No Alpine diskless install, no offline apk repo --
+    # the two modes run byte-identical userspace. Module loading and the root
+    # assembly live in the initramfs, so the cmdline only needs the mode flag.
+    grub_content = f"""\
 set default=0
 set timeout=3
 
-menuentry "KBB Tactical OSINT Appliance (Amnesic RAM)" {
-    search --no-floppy --set=root --file /boot/vmlinuz-lts
-    linux /boot/vmlinuz-lts \\
-        modules=loop,squashfs,sd-mod,usb-storage,vfat,fat \\
-        quiet console=tty1 kbb_mode=baremetal
-    initrd /boot/initramfs-lts
-}
+menuentry "KBB Tactical OSINT Appliance (Amnesic)" {{
+    search --no-floppy --set=root --file /vmlinuz-kbb
+    linux /vmlinuz-kbb quiet console=tty1 kbb_mode=baremetal
+    initrd /{BAREMETAL_INITRAMFS}
+}}
 """
     grub_cfg.write_text(grub_content, encoding="utf-8")
     console.print("[bold green]UEFI bootloader structure injected.[/bold green]")
@@ -1765,6 +1868,11 @@ def _provision_qemu_runtime(root: Path, platforms: Optional[List[str]] = None,
 
 
 GUEST_IMAGE_FILES = ("kbb_guest.img", "vmlinuz-kbb", "initramfs-kbb")
+# Shipped when present. The bare-metal initramfs (Mode A) rides in the same
+# artefact; it is optional so a Mode-C-only stick provisioned from an older
+# artefact still installs. Mode A's boot entry needs it, so provisioning warns
+# if --with-alpine is set and it is absent.
+GUEST_IMAGE_OPTIONAL = (BAREMETAL_INITRAMFS,)
 
 
 def _install_guest_image(root: Path, source: Optional[str] = None) -> None:
@@ -1796,7 +1904,9 @@ def _install_guest_image(root: Path, source: Optional[str] = None) -> None:
             f"files produced by the sandbox workflow: {list(GUEST_IMAGE_FILES)}"
         )
 
-    for name in GUEST_IMAGE_FILES:
+    for name in GUEST_IMAGE_FILES + tuple(
+        f for f in GUEST_IMAGE_OPTIONAL if (src / f).is_file()
+    ):
         target = root / name
         # Copy via a .part file and rename, so an interrupted copy never leaves a
         # truncated image that QEMU would boot into something incoherent.
@@ -1813,7 +1923,7 @@ def _install_guest_image(root: Path, source: Optional[str] = None) -> None:
 # guest sees stays small.
 SANDBOX_INFRA_NAMES = frozenset({
     ".kb_env", ".kb_state", ".ia_state", "qemu", "boot", "EFI", "docs",
-    "kbb_guest.img", "vmlinuz-kbb", "initramfs-kbb",
+    "kbb_guest.img", "vmlinuz-kbb", "initramfs-kbb", BAREMETAL_INITRAMFS,
     "start_sandbox.bat", "start_sandbox.sh", "kbb_drivegen.ps1",
     "kbb_mediagen.py", "Launch_KBB.exe",
     "System Volume Information", "$RECYCLE.BIN",
@@ -2720,22 +2830,28 @@ def _guest_init_files() -> Dict[str, str]:
         '        # the symlinks (it stays strict for any other escape).\n'
         '        export KBB_BUCKET_LINK_ROOTS="$KBB_ZIM_BUCKET:$KBB_MEDIA_MNT"\n'
         '    else\n'
-        '        # Bare-metal (Mode A) and legacy layouts: mount the real FAT32\n'
-        '        # partition, where the ZIMs are ordinary files and no FUSE is\n'
-        '        # needed. This path is unchanged.\n'
-        '        KBB_RO=/media/kbb-ro\n'
-        '        mkdir -p "$KBB_RO" "$KBB_DATA"\n'
-        '        if ! mountpoint -q "$KBB_RO"; then\n'
-        '            for dev in /dev/vdb1 /dev/vdb /dev/sdb1 /dev/sda1; do\n'
-        '                [ -b "$dev" ] || continue\n'
-        '                mount -o ro,noatime "$dev" "$KBB_RO" 2>/dev/null && break\n'
-        '            done\n'
-        '        fi\n'
-        '        if mountpoint -q "$KBB_RO"; then\n'
-        '            kbb_log "archive mounted read-only at $KBB_RO"\n'
-        '            mount --bind "$KBB_RO" "$KBB_DATA" 2>/dev/null\n'
+        '        # Bare-metal (Mode A) and legacy layouts: content is ordinary\n'
+        '        # files on the FAT32 stick -- no SCSI/FUSE/ISO. The bare-metal\n'
+        '        # initramfs already loop-mounted the guest image and moved the\n'
+        '        # stick to /media/kbb (== $KBB_DATA), so prefer it. Otherwise scan\n'
+        '        # for the FAT32 device (older sticks / other removable media).\n'
+        '        if mountpoint -q "$KBB_DATA" && [ -d "$KBB_DATA/library" ]; then\n'
+        '            kbb_log "bare-metal: content from $KBB_DATA (guest-image boot)"\n'
         '        else\n'
-        '            kbb_log "no archive attached; UI will start without content"\n'
+        '            KBB_RO=/media/kbb-ro\n'
+        '            mkdir -p "$KBB_RO" "$KBB_DATA"\n'
+        '            if ! mountpoint -q "$KBB_RO"; then\n'
+        '                for dev in /dev/vdb1 /dev/vdb /dev/sdb1 /dev/sda1; do\n'
+        '                    [ -b "$dev" ] || continue\n'
+        '                    mount -o ro,noatime "$dev" "$KBB_RO" 2>/dev/null && break\n'
+        '                done\n'
+        '            fi\n'
+        '            if mountpoint -q "$KBB_RO"; then\n'
+        '                kbb_log "archive mounted read-only at $KBB_RO"\n'
+        '                mount --bind "$KBB_RO" "$KBB_DATA" 2>/dev/null\n'
+        '            else\n'
+        '                kbb_log "no archive attached; UI will start without content"\n'
+        '            fi\n'
         '        fi\n'
         '        for cand in "$KBB_DATA/library/archive" "$KBB_DATA/library" "$KBB_DATA"; do\n'
         '            [ -d "$cand" ] && KBB_BUCKET="$cand" && break\n'
@@ -3226,18 +3342,28 @@ def portable(
         # ------------------------------------------------------------------
         # Tri-modal tactical deployment (Modes A & C)
         # ------------------------------------------------------------------
-        # Alpine boot artefacts are shared between Mode A (bare-metal) and
-        # Mode C (QEMU sandbox): provision them if either flag is set.
+        # Both bare-metal (Mode A) and the QEMU sandbox (Mode C) boot the SAME
+        # finished guest image, so they run byte-identical userspace. Mode C
+        # direct-kernel-boots it; Mode A loop-mounts it via the bare-metal
+        # initramfs (see baremetal_init_script). The old Alpine diskless path
+        # (vmlinuz-lts + apkovl + an offline apk repo) is gone: it depended on
+        # packages the stick could not reliably carry, and left Mode A unable to
+        # reach the UI.
         if with_alpine or with_qemu:
-            _provision_alpine_boot(root, bundle_path, allow_insecure_network)
-            _build_alpine_overlay(root)
+            _install_guest_image(root, guest_image_from)
 
         if with_alpine:
+            if not (root / BAREMETAL_INITRAMFS).is_file():
+                console.print(
+                    f"[yellow]WARNING: {BAREMETAL_INITRAMFS} is not present.[/yellow] "
+                    "Mode A boots the guest image via this initramfs; rebuild the "
+                    "'kbb-guest-image' artefact (it now ships it) and re-run with "
+                    "--guest-image-from."
+                )
             _provision_efi_bootloader(root, bundle_path, allow_insecure_network)
 
         if with_qemu:
             _provision_qemu_runtime(root, None, bundle_path, allow_insecure_network)
-            _install_guest_image(root, guest_image_from)
             _write_sandbox_launchers(root)
 
     except Exception as e:

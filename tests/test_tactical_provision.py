@@ -72,7 +72,12 @@ def test_provision_efi_bootloader_creates_structure(tmp_path):
 
 
 def test_grub_cfg_references_kernel(tmp_path):
-    """grub.cfg must reference the correct kernel path."""
+    """grub.cfg boots the shared guest image, not an Alpine diskless install.
+
+    Mode A reuses Mode C's kbb_guest.img (loop-mounted by the bare-metal
+    initramfs) instead of the old diskless kernel, which needed an offline apk
+    repo the stick could not reliably carry.
+    """
     # Provide a fake EFI binary so the function gets past the download
     efi_dir = tmp_path / "EFI" / "BOOT"
     efi_dir.mkdir(parents=True)
@@ -83,9 +88,12 @@ def test_grub_cfg_references_kernel(tmp_path):
     grub_cfg = efi_dir / "grub.cfg"
     assert grub_cfg.exists(), "grub.cfg was not created"
     text = grub_cfg.read_text(encoding="utf-8")
-    assert "linux /boot/vmlinuz-lts" in text, "grub.cfg does not reference the kernel"
-    assert "initrd /boot/initramfs-lts" in text, "grub.cfg does not reference the initramfs"
+    assert "linux /vmlinuz-kbb" in text, "grub.cfg does not boot the guest kernel"
+    assert f"initrd /{cli.BAREMETAL_INITRAMFS}" in text, (
+        "grub.cfg does not reference the bare-metal initramfs"
+    )
     assert "kbb_mode=baremetal" in text, "grub.cfg does not set kbb_mode"
+    assert "vmlinuz-lts" not in text, "grub.cfg still boots the diskless kernel"
 
 
 # --------------------------------------------------------------------------
