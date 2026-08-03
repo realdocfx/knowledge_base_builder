@@ -25,7 +25,7 @@ A hyper-ergonomic CLI tool for downloading and managing Internet Archive and Wik
 - **Hierarchical Offline Search**: full-content SQLite FTS5 index over the secured library, ranking name/metadata matches above body-text matches (no cloud, no AI vectors)
 - **Airgapped Portable Launcher (Windows)**: single-click `Launch_KBB.exe` with an embedded Python runtime and a **bundled WebView2** runtime, so the portal renders on any Windows host with no WebView2 and no internet
 - **Hash-Verified Provisioning**: every downloaded runtime asset (Python, kiwix-tools, get-pip, WebView2) is checked against a pinned SHA-256 before use
-- **Tri-Modal Tactical Deployment**: a single USB stick supports three execution modes — **bare-metal Alpine boot** (amnesic RAM, zero host trace), **host-native** (standard launch), and **QEMU sandbox** (hypervisor-isolated from host EDR/DLP) — sharing one kernel and one Python runtime (DRY/SSOT)
+- **Tri-Modal Tactical Deployment**: a single USB stick runs three ways — **Mode B host-native** (single-click launcher on the host OS), **Mode A bare-metal / live-USB** (boot the machine from the stick; loop-mounts the guest image with a RAM overlay for a zero-trace amnesic kiosk), and **Mode C QEMU sandbox** (hypervisor-isolated from host EDR/DLP). Modes A and C boot the **same x86-64 guest image** — byte-identical userspace (DRY/SSOT). See the [Field Manual](src/knowledge_base_builder/docs/MANUAL.md) for the host/mode compatibility matrix (Windows, Linux, macOS Intel + Apple Silicon)
 
 ## Installation
 
@@ -269,31 +269,33 @@ The *target* host needs no Rust, no internet, and no WebView2 — only the built
 
 ### 10. Tri-Modal Tactical Deployment (Modes A / B / C)
 
-A single KBB stick supports three execution modes. All three share the same
-Alpine kernel, the same `.kb_env/python` runtime, and the same data — one
-source of truth, three deployment contexts.
+A single KBB stick supports three execution modes. Modes A and C boot the same
+x86-64 guest image; Mode B runs the portal on the host with `.kb_env/python`.
+Full step-by-step and the host matrix (Windows, Linux, macOS Intel + Apple
+Silicon) are in the [Field Manual](src/knowledge_base_builder/docs/MANUAL.md).
 
-| Mode | Name | Host footprint | Isolation | Launch |
-|------|------|---------------|-----------|--------|
-| **A** | Bare-metal Alpine boot | Zero (RAM only) | Total physical | UEFI boot menu |
-| **B** | Host-native | Standard process | None | `Launch_KBB.exe` or `C2_Portal.bat` |
-| **C** | QEMU sandbox | Hypervisor process | VM-isolated from EDR/DLP | `start_sandbox.bat` |
+| Mode | Name | Host footprint | Isolation | Launch | Hosts |
+|------|------|---------------|-----------|--------|-------|
+| **A** | Bare-metal / live-USB | Zero (RAM overlay) | Total physical | UEFI boot menu | x86-64 UEFI machines (Intel Macs; **not** Apple Silicon) |
+| **B** | Host-native | Standard process | None | `Launch_KBB.exe` / `C2_Portal.{bat,sh}` | Win/Linux/macOS (Apple Silicon via Rosetta) |
+| **C** | QEMU sandbox | Hypervisor process | VM-isolated from EDR/DLP | `start_sandbox.{bat,sh}` | Win/Linux/macOS (x86-64 emulated) |
 
 #### Provision Mode A (bare-metal boot)
 
 ```bash
-kb-builder portable D:\ --with-alpine --allow-insecure-network
+# --guest-image-from is the unzipped "kbb-guest-image" CI artefact
+kb-builder portable D:\ --with-alpine --guest-image-from .\guest\ --allow-insecure-network
 ```
 
-Injects `/boot/` (Alpine kernel + initramfs + kiosk overlay), `/EFI/BOOT/`
-(GRUB2 bootloader + `grub.cfg`). The target host boots from USB via the UEFI
-boot menu — Alpine loads into RAM, mounts the stick read-only, and launches
-the KBB portal in a Cage/WebKitGTK kiosk. Zero trace on host storage.
+Installs `kbb_guest.img` + `initramfs-kbb-baremetal` and writes `/EFI/BOOT/`
+(GRUB2 + `grub.cfg`). Booting the machine from USB (UEFI menu) loop-mounts the
+guest image with a **tmpfs RAM overlay** and launches the KBB portal in a
+Cage/WebKitGTK kiosk — every write goes to RAM, so power-off leaves zero trace.
 
 #### Provision Mode C (QEMU sandbox)
 
 ```bash
-kb-builder portable D:\ --with-qemu --allow-insecure-network
+kb-builder portable D:\ --with-qemu --guest-image-from .\guest\ --allow-insecure-network
 ```
 
 Downloads portable QEMU binaries, generates `start_sandbox.bat` /
@@ -309,37 +311,37 @@ interaction is required.
 #### Provision both modes at once
 
 ```bash
-kb-builder portable D:\ --with-alpine --with-qemu --allow-insecure-network
+kb-builder portable D:\ --with-alpine --with-qemu --guest-image-from .\guest\ --allow-insecure-network
 ```
 
 All flags are additive and non-destructive — existing content is never
-touched. The Alpine kernel + initramfs are shared between Modes A and C (DRY).
+touched. Modes A and C share the same **guest image + kernel** (`kbb_guest.img`
++ `vmlinuz-kbb`); only the initramfs differs (`initramfs-kbb` for Mode C's
+virtio root, `initramfs-kbb-baremetal` for Mode A's loop-mount). One artefact,
+two boot paths (DRY). `--with-alpine`/`--with-qemu` require `--guest-image-from`
+(the unzipped `kbb-guest-image` CI artefact).
 
 #### Drive layout after full provisioning
 
 ```
 D:\
-├── Launch_KBB.exe              # Mode B: Rust/Tauri launcher
-├── C2_Portal.bat               # Mode B: batch launcher
-├── start_sandbox.bat           # Mode C: QEMU sandbox (Windows)
-├── start_sandbox.sh            # Mode C: QEMU sandbox (Linux/macOS)
+├── Launch_KBB.exe              # Mode B: Rust/Tauri launcher (Windows, --with-launcher)
+├── C2_Portal.bat / .sh         # Mode B: host-native launcher (no --with-launcher)
+├── start_sandbox.bat / .sh     # Mode C: QEMU sandbox (Windows / Linux+macOS)
 ├── kbb_drivegen.ps1            # Mode C: ZIM slice enumerator (called by .bat)
-├── kbb_guest.img               # Mode C: prebuilt Alpine guest filesystem
+├── kbb_mediagen.py             # Mode C: non-ZIM media ISO packer
+├── kbb_guest.img               # Mode A+C: prebuilt Alpine guest image (shared)
+├── vmlinuz-kbb                 # Mode A+C: guest kernel (shared)
+├── initramfs-kbb               # Mode C: virtio-root initramfs
+├── initramfs-kbb-baremetal     # Mode A: loop-mounts kbb_guest.img with a RAM overlay
 ├── EFI/BOOT/                   # Mode A: UEFI bootloader
 │   ├── BOOTX64.EFI
-│   └── grub.cfg
-├── boot/                       # Mode A+C: shared Alpine kernel
-│   ├── vmlinuz-lts
-│   ├── initramfs-lts
-│   ├── modloop-lts
-│   └── apkovl.tar.gz           # KBB kiosk overlay
-├── qemu/                       # Mode C: portable QEMU
-│   ├── win/                    # Windows binaries
-│   ├── lin/                    # Linux binaries
-│   └── mac/                    # macOS binaries
-├── .kb_env/                    # Shared runtime (Python, kiwix, WebView2)
+│   └── grub.cfg                # boots vmlinuz-kbb + initramfs-kbb-baremetal
+├── qemu/                       # Mode C: portable QEMU (always emulates x86-64)
+│   ├── win/  lin/  mac/        # per-host binaries
+├── .kb_env/                    # Mode B runtime (Python, kiwix, WebView2) — x86-64
 ├── .kb_state/                  # State (audit, index, sync)
-└── <content>/                  # ZIM slices, Archive.org items (UNTOUCHED)
+└── library/archive/            # ZIM slices + Archive.org media (UNTOUCHED)
 ```
 
 ### 11. Check Bucket Status
