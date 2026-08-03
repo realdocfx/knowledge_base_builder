@@ -55,7 +55,7 @@ isolated but runs under the host OS; Mode B runs as an ordinary host process.
 
 ### Is Knowledge-Base-Builder free to use?
 
-Yes, Knowledge-Base-Builder is open source software released under the MIT License. It's free to use, modify, and distribute.
+Yes. Knowledge-Base-Builder is dedicated to the public domain under the Creative Commons **CC0 1.0 Universal** (CC0-1.0) dedication — free to use, modify, and distribute with no restrictions. See the [LICENSE](LICENSE) file.
 
 ### Do I need an Internet Archive account?
 
