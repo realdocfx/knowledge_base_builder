@@ -131,3 +131,21 @@ def test_sbom_is_attached_to_releases():
     """An SBOM nobody can retrieve alongside the artefact is not evidence."""
     workflows = " ".join(w.read_text(encoding="utf-8") for w in _WORKFLOWS)
     assert "sbom.json" in workflows, "the SBOM is never published with a release"
+
+
+# --------------------------------------------------------------------------
+# P3: the guest image is a shipping artefact -- its own fetches must be verified.
+# The suite previously inspected only cli._install_portable_packages, so it could
+# not observe the guest-image build in sandbox.yml.
+# --------------------------------------------------------------------------
+def test_guest_image_verifies_its_kiwix_fetch():
+    yml = (Path(__file__).resolve().parents[1] / ".github" / "workflows" / "sandbox.yml").read_text(
+        encoding="utf-8"
+    )
+    assert "kiwix-tools_linux-x86_64-musl" in yml, "kiwix-tools fetch not found (test stale?)"
+    assert re.search(r"KIWIX_SHA256=[0-9a-f]{64}", yml), (
+        "the guest-image kiwix-tools fetch is not pinned to a SHA-256 (audit P3)"
+    )
+    assert "sha256sum -c" in yml, (
+        "the guest-image kiwix-tools download is not verified with `sha256sum -c` (audit P3)"
+    )

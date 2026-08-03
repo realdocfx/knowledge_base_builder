@@ -441,8 +441,13 @@ jobs:
           # with. The musl build is self-contained, so it just drops into the
           # image with no extra libraries.
           KVER=3.8.2
+          # Pinned SHA-256 (audit P3): the guest image is a shipping artefact, so
+          # every fetch into it is verified -- like .kb_env's downloads are -- not
+          # trusted on transport alone.
+          KIWIX_SHA256=6a09e5e054b606f03d1705cfca4ddab90cb2417c9effeb8382acb6066843e1fa
           curl -fsSL -o kiwix-tools.tar.gz \
             "https://download.kiwix.org/release/kiwix-tools/kiwix-tools_linux-x86_64-musl-${KVER}.tar.gz"
+          echo "${KIWIX_SHA256}  kiwix-tools.tar.gz" | sha256sum -c -
           mkdir -p kiwix-extract
           tar -xzf kiwix-tools.tar.gz -C kiwix-extract --strip-components=1
           test -f kiwix-extract/kiwix-serve
