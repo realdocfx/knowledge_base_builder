@@ -26,20 +26,38 @@ from . import audit
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
 
 # Top-level entries that make up the bootable runtime (no downloaded content).
+#
+# The Modes A & C entries must stay in lockstep with cli.SANDBOX_INFRA_NAMES:
+# the guest-image rework moved kbb_guest.img, vmlinuz-kbb and the two initramfs
+# to the drive root and added kbb_drivegen.ps1 / kbb_mediagen.py, but they were
+# never added here, so a "virgin" (runtime) clone reported success yet produced
+# a drive that could not boot Mode A or Mode C (audit P2).
+# test_clone_integrity.test_runtime_items_cover_sandbox_infra binds the two.
 _RUNTIME_ITEMS = (
     ".kb_env",
+    # Mode B host-native launchers.
     "Launch_KBB.exe",
     "C2_Portal.bat",
     "C2_Portal.sh",
     "Start-KBB.sh",
     "Install-PortableRust.bat",
     "Portable-Rust-Shell.bat",
-    # Tri-modal tactical deployment infrastructure (Modes A & C).
+    # Modes A & C: the shared guest image + kernel + both initramfs (all at the
+    # drive root), the UEFI/GRUB bootloader, the QEMU runtime and its launchers,
+    # and the ZIM/media generators the sandbox .bat invokes.
+    "kbb_guest.img",
+    "vmlinuz-kbb",
+    "initramfs-kbb",
+    "initramfs-kbb-baremetal",
     "EFI",
-    "boot",
     "qemu",
     "start_sandbox.bat",
     "start_sandbox.sh",
+    "kbb_drivegen.ps1",
+    "kbb_mediagen.py",
+    # Legacy: the bare-metal apkovl still lives under boot/ for the /sandbox
+    # endpoint; harmless to carry when present.
+    "boot",
 )
 # Never copied (live-locked on the source and regenerated on the target).
 # Never copied: SQLite's WAL sidecars are live-locked by the running portal and
