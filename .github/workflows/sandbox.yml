@@ -703,6 +703,124 @@ jobs:
           retention-days: 7
 
   # ---------------------------------------------------------------------------
+  # Mode C in the configuration that SHIPS (audit P11).
+  #
+  # guest-boot proves the UI starts, but with `if=virtio` and no snapshot, no
+  # SCSI drives, no manifest and no media ISO -- so nothing anywhere booted the
+  # guest with ZIM slices attached and asserted KBB-ZIM-MOUNTED, the load-bearing
+  # marker of Mode C. This boots exactly what start_sandbox.bat/.sh emit: a
+  # real ZIM split into slices, delivered as file-backed disks on a
+  # virtio-scsi-pci controller with the V2 manifest at target 0, a media ISO on
+  # /dev/vdb, snapshot=on (the amnesic property), both consoles (serial last) and
+  # kbb_port -- then asserts the guest maps the slices via kbb-blkfuse, mounts
+  # the media, and the portal serves.
+  # ---------------------------------------------------------------------------
+  guest-boot-mode-c:
+    name: Mode C boots the shipping drive config
+    runs-on: ubuntu-latest
+    needs: [guest-image]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: kbb-guest-image
+
+      - name: Tooling
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-system-x86 xorriso
+          pip install libzim
+
+      - name: Build the shipping drives (ZIM slices + V2 manifest + media ISO)
+        run: |
+          set -eux
+          # A real multi-entry ZIM, split byte-exactly into two slices, exactly
+          # as the launcher delivers a split archive.
+          python3 guest/ci/make_test_zim.py test.zim
+          SZ=$(stat -c%s test.zim); HALF=$(( (SZ / 2 / 512) * 512 ))
+          dd if=test.zim of=test.zimaa bs=4M iflag=count_bytes count=$HALF status=none
+          dd if=test.zim of=test.zimab bs=4M iflag=skip_bytes  skip=$HALF  status=none
+          SZAA=$(stat -c%s test.zimaa); SZAB=$(stat -c%s test.zimab)
+          # V2 manifest at SCSI target 0: "<target> <name> <true_size>", the TRUE
+          # size (kbb-blkfuse hides QEMU's 512-byte padding). Padded to 8 KiB.
+          printf 'KBB_MANIFEST_V2\n1 test.zimaa %s\n2 test.zimab %s\n' "$SZAA" "$SZAB" > kbb_manifest.bin
+          truncate -s 8192 kbb_manifest.bin
+          # Non-ZIM media, packed into a read-only ISO the guest mounts at /dev/vdb.
+          mkdir -p media/Some_Book
+          echo 'MODE-C-MEDIA-CANARY' > media/Some_Book/index.txt
+          xorriso -as mkisofs -R -o kbb_media.iso media/
+          ls -l test.zimaa test.zimab kbb_manifest.bin kbb_media.iso
+
+      - name: Boot Mode C exactly as the launcher does
+        timeout-minutes: 15
+        run: |
+          set -eux
+          # Byte-for-byte the start_sandbox drive/console/port config: rootfs on
+          # virtio with snapshot=on, the media ISO as the next virtio disk
+          # (/dev/vdb), the ZIM slices + manifest on one virtio-scsi-pci
+          # controller (targets 1/2 = slices, target 0 = manifest), both consoles
+          # with serial last, and kbb_port. Only -display differs (none, headless
+          # runner) -- which does not touch the drive path this job exists to test.
+          timeout 600 qemu-system-x86_64 \
+            -M q35 -m 3072 -smp 2 -no-reboot \
+            -kernel vmlinuz-kbb -initrd initramfs-kbb \
+            -append "root=/dev/vda rootfstype=ext4 rw console=tty0 console=ttyS0 kbb_mode=qemu kbb_port=8080" \
+            -drive file=kbb_guest.img,format=raw,if=virtio,snapshot=on \
+            -drive file=kbb_media.iso,format=raw,if=virtio,readonly=on \
+            -device virtio-scsi-pci,id=scsi0 \
+            -drive file=test.zimaa,format=raw,if=none,id=zim1,readonly=on \
+            -device scsi-hd,drive=zim1,bus=scsi0.0,scsi-id=1,lun=0 \
+            -drive file=test.zimab,format=raw,if=none,id=zim2,readonly=on \
+            -device scsi-hd,drive=zim2,bus=scsi0.0,scsi-id=2,lun=0 \
+            -drive file=kbb_manifest.bin,format=raw,if=none,id=manifest,readonly=on \
+            -device scsi-hd,drive=manifest,bus=scsi0.0,scsi-id=0,lun=0 \
+            -device virtio-vga \
+            -device virtio-keyboard-pci -device virtio-tablet-pci \
+            -display none -serial stdio \
+            2>&1 | tee mode_c.log || true
+          echo "--- tail ---"; tail -60 mode_c.log
+
+      - name: Assert the ZIM slices mounted and the portal served
+        run: |
+          set -eux
+          if grep -qiE "emergency|init not found|Kernel panic" mode_c.log; then
+            echo "::error::guest did not reach userspace"; exit 1
+          fi
+          # The load-bearing marker: kbb-blkfuse mapped the SCSI slices to true-
+          # sized files and mounted them. This is what nothing tested before.
+          grep -qa "KBB-ZIM-MOUNTED" mode_c.log || {
+            echo "::error::ZIM slices were never mounted (KBB-ZIM-MOUNTED absent)"
+            grep -a "KBB\]" mode_c.log | tail -30 || true
+            exit 1
+          }
+          # The non-ZIM media ISO mounted too.
+          grep -qa "media ISO mounted" mode_c.log || {
+            echo "::error::media ISO (/dev/vdb) did not mount"
+            grep -a "media" mode_c.log || true
+            exit 1
+          }
+          # Amnesic property is actually exercised (snapshot=on): state on tmpfs.
+          grep -qa "portal state: /tmp" mode_c.log || echo "::warning::state redirect not echoed"
+          # ...and the portal served a page with the archive attached.
+          grep -qa "KBB-PORTAL-OK" mode_c.log || {
+            echo "::error::portal did not serve with the ZIM+media attached"
+            grep -a "KBB-" mode_c.log | tail -20 || true
+            exit 1
+          }
+          grep -qa "KBB-UI-ALIVE" mode_c.log || { echo "::error::UI did not stay alive"; exit 1; }
+          echo "Mode C shipping config: ZIM slices mounted, media mounted, portal serving"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        if: always()
+        with:
+          name: mode-c-boot-log
+          path: mode_c.log
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
   # The archive actually reaching the guest.
   #
   # Every other job proves the UI starts. None of them proves the operator can
