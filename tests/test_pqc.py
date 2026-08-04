@@ -7,9 +7,6 @@ primitive is proven correct in isolation.
 
 from __future__ import annotations
 
-import time
-from pathlib import Path
-
 import pytest
 
 from knowledge_base_builder import pqc

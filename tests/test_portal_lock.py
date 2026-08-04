@@ -10,9 +10,6 @@ Strict TDD: these tests are written BEFORE the implementation.
 
 from __future__ import annotations
 
-import os
-from pathlib import Path
-
 import pytest
 
 from knowledge_base_builder import pqc
