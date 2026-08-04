@@ -821,6 +821,172 @@ def encrypt_at_rest(
         raise typer.Exit(1)
 
 
+_TERMUX_SETUP_SH = r'''#!/data/data/com.termux/files/usr/bin/bash
+# KBB for Android (ARM64) -- Termux setup. Run this INSIDE Termux (from F-Droid).
+#
+# The stick's runtime is x86-64 and cannot execute on the phone. This installs a
+# small glibc Debian (aarch64) userland via proot-distro, then the KBB Python
+# package + kiwix-tools inside it. KBB is pure Python and cross-platform, so once
+# the ARM64 wheels for its native deps (cryptography/argon2/pymupdf/libzim) are
+# installed, the same portal runs. proot shares the network namespace, so a port
+# bound at 127.0.0.1 inside Debian is reachable from the phone browser.
+set -euo pipefail
+HERE="$(cd "$(dirname "$0")" && pwd)"
+
+echo "[KBB] Updating Termux + installing proot-distro..."
+pkg update -y && pkg install -y proot-distro
+
+echo "[KBB] Installing the Debian (aarch64) userland (first run only)..."
+proot-distro install debian 2>/dev/null || true
+
+DISTRO="$PREFIX/var/lib/proot-distro/installed-rootfs/debian"
+mkdir -p "$DISTRO/root/kbb"
+cp "$HERE"/*.whl "$DISTRO/root/kbb/" 2>/dev/null || true
+
+echo "[KBB] Provisioning KBB inside Debian (Python venv, kiwix-tools)..."
+proot-distro login debian -- bash -eu <<'INNER'
+export DEBIAN_FRONTEND=noninteractive
+apt-get update
+apt-get install -y python3 python3-venv python3-pip kiwix-tools curl
+python3 -m venv /opt/kbbenv
+/opt/kbbenv/bin/pip install --upgrade pip
+WHEEL="$(ls /root/kbb/*.whl 2>/dev/null | head -1 || true)"
+if [ -n "$WHEEL" ]; then
+  /opt/kbbenv/bin/pip install "${WHEEL}[web]"
+else
+  /opt/kbbenv/bin/pip install "knowledge-base-builder[web]"
+fi
+echo "[KBB] KBB installed in /opt/kbbenv."
+INNER
+
+echo "[KBB] Setup complete. Start the portal with:  bash kbb-start.sh <content-dir>"
+'''
+
+_KBB_START_SH = r'''#!/data/data/com.termux/files/usr/bin/bash
+# Start the KBB portal on the phone. Pass the content directory (holding the ZIMs,
+# the encrypted media, and .kb_state/ with the crypto tokens). Default: ~/kbb-content.
+set -euo pipefail
+CONTENT="${1:-$HOME/kbb-content}"
+
+# kiwix-serve reads a single .zim; the library ships split slices (.zimaa...), so
+# reassemble any that are not yet joined. NOTE: this transiently needs ~2x the ZIM
+# size free -- fine for fr_top_maxi (~6 GB), not for fr_all_maxi (~60 GB) on a
+# 128 GB phone. Join large ZIMs on a PC with space, or stream-join during transfer.
+shopt -s nullglob
+for first in "$CONTENT"/*.zimaa; do
+  base="${first%.zimaa}"
+  if [ ! -f "$base.zim" ]; then
+    echo "[KBB] Reassembling $(basename "$base").zim from slices..."
+    cat "$base".zim[a-z][a-z] > "$base.zim"
+  fi
+done
+
+echo "[KBB] Starting portal at http://localhost:8080  (open it in your phone browser)"
+proot-distro login debian --bind "$CONTENT:/root/kbb-content" -- \
+  /opt/kbbenv/bin/kb-builder portal /root/kbb-content --no-browser --host 127.0.0.1 --port 8080
+'''
+
+
+@app.command("android-bundle")
+def android_bundle(
+    dest: str = typer.Argument(..., help="Folder to write the Android transfer bundle into"),
+    from_bucket: str = typer.Option(..., "--from",
+                                    help="Source stick/bucket, for the crypto tokens + content manifest"),
+):
+    """Assemble the Android (Termux) deployment bundle.
+
+    Writes the setup scripts, this build's KBB wheel (best-effort), and the crypto
+    tokens (``.kbb_crypto_salt`` + ``.kbb_crypto_verify``) that let the SAME
+    passphrase decrypt the media on the phone -- plus a manifest of the ZIM/media
+    content to copy. The big content is NOT duplicated here; only the small runtime
+    bits are staged. The per-device signing key is deliberately not copied.
+    """
+    import re
+    import sys
+
+    from .state_paths import resolve_state_dir
+
+    src = Path(from_bucket).resolve()
+    lib = src / LIBRARY_DIR / ARCHIVE_SUBDIR
+    if not lib.is_dir():
+        lib = src / LIBRARY_DIR
+    if lib.is_dir():
+        src = lib
+    out = Path(dest).resolve()
+    out.mkdir(parents=True, exist_ok=True)
+    console.print(f"[cyan]Source bucket:[/cyan] {src}\n[cyan]Bundle:[/cyan] {out}")
+
+    (out / "termux-setup.sh").write_text(_TERMUX_SETUP_SH, encoding="utf-8", newline="\n")
+    (out / "kbb-start.sh").write_text(_KBB_START_SH, encoding="utf-8", newline="\n")
+
+    # Crypto tokens: the salt + verification token so the phone derives the SAME key
+    # from the SAME passphrase and can decrypt the copied media. (These do not reveal
+    # the passphrase; the signing key is NOT copied -- each device its own identity.)
+    from . import pqc
+    state = resolve_state_dir(src)
+    tokens_out = out / "kb_state"
+    tokens_out.mkdir(exist_ok=True)
+    copied_tokens = []
+    for name in (pqc.CRYPTO_SALT_FILE, pqc.CRYPTO_VERIFY_FILE):
+        srcf = state / name
+        if srcf.is_file():
+            shutil.copy2(str(srcf), str(tokens_out / name))
+            copied_tokens.append(name)
+
+    # Content manifest: group ZIM slices by base, sum media -- so the operator knows
+    # exactly what to copy and how big it is, without us moving a byte of it.
+    from . import at_rest
+    zim_groups: Dict[str, int] = {}
+    media_bytes = 0
+    media_count = 0
+    for f in src.rglob("*"):
+        if not f.is_file():
+            continue
+        low = f.name.lower()
+        if low.endswith(".zim") or re.search(r"\.zim[a-z]{2}$", low):
+            base = re.sub(r"\.zim([a-z]{2})?$", "", f.name)
+            zim_groups[base] = zim_groups.get(base, 0) + f.stat().st_size
+        elif at_rest.should_protect(src, f):
+            media_bytes += f.stat().st_size
+            media_count += 1
+
+    lines = ["# KBB Android content manifest", "",
+             "Copy these from the stick to the phone's content dir. ZIMs are split;",
+             "kbb-start.sh reassembles them (needs ~2x the ZIM size free transiently).",
+             "", "## ZIM archives (pick what fits the phone):"]
+    for base, size in sorted(zim_groups.items()):
+        lines.append(f"  {size / 1e9:6.1f} GB  {base}.zim")
+    lines += ["", f"## Encrypted media: {media_count} files, {media_bytes / 1e9:.1f} GB total",
+              "  (copy the item folders under this bucket; they stay encrypted and",
+              "   decrypt on the phone with the same passphrase)", "",
+              f"## Crypto tokens (already staged in ./kb_state): {', '.join(copied_tokens) or 'NONE FOUND'}",
+              "  place them in <content-dir>/.kb_state/ on the phone."]
+    (out / "MANIFEST.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    # Best-effort: build this project's wheel into the bundle so the phone installs
+    # exactly this code. Falls back to PyPI in the setup script if absent.
+    repo_root = Path(__file__).resolve().parents[2]
+    if (repo_root / "pyproject.toml").is_file():
+        try:
+            subprocess.run([sys.executable, "-m", "pip", "wheel", "--no-deps",
+                            "-w", str(out), str(repo_root)],
+                           check=True, capture_output=True, text=True)
+            console.print("[green]Built KBB wheel into the bundle.[/green]")
+        except Exception as exc:  # noqa: BLE001
+            console.print(f"[yellow]Wheel build skipped ({exc}); the setup script "
+                          "will pip-install knowledge-base-builder from PyPI.[/yellow]")
+
+    console.print(Panel(
+        f"Bundle ready: {out}\n\n"
+        f"Tokens staged: {', '.join(copied_tokens) or 'none'}\n"
+        f"ZIM groups: {len(zim_groups)}   Media: {media_count} files "
+        f"({media_bytes / 1e9:.1f} GB)\n\n"
+        "Next: copy this bundle + the chosen content (see MANIFEST.txt) to the phone,\n"
+        "install Termux (F-Droid), then run:  bash termux-setup.sh",
+        title="Android bundle", border_style="cyan",
+    ))
+
+
 @app.command()
 def portal(
     path: str = typer.Argument(..., help="Path to the bucket/drive to expose"),
