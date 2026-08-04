@@ -1,0 +1,46 @@
+name: Android APK
+
+# Builds the WebView-shell APK (a dedicated, chromeless window over the local KBB
+# portal -- the Android analog of the Tauri launcher). Pure Kotlin, no native code,
+# so no NDK / cross-compilation. Download the artifact from a run and `adb install`.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'android/**'
+      - '.github/workflows/android-apk.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build debug APK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      # ubuntu-latest ships JDK 17, the Android SDK (platform-34 + build-tools) and
+      # Gradle, so no extra setup actions are needed (hence no new action pins). The
+      # global gradle is used only to generate a VERSION-PINNED wrapper, then the
+      # build runs through that wrapper, so the AGP<->Gradle contract does not drift
+      # as the runner image updates.
+      - name: Build KBB Portal APK
+        working-directory: android
+        run: |
+          set -euo pipefail
+          export JAVA_HOME="$JAVA_HOME_17_X64"
+          echo "sdk.dir=$ANDROID_SDK_ROOT" > local.properties
+          gradle wrapper --gradle-version 8.9 --no-daemon
+          ./gradlew --no-daemon --stacktrace assembleDebug
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: kbb-portal-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error

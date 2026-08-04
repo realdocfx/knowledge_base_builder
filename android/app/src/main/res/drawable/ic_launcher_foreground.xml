@@ -1,0 +1,16 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- A stylised open book / archive glyph, centred in the adaptive-icon safe zone. -->
+    <path
+        android:fillColor="#4ADE80"
+        android:pathData="M30,40 L52,44 L52,74 L30,70 Z" />
+    <path
+        android:fillColor="#4ADE80"
+        android:pathData="M78,40 L56,44 L56,74 L78,70 Z" />
+    <path
+        android:fillColor="#173A26"
+        android:pathData="M54,44 L54,74 L52,74 L52,44 Z" />
+</vector>

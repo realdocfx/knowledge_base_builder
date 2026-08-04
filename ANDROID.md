@@ -66,6 +66,33 @@ Open **Chrome/Firefox on the phone** and go to `http://localhost:8080`. You'll g
 **lock screen** — enter the **same passphrase** as the stick. The encrypted media then
 decrypts on the fly, and the French Wikipedia ZIM serves through kiwix.
 
+## A dedicated app window (like Tauri), not a browser tab
+
+Two ways, both give a chromeless window instead of a browser tab:
+
+**A. Install the portal as a PWA (no build).** The portal ships a web-app manifest +
+service worker, so with it open in Chrome, tap **⋮ → Add to Home screen / Install
+app**. The home-screen icon then launches it **standalone** (no address bar), which is
+the mobile equivalent of the Tauri window. This works today, over the Termux backend.
+
+**B. The WebView-shell APK (`android/`).** A tiny Kotlin app whose only job is to host
+`127.0.0.1:8080` in a full-screen WebView — the Android analog of Tauri (native window
++ WebView + the Python "sidecar" running in Termux). It has **no native code**, so it
+builds without the NDK. This machine has no Android toolchain, so it is built in CI:
+
+- The **Android APK** GitHub Actions workflow builds `app-debug.apk` on every change to
+  `android/**` (and on manual dispatch). Download the `kbb-portal-apk` artifact from the
+  run and install it:
+
+  ```bash
+  adb install -r app-debug.apk
+  ```
+
+Start the portal in Termux first (`bash kbb-start.sh …`), then open **KBB Portal** — it
+waits for the backend, then shows the portal full-screen. (On-device behaviour is not
+verifiable from the build host; the WebView shell is deliberately minimal so it is easy
+to adjust.)
+
 ## Notes
 
 - **Same passphrase** works only because the salt+verify tokens were copied; without

@@ -485,7 +485,63 @@ def _portal_is_locked() -> bool:
 
 _LOCK_EXEMPT_PATHS = frozenset({
     "/lock", "/api/unlock", "/api/setup-passphrase", "/portal.css",
+    # PWA assets: must serve as themselves (not the lock HTML) so the portal can be
+    # installed as a standalone home-screen app even before it is unlocked.
+    "/manifest.webmanifest", "/sw.js", "/pwa-icon.svg",
 })
+
+
+_PWA_ICON_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">'
+    '<rect width="512" height="512" rx="104" fill="#0b0f0c"/>'
+    '<rect x="40" y="40" width="432" height="432" rx="72" fill="none" '
+    'stroke="#173a26" stroke-width="10"/>'
+    '<text x="50%" y="55%" font-family="monospace" font-size="188" '
+    'font-weight="bold" fill="#4ade80" text-anchor="middle" '
+    'dominant-baseline="middle">KBB</text></svg>'
+)
+
+_PWA_MANIFEST = {
+    "name": "KBB Knowledge Portal",
+    "short_name": "KBB",
+    "description": "Offline knowledge portal — Wikipedia (ZIM) + archive.org media.",
+    "start_url": "/",
+    "scope": "/",
+    "display": "standalone",
+    "orientation": "any",
+    "background_color": "#0b0f0c",
+    "theme_color": "#0b0f0c",
+    "icons": [
+        {"src": "/pwa-icon.svg", "sizes": "any", "type": "image/svg+xml",
+         "purpose": "any maskable"},
+    ],
+}
+
+# Minimal service worker: a fetch handler makes the portal installable; it stays a
+# network passthrough (no caching -- the content is already local and large).
+_PWA_SERVICE_WORKER = (
+    "self.addEventListener('install', function(e){ self.skipWaiting(); });\n"
+    "self.addEventListener('activate', function(e){ "
+    "e.waitUntil(self.clients.claim()); });\n"
+    "self.addEventListener('fetch', function(e){ /* network passthrough */ });\n"
+)
+
+
+@app.get("/manifest.webmanifest")
+async def pwa_manifest() -> Response:
+    return Response(json.dumps(_PWA_MANIFEST), media_type="application/manifest+json")
+
+
+@app.get("/sw.js")
+async def pwa_service_worker() -> Response:
+    return Response(_PWA_SERVICE_WORKER, media_type="application/javascript",
+                    headers={"Cache-Control": "no-cache"})
+
+
+@app.get("/pwa-icon.svg")
+async def pwa_icon() -> Response:
+    return Response(_PWA_ICON_SVG, media_type="image/svg+xml",
+                    headers={"Cache-Control": "public, max-age=86400"})
 
 
 @app.middleware("http")
@@ -1970,8 +2026,24 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="en" data-view-mode="standard">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>KBB // Tactical C2 Knowledge Portal</title>
+<!-- PWA: installs to the home screen and opens in a dedicated, chromeless window
+     (display:standalone), the mobile equivalent of the Tauri desktop shell. -->
+<meta name="theme-color" content="#0b0f0c">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="KBB">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/pwa-icon.svg">
+<script>
+  if ('serviceWorker' in navigator) {
+    window.addEventListener('load', function () {
+      navigator.serviceWorker.register('/sw.js').catch(function () {});
+    });
+  }
+</script>
 <script>
   /* Pre-paint: apply the saved optics BEFORE first paint so Stealth Night never
      flashes a bright frame (critical for night light-discipline). */

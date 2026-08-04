@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">KBB Portal</string>
+    <string name="starting">Starting KBB portal…\n\nIf this waits, start the backend in Termux:\n  bash kbb-start.sh</string>
+    <string name="not_reachable">KBB portal not reachable on 127.0.0.1:8080.\n\nStart it in Termux (bash kbb-start.sh), then reopen this app.</string>
+</resources>

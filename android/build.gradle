@@ -1,0 +1,7 @@
+// Root Gradle build. The Android launcher is a thin WebView shell (no native code):
+// it hosts the KBB portal (served by Python in Termux, see ../ANDROID.md) in a
+// dedicated, chromeless window -- the Android analog of the Tauri desktop launcher.
+plugins {
+    id 'com.android.application' version '8.6.1' apply false
+    id 'org.jetbrains.kotlin.android' version '1.9.25' apply false
+}
