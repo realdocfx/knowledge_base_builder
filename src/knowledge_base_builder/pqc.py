@@ -366,22 +366,32 @@ def unlock_stick(root: Path, passphrase: str) -> Optional[bytes]:
 def change_passphrase(
     root: Path, current_passphrase: str, new_passphrase: str
 ) -> bytes:
-    """Change the stick passphrase. Verifies current, generates new salt+key.
+    """Change the stick passphrase. Verifies the current one, then rekeys.
 
-    Returns the new derived key. Raises ValueError if current passphrase is wrong.
+    Returns the new derived key. Raises ValueError if no passphrase is configured
+    or the current passphrase is wrong.
+
+    Rekeying rewrites BOTH the salt and the verification token. The token proves a
+    passphrase is correct by decrypting to a known plaintext, so it MUST be
+    re-encrypted under the new key -- otherwise a later unlock derives the new key
+    from the new passphrase and new salt, tries to decrypt a token still sealed
+    under the OLD key, fails every time, and the stick is locked out for good.
     """
     state_dir = resolve_state_dir(root)
     salt_path = state_dir / CRYPTO_SALT_FILE
+    verify_path = state_dir / CRYPTO_VERIFY_FILE
 
     if not salt_path.exists():
         raise ValueError("No passphrase configured on this stick")
+    if not verify_passphrase(root, current_passphrase):
+        raise ValueError("Current passphrase is incorrect")
 
-    # Generate new salt and derive new key
+    # New salt + key, and a fresh verification token sealed under the new key so a
+    # later unlock (new passphrase + new salt) decrypts it successfully.
     new_salt = generate_salt()
     new_key = derive_key_from_passphrase(new_passphrase, new_salt)
-
-    # Atomically replace the salt file
     salt_path.write_bytes(new_salt)
+    verify_path.write_bytes(encrypt_bytes(new_key, _VERIFY_PLAINTEXT))
 
     return new_key
 

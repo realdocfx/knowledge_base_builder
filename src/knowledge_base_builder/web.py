@@ -472,6 +472,12 @@ def _portal_is_locked() -> bool:
         return False
     if _CONTENT_KEY is not None:
         return False
+    # Fail open, not dead: if this host cannot perform encryption at rest (the
+    # cryptography/argon2 backends are absent) there is no key to protect and no
+    # way to unlock, so locking here would brick the portal with no recovery path.
+    from . import pqc
+    if not pqc.get_pqc_status().get("encryption_at_rest", False):
+        return False
     # No salt = first use OR salt exists but key not derived = locked
     return True
 
@@ -491,43 +497,80 @@ async def enforce_lock_screen(request: Request, call_next):
             return await call_next(request)
         if request.url.path.startswith("/api/"):
             return JSONResponse({"detail": "portal locked"}, status_code=401)
-        from starlette.responses import RedirectResponse
-        return RedirectResponse("/lock", status_code=307)
+        # Serve the lock screen INLINE with 200, never a redirect. The launcher's
+        # readiness probe polls GET / and accepts only HTTP 200; a 3xx here makes a
+        # healthy, locked portal read as "backend did not respond" and blocks every
+        # startup (and the Mode C guest-boot health check the same way).
+        return HTMLResponse(_lock_screen_html(), status_code=200)
     return await call_next(request)
+
+
+def _lock_screen_html() -> str:
+    """Passphrase page markup: unlock form for a provisioned stick, first-use
+    setup form otherwise.
+
+    Shared by the ``/lock`` route and :func:`enforce_lock_screen` so a locked
+    navigational request is answered with the page itself (HTTP 200), never a
+    redirect. The launcher's readiness probe polls ``GET /`` and treats anything
+    but 200 as "backend did not respond"; a 3xx here made a healthy, locked portal
+    look dead and blocked every startup.
+
+    The submit handler posts via fetch and reloads ``/`` on success, so the
+    operator lands in the unlocked portal instead of a raw JSON body, and sees the
+    server's error detail in place on failure.
+    """
+    if _stick_has_passphrase():
+        title = "KBB // C2 Knowledge Portal"
+        intro = "Enter passphrase to unlock the secured library."
+        action = "/api/unlock"
+        fields = (
+            '<input type="password" name="passphrase" placeholder="Passphrase" '
+            'required autofocus style="width:100%;padding:10px;margin:8px 0;font-size:1rem;">'
+        )
+        submit = "Unlock"
+    else:
+        title = "KBB // First-Time Setup"
+        intro = ("Create a passphrase to secure this drive. You will need it every "
+                 "time you launch.")
+        action = "/api/setup-passphrase"
+        fields = (
+            '<input type="password" name="passphrase" placeholder="Create passphrase '
+            '(min 8 chars)" required autofocus '
+            'style="width:100%;padding:10px;margin:8px 0;font-size:1rem;">'
+            '<input type="password" name="confirm" placeholder="Confirm passphrase" '
+            'required style="width:100%;padding:10px;margin:8px 0;font-size:1rem;">'
+        )
+        submit = "Set Passphrase &amp; Unlock"
+    return (
+        '<div style="max-width:400px;margin:80px auto;text-align:center;">'
+        f'<h1 style="margin-bottom:24px;">{title}</h1>'
+        f'<p>{intro}</p>'
+        f'<form method="POST" action="{action}" style="margin-top:16px;">'
+        f'{fields}'
+        '<button type="submit" style="width:100%;padding:10px;font-size:1rem;'
+        f'cursor:pointer;margin-top:8px;">{submit}</button>'
+        '</form>'
+        '<p id="lockmsg" role="alert" '
+        'style="color:#c00;min-height:1.2em;margin-top:12px;"></p>'
+        '</div>'
+        "<script>(function(){var f=document.querySelector('form');if(!f)return;"
+        "f.addEventListener('submit',function(e){e.preventDefault();"
+        "var d=new URLSearchParams(new FormData(f));"
+        "fetch(f.action,{method:'POST',body:d}).then(function(r){"
+        "if(r.ok){window.location.replace('/');return;}"
+        "return r.json().catch(function(){return{};}).then(function(j){"
+        "document.getElementById('lockmsg').textContent="
+        "(j&&j.detail)||('Error '+r.status);});"
+        "}).catch(function(){"
+        "document.getElementById('lockmsg').textContent='Network error';});"
+        "});})();</script>"
+    )
 
 
 @app.get("/lock", response_class=HTMLResponse)
 async def lock_screen() -> str:
     """The passphrase entry page (unlock or first-use setup)."""
-    if _stick_has_passphrase():
-        # Existing stick — unlock form
-        body = (
-            '<div style="max-width:400px;margin:80px auto;text-align:center;">'
-            '<h1 style="margin-bottom:24px;">KBB // C2 Knowledge Portal</h1>'
-            '<p>Enter passphrase to unlock the secured library.</p>'
-            '<form method="POST" action="/api/unlock" style="margin-top:16px;">'
-            '<input type="password" name="passphrase" placeholder="Passphrase" '
-            'required autofocus style="width:100%;padding:10px;margin:8px 0;font-size:1rem;">'
-            '<button type="submit" style="width:100%;padding:10px;font-size:1rem;'
-            'cursor:pointer;margin-top:8px;">Unlock</button>'
-            '</form></div>'
-        )
-    else:
-        # First use — create passphrase form
-        body = (
-            '<div style="max-width:400px;margin:80px auto;text-align:center;">'
-            '<h1 style="margin-bottom:24px;">KBB // First-Time Setup</h1>'
-            '<p>Create a passphrase to secure this drive. You will need it every time you launch.</p>'
-            '<form method="POST" action="/api/setup-passphrase" style="margin-top:16px;">'
-            '<input type="password" name="passphrase" placeholder="Create passphrase (min 8 chars)" '
-            'required style="width:100%;padding:10px;margin:8px 0;font-size:1rem;">'
-            '<input type="password" name="confirm" placeholder="Confirm passphrase" '
-            'required style="width:100%;padding:10px;margin:8px 0;font-size:1rem;">'
-            '<button type="submit" style="width:100%;padding:10px;font-size:1rem;'
-            'cursor:pointer;margin-top:8px;">Set Passphrase &amp; Unlock</button>'
-            '</form></div>'
-        )
-    return HTMLResponse(body)
+    return _lock_screen_html()
 
 
 @app.post("/api/setup-passphrase")
@@ -596,13 +639,16 @@ async def change_passphrase_endpoint(request: Request) -> Any:
         return JSONResponse({"detail": "No bucket configured"}, status_code=503)
 
     from . import pqc
-    # Verify the current passphrase by deriving and comparing with in-memory key
-    current_derived = pqc.unlock_stick(BUCKET.root, current)
-    if current_derived is None or (_CONTENT_KEY is not None and current_derived != _CONTENT_KEY):
+    # Authoritative check against the stored verification token -- not a comparison
+    # with the in-memory key, which is None before unlock and would let any current
+    # passphrase through. change_passphrase re-checks and raises on mismatch too.
+    if not pqc.verify_passphrase(BUCKET.root, current):
         return JSONResponse({"detail": "Current passphrase is incorrect"}, status_code=403)
 
-    # Change: new salt + new key
-    _CONTENT_KEY = pqc.change_passphrase(BUCKET.root, current, new_pw)
+    try:
+        _CONTENT_KEY = pqc.change_passphrase(BUCKET.root, current, new_pw)
+    except ValueError as exc:
+        return JSONResponse({"detail": str(exc)}, status_code=403)
     return JSONResponse({"detail": "Passphrase changed successfully"})
 
 
