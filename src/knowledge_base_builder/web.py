@@ -1662,6 +1662,20 @@ def _content_bytes(target: Path) -> bytes:
     return target.read_bytes()
 
 
+def _open_pdf(target: Path):
+    """Open a PDF with PyMuPDF, decrypting an at-rest file first. Raises 403 if the
+    file is encrypted and the portal is locked. Callers own doc.close()."""
+    import pymupdf
+
+    from . import at_rest
+    if at_rest.file_is_encrypted(target):
+        if _CONTENT_KEY is None:
+            raise HTTPException(status_code=403,
+                                detail="locked: unlock the portal to open encrypted content")
+        return pymupdf.open(stream=at_rest.read_decrypted(_CONTENT_KEY, target), filetype="pdf")
+    return pymupdf.open(str(target))
+
+
 def _content_file_response(target: Path, *, headers=None, media_type=None):
     """A FileResponse for a plaintext file, or a streaming decrypt for an at-rest
     one (memory stays flat -- chunks are decrypted as they are sent). Raises 403 if
@@ -1701,14 +1715,7 @@ async def pdf_page_image(
     if target.suffix.lower() != ".pdf":
         raise HTTPException(status_code=400, detail="Not a PDF file")
     try:
-        import pymupdf
-        from . import at_rest
-        if at_rest.file_is_encrypted(target):
-            # Encrypted-at-rest PDF: render from the decrypted bytes (raises 403 if
-            # the portal is locked) rather than mapping the ciphertext from disk.
-            doc = pymupdf.open(stream=_content_bytes(target), filetype="pdf")
-        else:
-            doc = pymupdf.open(str(target))
+        doc = _open_pdf(target)  # decrypts an at-rest PDF; 403 if locked
         if p >= len(doc):
             doc.close()
             raise HTTPException(status_code=404, detail=f"Page {p} does not exist")
@@ -3418,9 +3425,12 @@ async def read_document(
         # The browser receives only <img> tags — zero client-side PDF processing.
         # WebKitGTK (QEMU guest) freezes on ANY client-side PDF approach (raw
         # iframe, pdf.js viewer, embed/object). Server-side is the only fix.
+        #
+        # _open_pdf decrypts an at-rest PDF first: opening the ciphertext by path
+        # (the old code) made every encrypted PDF report 0 pages and fall back to a
+        # bare download link -- "the reader does not even display anymore".
         try:
-            import pymupdf
-            doc = pymupdf.open(str(target))
+            doc = _open_pdf(target)
             num_pages = len(doc)
             doc.close()
         except Exception:

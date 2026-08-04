@@ -93,6 +93,28 @@ def test_encrypted_pdf_renders_when_unlocked(bucket, key, monkeypatch):
     assert r.headers["content-type"] == "image/png"
 
 
+def test_encrypted_pdf_reader_shows_pages_not_download_fallback(bucket, key, monkeypatch):
+    """Regression: /read opened the PDF by path to count pages, which fails on an
+    at-rest file, so every encrypted PDF fell back to a bare download link ("the
+    reader does not even display anymore")."""
+    pytest.importorskip("pymupdf")
+    pypdf = pytest.importorskip("pypdf")
+    pdf = bucket / "book.pdf"
+    writer = pypdf.PdfWriter()
+    writer.add_blank_page(width=200, height=200)
+    writer.add_blank_page(width=200, height=200)
+    with open(pdf, "wb") as fh:
+        writer.write(fh)
+    at_rest.encrypt_file(key, pdf)
+
+    monkeypatch.setattr(web, "_CONTENT_KEY", key)
+    r = TestClient(web.content_app).get("/read?path=book.pdf", follow_redirects=False)
+    assert r.status_code == 200, r.text
+    body = r.text
+    assert "/pdf-page?path=" in body, "reader did not render server-side page images"
+    assert "2 pages" in body, "reader failed to count the encrypted PDF's pages"
+
+
 def test_encrypted_pdf_page_refused_when_locked(bucket, key, monkeypatch):
     pytest.importorskip("pymupdf")
     pypdf = pytest.importorskip("pypdf")
