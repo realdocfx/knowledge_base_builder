@@ -594,7 +594,7 @@ def _after_unlock() -> None:
     def _rebuild() -> None:
         try:
             if ArchiveIndex(root).needs_rebuild():
-                ArchiveIndex(root).rebuild()
+                ArchiveIndex(root).rebuild(content_key=key)
         except Exception:
             logger.exception("post-unlock index rebuild failed")
 
@@ -1367,7 +1367,11 @@ async def api_index_rebuild() -> Dict[str, Any]:
     root = BUCKET.root
     if ArchiveIndex(root).get_status().get("state") == "running":
         return {"started": False, "reason": "already running"}
-    threading.Thread(target=lambda: ArchiveIndex(root).rebuild(), daemon=True).start()
+    # Pass the content key so a rebuild extracts real body text from encrypted-at-rest
+    # media rather than indexing ciphertext.
+    key = _CONTENT_KEY
+    threading.Thread(target=lambda: ArchiveIndex(root).rebuild(content_key=key),
+                     daemon=True).start()
     return {"started": True}
 
 

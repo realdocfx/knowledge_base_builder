@@ -219,9 +219,20 @@ def test_ia_credentials_are_protected(tmp_path):
 
 def test_media_files_are_protected(tmp_path):
     for rel in ("101omelettes0000clau/101omelettes.pdf", "field_notes.epub",
-                "library/archive/book/scan.pdf"):
+                "library/archive/book/scan.pdf", "item/notes.txt", "item/scan.jpg",
+                "item/song.mp3", "item/clip.mp4", "item/page.html"):
         p = tmp_path / rel
         assert at_rest.should_protect(tmp_path, p) is True, rel
+
+
+def test_operational_debris_and_metadata_are_not_protected(tmp_path):
+    """A real bucket root holds the kiwix catalog, logs and stray code beside media;
+    the allowlist must leave all of it plaintext (encrypting catalog.xml breaks
+    serving)."""
+    for name in ("catalog.xml", "library.xml", "kiwix_all.log", "portal.err",
+                 "test_long.py", "launch_kbb", "item_meta.xml", "item_files.xml",
+                 "book.torrent", "notes"):
+        assert at_rest.should_protect(tmp_path, tmp_path / name) is False, name
 
 
 def test_sqlite_sidecars_are_not_protected(tmp_path):

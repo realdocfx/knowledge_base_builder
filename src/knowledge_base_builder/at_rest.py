@@ -97,6 +97,32 @@ _IA_DIR = ".ia_state"
 
 _ZIM_SLICE = re.compile(r"\.zim[a-z]{2}$")
 
+# Media is selected by an ALLOWLIST of content extensions, not "everything that
+# isn't excluded". A real bucket root also holds operational debris -- the kiwix
+# ``catalog.xml``, ``*.log``/``*.err`` traces, stray ``*.py`` -- and encrypting the
+# kiwix catalog would break serving. An allowlist fails safe: an unrecognised file
+# is left plaintext rather than risked. archive.org item metadata (``*.xml``,
+# ``*.torrent``) is deliberately not included: it is not collected material and some
+# of it is read before unlock.
+_MEDIA_EXTENSIONS = frozenset({
+    # documents / ebooks
+    ".pdf", ".epub", ".mobi", ".azw", ".azw3", ".djvu", ".djv", ".cbz", ".cbr",
+    ".txt", ".md", ".rtf", ".doc", ".docx", ".odt", ".ppt", ".pptx",
+    ".xls", ".xlsx", ".ods", ".csv",
+    # web/markup content inside items
+    ".html", ".htm", ".xhtml",
+    # images
+    ".jpg", ".jpeg", ".png", ".gif", ".webp", ".tif", ".tiff", ".bmp", ".svg",
+    # audio
+    ".mp3", ".m4a", ".m4b", ".flac", ".ogg", ".oga", ".opus", ".wav", ".aac",
+    # video
+    ".mp4", ".mkv", ".avi", ".webm", ".mov", ".m4v", ".mpg", ".mpeg",
+})
+
+# Never protected regardless of extension -- files the server/kiwix read before an
+# operator could unlock.
+_NEVER_PROTECT_NAMES = frozenset({"catalog.xml", "library.xml"})
+
 
 # ---------------------------------------------------------------------------
 # Chunked AEAD codec
@@ -311,20 +337,22 @@ def should_protect(root: Union[str, Path], path: Union[str, Path]) -> bool:
     name = parts[-1]
 
     # --- hard excludes (belt-and-suspenders) ---
-    if name in _CRYPTO_MATERIAL:
+    if name in _CRYPTO_MATERIAL or name.lower() in _NEVER_PROTECT_NAMES:
         return False
     if _is_zim(name):
         return False
     if parts[0] in _INFRA_TOP:
         return False
 
-    # --- includes ---
+    # --- state / credentials (by location, not extension) ---
     if parts[0] == _STATE_DIR:
         return name in _STATE_PROTECTED
     if parts[0] == _IA_DIR:
         return True
-    # Anything else under the bucket that survived the excludes is media content.
-    return True
+
+    # --- media: an allowlist of content extensions, so operational debris at the
+    #     bucket root (catalog.xml, *.log, *.py, ...) is never encrypted ---
+    return Path(name).suffix.lower() in _MEDIA_EXTENSIONS
 
 
 # ---------------------------------------------------------------------------

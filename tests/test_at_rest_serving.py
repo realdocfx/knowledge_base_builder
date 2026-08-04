@@ -124,6 +124,22 @@ def test_encrypted_epub_member_served_when_unlocked(bucket, key, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# The FTS index rebuild must decrypt encrypted media, never index ciphertext
+# ---------------------------------------------------------------------------
+def test_index_extraction_decrypts_encrypted_media_with_key(tmp_path, key):
+    from knowledge_base_builder.archive_index import _extract_content
+
+    p = tmp_path / "notes.txt"
+    p.write_bytes(b"the secret body text about permaculture design")
+    at_rest.encrypt_file(key, p)
+
+    # Without the key an encrypted file yields NO text (never index ciphertext).
+    assert _extract_content(p) == ""
+    # With the key, the real body text is recovered for indexing.
+    assert "permaculture" in _extract_content(p, key)
+
+
+# ---------------------------------------------------------------------------
 # /api/lock re-encrypts the live state and drops the key
 # ---------------------------------------------------------------------------
 def test_api_lock_reencrypts_live_state_and_locks(tmp_path, monkeypatch):

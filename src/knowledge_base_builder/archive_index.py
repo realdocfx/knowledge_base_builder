@@ -186,8 +186,7 @@ def _extract_text(path: Path) -> str:
     return text[:_MAX_CONTENT_CHARS]
 
 
-def _extract_content(path: Path) -> str:
-    ext = path.suffix.lower()
+def _extract_from(path: Path, ext: str) -> str:
     if ext in _PDF_EXT:
         return _extract_pdf(path)
     if ext in _EPUB_EXT:
@@ -195,6 +194,34 @@ def _extract_content(path: Path) -> str:
     if ext in _TEXT_EXT:
         return _extract_text(path)
     return ""
+
+
+def _extract_content(path: Path, key: Optional[bytes] = None) -> str:
+    """Extract indexable text. If the file is encrypted at rest and *key* is
+    supplied (a rebuild running while unlocked), decrypt it to a temp file first so
+    the index holds real body text rather than ciphertext; without a key an
+    encrypted file yields no text rather than garbage."""
+    ext = path.suffix.lower()
+    if ext not in _PDF_EXT and ext not in _EPUB_EXT and ext not in _TEXT_EXT:
+        return ""  # audio/video/images carry no body text -- never read/decrypt them
+
+    from . import at_rest
+    if not at_rest.file_is_encrypted(path):
+        return _extract_from(path, ext)
+    if key is None:
+        return ""
+    import tempfile
+    data = at_rest.read_decrypted(key, path)
+    tmp = tempfile.NamedTemporaryFile(suffix=ext, delete=False)
+    try:
+        tmp.write(data)
+        tmp.close()
+        return _extract_from(Path(tmp.name), ext)
+    finally:
+        try:
+            Path(tmp.name).unlink()
+        except OSError:
+            pass
 
 
 def _read_item_meta(item_dir: Path) -> Dict[str, List[str]]:
@@ -458,6 +485,7 @@ class ArchiveIndex:
         self,
         extract_content: bool = True,
         progress: Optional[Callable[[int, int, str], None]] = None,
+        content_key: Optional[bytes] = None,
     ) -> Dict[str, Any]:
         """Walk the bucket and rebuild the whole index atomically.
 
@@ -486,7 +514,7 @@ class ArchiveIndex:
 
                 batch = 0
                 for idx, (identifier, meta, f) in enumerate(items, start=1):
-                    content = _extract_content(f) if extract_content else ""
+                    content = _extract_content(f, content_key) if extract_content else ""
                     try:
                         size = f.stat().st_size
                     except OSError:
