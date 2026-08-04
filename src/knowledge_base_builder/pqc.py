@@ -376,10 +376,6 @@ def change_passphrase(
     if not salt_path.exists():
         raise ValueError("No passphrase configured on this stick")
 
-    # Verify the current passphrase produces the expected key
-    old_salt = salt_path.read_bytes()
-    # (Caller must compare the derived key with the in-memory key to verify)
-
     # Generate new salt and derive new key
     new_salt = generate_salt()
     new_key = derive_key_from_passphrase(new_passphrase, new_salt)
