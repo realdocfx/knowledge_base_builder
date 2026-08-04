@@ -853,10 +853,21 @@ cat > "$DISTRO/root/kbb/inner-setup.sh" <<'INNER'
 #!/bin/bash
 set -uo pipefail
 log() { echo "[KBB/debian] $*"; }
-# Force a working resolver. proot Debian often inherits an unreachable nameserver,
-# which makes apt fail with "Temporary failure resolving deb.debian.org".
-printf 'nameserver 8.8.8.8\nnameserver 1.1.1.1\n' > /etc/resolv.conf
 export DEBIAN_FRONTEND=noninteractive
+
+# DNS in proot must be made to work, and a VPN complicates it: a Tor VPN (Orbot)
+# routes everything through tun0 and Tor carries only TCP, so plain UDP DNS to
+# 8.8.8.8 is dropped ("Temporary failure resolving"). Try resolvers adaptively and
+# self-test: plain 8.8.8.8 (no VPN), the VPN's own gateway 198.18.0.2 (Orbot), then
+# TCP-forced public resolvers (use-vc -> Tor carries TCP).
+try_dns() { printf '%b' "$1"'\noptions timeout:3 attempts:1\n' > /etc/resolv.conf; \
+            getent hosts deb.debian.org >/dev/null 2>&1; }
+if   try_dns 'nameserver 8.8.8.8\n';               then log "DNS OK via 8.8.8.8 (UDP)"
+elif try_dns 'nameserver 198.18.0.2\n';            then log "DNS OK via 198.18.0.2 (VPN gateway)"
+elif try_dns 'nameserver 8.8.8.8\noptions use-vc'; then log "DNS OK via 8.8.8.8 (TCP)"
+elif try_dns 'nameserver 1.1.1.1\noptions use-vc'; then log "DNS OK via 1.1.1.1 (TCP)"
+else log "DNS FAILED with every method (VPN/Tor blocking?). Aborting."; exit 1; fi
+log "resolv.conf -> $(tr '\n' ' ' < /etc/resolv.conf)"
 
 log "apt-get update..."
 apt-get update || { log "apt-get update FAILED (network/DNS). Aborting."; exit 1; }
