@@ -822,44 +822,83 @@ def encrypt_at_rest(
 
 
 _TERMUX_SETUP_SH = r'''#!/data/data/com.termux/files/usr/bin/bash
-# KBB for Android (ARM64) -- Termux setup. Run this INSIDE Termux (from F-Droid).
+# KBB for Android (ARM64) -- Termux setup (robust). Run INSIDE Termux (from F-Droid).
 #
 # The stick's runtime is x86-64 and cannot execute on the phone. This installs a
 # small glibc Debian (aarch64) userland via proot-distro, then the KBB Python
-# package + kiwix-tools inside it. KBB is pure Python and cross-platform, so once
-# the ARM64 wheels for its native deps (cryptography/argon2/pymupdf/libzim) are
-# installed, the same portal runs. proot shares the network namespace, so a port
-# bound at 127.0.0.1 inside Debian is reachable from the phone browser.
-set -euo pipefail
+# package inside it. KBB is pure Python and cross-platform, so once the ARM64 wheels
+# for its native deps (cryptography/argon2/pymupdf/libzim) are installed, the same
+# portal runs. proot shares the network namespace, so a port bound at 127.0.0.1
+# inside Debian is reachable from the phone browser. kiwix-tools is fetched from
+# kiwix.org (it is NOT a Debian package) and is OPTIONAL: only the Wikipedia ZIM
+# needs it; the portal and the encrypted media work without it.
+set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
+log() { echo "[KBB] $*"; }
 
-echo "[KBB] Updating Termux + installing proot-distro..."
-pkg update -y && pkg install -y proot-distro
+log "Updating Termux + installing proot-distro..."
+pkg update -y || true
+pkg install -y proot-distro || { log "FAILED to install proot-distro"; exit 1; }
 
-echo "[KBB] Installing the Debian (aarch64) userland (first run only)..."
-proot-distro install debian 2>/dev/null || true
+log "Installing the Debian (aarch64) userland (first run only)..."
+proot-distro install debian 2>/dev/null || log "Debian already installed."
 
 DISTRO="$PREFIX/var/lib/proot-distro/installed-rootfs/debian"
 mkdir -p "$DISTRO/root/kbb"
 cp "$HERE"/*.whl "$DISTRO/root/kbb/" 2>/dev/null || true
 
-echo "[KBB] Provisioning KBB inside Debian (Python venv, kiwix-tools)..."
-proot-distro login debian -- bash -eu <<'INNER'
+# Write the in-Debian provisioning to a FILE and run it by path. A heredoc piped
+# through 'proot-distro login' does not run reliably; an explicit script does.
+cat > "$DISTRO/root/kbb/inner-setup.sh" <<'INNER'
+#!/bin/bash
+set -uo pipefail
+log() { echo "[KBB/debian] $*"; }
+# Force a working resolver. proot Debian often inherits an unreachable nameserver,
+# which makes apt fail with "Temporary failure resolving deb.debian.org".
+printf 'nameserver 8.8.8.8\nnameserver 1.1.1.1\n' > /etc/resolv.conf
 export DEBIAN_FRONTEND=noninteractive
-apt-get update
-apt-get install -y python3 python3-venv python3-pip kiwix-tools curl
+
+log "apt-get update..."
+apt-get update || { log "apt-get update FAILED (network/DNS). Aborting."; exit 1; }
+
+log "Installing python3 + tools (NOT kiwix -- Debian has no such package)..."
+apt-get install -y python3 python3-venv python3-pip curl ca-certificates xz-utils \
+  || { log "apt-get install FAILED"; exit 1; }
+
+log "Creating the KBB virtualenv..."
 python3 -m venv /opt/kbbenv
 /opt/kbbenv/bin/pip install --upgrade pip
 WHEEL="$(ls /root/kbb/*.whl 2>/dev/null | head -1 || true)"
 if [ -n "$WHEEL" ]; then
-  /opt/kbbenv/bin/pip install "${WHEEL}[web]"
+  log "pip install ${WHEEL}[web] ..."
+  /opt/kbbenv/bin/pip install "${WHEEL}[web]" || { log "pip install (wheel) FAILED"; exit 1; }
 else
-  /opt/kbbenv/bin/pip install "knowledge-base-builder[web]"
+  log "pip install knowledge-base-builder[web] (PyPI) ..."
+  /opt/kbbenv/bin/pip install "knowledge-base-builder[web]" || { log "pip install FAILED"; exit 1; }
 fi
-echo "[KBB] KBB installed in /opt/kbbenv."
+
+# kiwix-serve: static aarch64 build from kiwix.org. Non-fatal.
+KVER="${KIWIX_VERSION:-3.7.0}"
+KURL="${KIWIX_URL:-https://download.kiwix.org/release/kiwix-tools/kiwix-tools_linux-aarch64-${KVER}.tar.gz}"
+log "Fetching kiwix-tools: $KURL"
+if curl -fsSL -o /tmp/kiwix.tgz "$KURL" && tar -C /opt -xf /tmp/kiwix.tgz; then
+  KDIR="$(ls -d /opt/kiwix-tools_linux-aarch64-* 2>/dev/null | head -1)"
+  [ -n "$KDIR" ] && ln -sf "$KDIR/kiwix-serve" /usr/local/bin/kiwix-serve
+  log "kiwix-serve: $(command -v kiwix-serve || echo MISSING)"
+else
+  log "WARNING: kiwix-tools download failed. The portal + media still work; only the"
+  log "         Wikipedia ZIM will be unavailable. Re-run with KIWIX_VERSION=<v> to retry."
+fi
+
+log "DONE: KBB installed in /opt/kbbenv."
 INNER
 
-echo "[KBB] Setup complete. Start the portal with:  bash kbb-start.sh <content-dir>"
+log "Provisioning KBB inside Debian (several minutes)..."
+proot-distro login debian -- bash /root/kbb/inner-setup.sh
+rc=$?
+log "inner-setup exit code: $rc"
+[ "$rc" -eq 0 ] && log "Setup complete. Start with:  bash kbb-start.sh <content-dir>"
+exit "$rc"
 '''
 
 _KBB_START_SH = r'''#!/data/data/com.termux/files/usr/bin/bash
