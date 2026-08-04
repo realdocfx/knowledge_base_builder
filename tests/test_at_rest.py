@@ -232,6 +232,57 @@ def test_sqlite_sidecars_are_not_protected(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Chunked AEAD — boundaries, streaming, truncation/reorder detection
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("size", [0, 1, 15, 16, 17, 31, 32, 33, 48, 100])
+def test_chunked_round_trip_across_boundaries(key, size, monkeypatch):
+    monkeypatch.setattr(at_rest, "CHUNK_SIZE", 16)  # tiny chunks -> many boundaries
+    data = os.urandom(size)
+    assert at_rest.decrypt(key, at_rest.encrypt(key, data)) == data
+
+
+def test_truncating_the_final_chunk_is_detected(key, monkeypatch):
+    monkeypatch.setattr(at_rest, "CHUNK_SIZE", 16)
+    data = os.urandom(50)  # chunks of 16,16,16,2 -> last ciphertext is 2+16 = 18 B
+    blob = at_rest.encrypt(key, data)
+    with pytest.raises(Exception):
+        at_rest.decrypt(key, blob[:-18])  # drop the final chunk entirely
+
+
+def test_reordering_chunks_is_detected(key, monkeypatch):
+    monkeypatch.setattr(at_rest, "CHUNK_SIZE", 16)
+    data = os.urandom(48)  # exactly three full chunks
+    blob = bytearray(at_rest.encrypt(key, data))
+    h, enc = at_rest._HEADER_LEN, 16 + 16
+    blob[h:h + enc], blob[h + enc:h + 2 * enc] = (
+        blob[h + enc:h + 2 * enc], blob[h:h + enc])  # swap chunk 0 and 1
+    with pytest.raises(Exception):
+        at_rest.decrypt(key, bytes(blob))
+
+
+def test_decrypt_iter_streams_and_matches_read_decrypted(key, tmp_path, monkeypatch):
+    monkeypatch.setattr(at_rest, "CHUNK_SIZE", 16)
+    data = os.urandom(70)
+    p = tmp_path / "m.bin"
+    at_rest.write_encrypted(key, p, data)
+    assert b"".join(at_rest.decrypt_iter(key, p)) == data
+    assert at_rest.read_decrypted(key, p) == data
+    # It really is chunked on disk (more than one chunk of ciphertext + header).
+    assert p.stat().st_size > at_rest._HEADER_LEN + 16
+
+
+def test_large_multichunk_file_round_trips_on_disk(key, tmp_path, monkeypatch):
+    monkeypatch.setattr(at_rest, "CHUNK_SIZE", 1024)
+    data = os.urandom(1024 * 5 + 123)
+    p = tmp_path / "big.pdf"
+    p.write_bytes(data)
+    assert at_rest.encrypt_file(key, p) is True
+    assert at_rest.file_is_encrypted(p)
+    assert at_rest.decrypt_file(key, p) is True
+    assert p.read_bytes() == data
+
+
+# ---------------------------------------------------------------------------
 # Migration walker — encrypt/decrypt a whole tree, safely and resumably
 # ---------------------------------------------------------------------------
 @pytest.fixture()
@@ -339,3 +390,43 @@ def test_decrypt_migration_with_wrong_key_aborts_without_damage(bucket, key):
     assert report["processed"] == 0
     for p, data in snapshot.items():          # nothing decrypted, nothing damaged
         assert p.read_bytes() == data
+
+
+# ---------------------------------------------------------------------------
+# Live-state lifecycle: decrypt on unlock, re-encrypt on lock (index/audit/state)
+# ---------------------------------------------------------------------------
+def test_live_state_is_state_and_creds_only(bucket):
+    live = {p.relative_to(bucket).as_posix() for p in at_rest.iter_live_state_files(bucket)}
+    assert live == {
+        ".kb_state/sync_state.json",
+        ".kb_state/audit.log",
+        ".kb_state/archive_index.db",
+        ".ia_state/creds",
+    }
+
+
+def test_lock_then_unlock_live_state_round_trips_without_touching_media(bucket, key):
+    media = bucket / "book" / "scan.pdf"
+    media_bytes = media.read_bytes()
+    originals = {p: p.read_bytes() for p in at_rest.iter_live_state_files(bucket)}
+
+    lock = at_rest.lock_live_state(bucket, key)
+    assert lock["failed"] == 0
+    assert lock["processed"] == len(originals)
+    for p in originals:
+        assert at_rest.file_is_encrypted(p)
+    # Media is NOT part of the live set -- it stays plaintext here (it is encrypted
+    # by the migration and decrypted only when served).
+    assert media.read_bytes() == media_bytes
+    assert not at_rest.file_is_encrypted(media)
+
+    unlock = at_rest.unlock_live_state(bucket, key)
+    assert unlock["failed"] == 0
+    for p, data in originals.items():
+        assert p.read_bytes() == data
+        assert not at_rest.file_is_encrypted(p)
+
+
+def test_lock_live_state_is_idempotent(bucket, key):
+    at_rest.lock_live_state(bucket, key)
+    assert at_rest.lock_live_state(bucket, key)["processed"] == 0

@@ -724,6 +724,103 @@ def resplit(
         console.print(f"[bold green]{stem}: rewritten as {written} slices.[/bold green]")
 
 
+@app.command("encrypt-at-rest")
+def encrypt_at_rest(
+    path: str = typer.Argument(..., help="Path to the bucket/drive to (de)encrypt at rest"),
+    decrypt: bool = typer.Option(False, "--decrypt", help="Reverse: decrypt the at-rest files"),
+    dry_run: bool = typer.Option(False, "--dry-run",
+                                 help="Report what would change; write nothing (no passphrase needed)"),
+    passphrase: Optional[str] = typer.Option(None, "--passphrase",
+                                             help="Stick passphrase (omit to be prompted)"),
+    yes: bool = typer.Option(False, "--yes", help="Skip the confirmation prompt"),
+):
+    """Encrypt (or decrypt) the stick's protected files at rest (audit N24).
+
+    Protects downloaded media, ``.kb_state`` state (sync/index/audit) and
+    ``.ia_state`` credentials; never touches the ZIM archive, the boot files or the
+    crypto material. Every file is rewritten atomically and the pass is resumable, so
+    an interruption is always safe to re-run. ``--dry-run`` shows exactly what would
+    change and writes nothing.
+    """
+    from . import at_rest, pqc
+    from .state_paths import resolve_state_dir
+
+    root = Path(path).resolve()
+    lib = root / LIBRARY_DIR / ARCHIVE_SUBDIR
+    if not lib.is_dir():
+        lib = root / LIBRARY_DIR
+    if lib.is_dir():
+        root = lib
+    console.print(f"[cyan]Bucket:[/cyan] {root}")
+
+    files = list(at_rest.iter_protected_files(root))
+    if not files:
+        console.print("[yellow]No protected files found under this bucket.[/yellow]")
+        raise typer.Exit(0)
+    encrypted: List[Path] = []
+    plaintext: List[Path] = []
+    for f in files:
+        (encrypted if at_rest.file_is_encrypted(f) else plaintext).append(f)
+    action = "decrypt" if decrypt else "encrypt"
+    todo = encrypted if decrypt else plaintext
+
+    console.print(
+        f"[bold]{len(files)}[/bold] protected file(s): "
+        f"[green]{len(encrypted)} encrypted[/green], {len(plaintext)} plaintext. "
+        f"[bold]{len(todo)}[/bold] would be {action}ed."
+    )
+    for f in todo[:40]:
+        console.print(f"  {action}: {f.relative_to(root)}")
+    if len(todo) > 40:
+        console.print(f"  ... and {len(todo) - 40} more")
+
+    if dry_run:
+        console.print("[cyan]Dry run — nothing written.[/cyan]")
+        raise typer.Exit(0)
+    if not todo:
+        console.print("[green]Nothing to do.[/green]")
+        raise typer.Exit(0)
+
+    if not pqc.get_pqc_status().get("encryption_at_rest", False):
+        console.print("[red]Encryption backend (cryptography/argon2) not available.[/red]")
+        raise typer.Exit(1)
+    if not (resolve_state_dir(root) / pqc.CRYPTO_SALT_FILE).exists():
+        console.print("[red]No passphrase configured on this stick. Set one in the portal first.[/red]")
+        raise typer.Exit(1)
+
+    pw = passphrase or typer.prompt("Stick passphrase", hide_input=True)
+    if not pqc.verify_passphrase(root, pw):
+        console.print("[red]Incorrect passphrase.[/red]")
+        raise typer.Exit(1)
+    key = pqc.unlock_stick(root, pw)
+
+    if not yes:
+        typer.confirm(
+            f"About to {action} {len(todo)} file(s) in place on {root}. This rewrites "
+            "real content (reversibly, with this passphrase). Continue?",
+            abort=True,
+        )
+
+    migrate = at_rest.migrate_decrypt if decrypt else at_rest.migrate_encrypt
+    seen = {"n": 0}
+
+    def _tick(_path: Path, _changed: bool, rep: dict) -> None:
+        seen["n"] += 1
+        if seen["n"] % 20 == 0:
+            console.print(f"  ... {rep['processed']} {action}ed, {rep['skipped']} skipped")
+
+    report = migrate(root, key, progress=_tick)
+    console.print(
+        f"[green]Done[/green]: {report['processed']} {action}ed, "
+        f"{report['skipped']} already done, {report['failed']} failed "
+        f"({report['bytes'] / 1e6:.1f} MB)."
+    )
+    if report["errors"]:
+        for err in report["errors"][:10]:
+            console.print(f"  [red]{err}[/red]")
+        raise typer.Exit(1)
+
+
 @app.command()
 def portal(
     path: str = typer.Argument(..., help="Path to the bucket/drive to expose"),

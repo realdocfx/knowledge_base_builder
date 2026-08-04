@@ -8,6 +8,7 @@ Install the web extra: ``pip install -e .[web]``.
 """
 
 import html
+import io
 import json
 import logging
 import mimetypes
@@ -573,6 +574,70 @@ async def lock_screen() -> str:
     return _lock_screen_html()
 
 
+def _after_unlock() -> None:
+    """Bring the stick's live state online once the content key is set: decrypt the
+    in-place ``.kb_state``/``.ia_state`` files, then (re)build the search index in the
+    background now that the media it extracts text from can be read."""
+    if BUCKET is None or _CONTENT_KEY is None:
+        return
+    from . import at_rest
+
+    # Capture into locals: the background thread must not read the mutable globals,
+    # which a later lock (or, in tests, teardown) may have reset by the time it runs.
+    root = BUCKET.root
+    key = _CONTENT_KEY
+    try:
+        at_rest.unlock_live_state(root, key)
+    except Exception:
+        logger.exception("unlock_live_state failed")
+
+    def _rebuild() -> None:
+        try:
+            if ArchiveIndex(root).needs_rebuild():
+                ArchiveIndex(root).rebuild()
+        except Exception:
+            logger.exception("post-unlock index rebuild failed")
+
+    threading.Thread(target=_rebuild, daemon=True).start()
+
+
+@app.post("/api/lock")
+async def lock_portal() -> Any:
+    """Re-encrypt the live state and drop the in-memory key.
+
+    The portal returns to the lock screen and ``.kb_state``/``.ia_state`` are
+    encrypted at rest again. Media was never decrypted at rest (it is streamed
+    decrypted on serve), so nothing there changes.
+    """
+    global _CONTENT_KEY
+    if BUCKET is None:
+        return JSONResponse({"detail": "No bucket configured"}, status_code=503)
+    if _CONTENT_KEY is None:
+        return JSONResponse({"detail": "Already locked"})
+    from . import at_rest
+
+    try:
+        _checkpoint_state_wal(BUCKET.root)
+        at_rest.lock_live_state(BUCKET.root, _CONTENT_KEY)
+    except Exception:
+        logger.exception("lock_live_state failed")
+    _CONTENT_KEY = None
+    response = JSONResponse({"detail": "Portal locked"})
+    response.delete_cookie(AUTH_COOKIE, path="/")
+    return response
+
+
+def _checkpoint_state_wal(root: Path) -> None:
+    """Fold any SQLite WAL back into the index db before it is encrypted, so the
+    encrypted file is self-contained (the -wal/-shm sidecars are not protected)."""
+    try:
+        from .cloning import _checkpoint_sqlite_wal
+        from .state_paths import resolve_state_dir
+        _checkpoint_sqlite_wal(resolve_state_dir(root))
+    except Exception:
+        logger.exception("WAL checkpoint before lock failed")
+
+
 @app.post("/api/setup-passphrase")
 async def setup_passphrase(request: Request) -> Any:
     """First-use: create a passphrase, derive AES key, store salt."""
@@ -591,6 +656,7 @@ async def setup_passphrase(request: Request) -> Any:
 
     from . import pqc
     _CONTENT_KEY = pqc.setup_stick_encryption(BUCKET.root, pw)
+    _after_unlock()
 
     response = JSONResponse({"detail": "Passphrase set and portal unlocked"})
     response.set_cookie(AUTH_COOKIE, get_auth_token(), httponly=True, samesite="strict", path="/")
@@ -613,6 +679,7 @@ async def unlock_portal(request: Request) -> Any:
         return JSONResponse({"detail": "Incorrect passphrase"}, status_code=403)
 
     _CONTENT_KEY = pqc.unlock_stick(BUCKET.root, pw)
+    _after_unlock()
 
     response = JSONResponse({"detail": "Portal unlocked"})
     response.set_cookie(AUTH_COOKIE, get_auth_token(), httponly=True, samesite="strict", path="/")
@@ -1025,8 +1092,13 @@ async def lifespan(_app: FastAPI):
         # Only NOW build the search index. Running it during boot saturated the
         # drive's I/O and starved both kiwix and the telemetry endpoints, which is
         # what made the console sit at "Initializing…" for minutes.
+        #
+        # And only while UNLOCKED: on an encrypted stick the index db and the media
+        # it extracts text from are ciphertext at rest, so a rebuild here (locked,
+        # no content key) would fail to open the index and would index ciphertext.
+        # The unlock path (_after_unlock) triggers the rebuild once the key is set.
         try:
-            if ArchiveIndex(root).needs_rebuild():
+            if not _portal_is_locked() and ArchiveIndex(root).needs_rebuild():
                 ArchiveIndex(root).rebuild()
         except Exception:
             logger.exception("Background index rebuild failed")
@@ -1570,6 +1642,38 @@ async def wiki_proxy(request: Request, path: str) -> Response:
     )
 
 
+# ---------------------------------------------------------------------------
+# Data-at-rest: transparent decrypt on serve (audit N24)
+# ---------------------------------------------------------------------------
+def _content_bytes(target: Path) -> bytes:
+    """Plaintext bytes of a content file, decrypting an at-rest file with the
+    in-memory content key. Raises 403 if it is encrypted but the portal is locked."""
+    from . import at_rest
+
+    if at_rest.file_is_encrypted(target):
+        if _CONTENT_KEY is None:
+            raise HTTPException(status_code=403,
+                                detail="locked: unlock the portal to open encrypted content")
+        return at_rest.read_decrypted(_CONTENT_KEY, target)
+    return target.read_bytes()
+
+
+def _content_file_response(target: Path, *, headers=None, media_type=None):
+    """A FileResponse for a plaintext file, or a streaming decrypt for an at-rest
+    one (memory stays flat -- chunks are decrypted as they are sent). Raises 403 if
+    the file is encrypted and the portal is locked."""
+    from . import at_rest
+
+    if at_rest.file_is_encrypted(target):
+        if _CONTENT_KEY is None:
+            raise HTTPException(status_code=403,
+                                detail="locked: unlock the portal to view encrypted content")
+        mt = media_type or mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+        return StreamingResponse(at_rest.decrypt_iter(_CONTENT_KEY, target),
+                                 media_type=mt, headers=headers)
+    return FileResponse(target, media_type=media_type, headers=headers)
+
+
 @content_app.get("/pdf-page")
 async def pdf_page_image(
     path: str = Query(..., description="Bucket-relative path to the PDF"),
@@ -1594,7 +1698,13 @@ async def pdf_page_image(
         raise HTTPException(status_code=400, detail="Not a PDF file")
     try:
         import pymupdf
-        doc = pymupdf.open(str(target))
+        from . import at_rest
+        if at_rest.file_is_encrypted(target):
+            # Encrypted-at-rest PDF: render from the decrypted bytes (raises 403 if
+            # the portal is locked) rather than mapping the ciphertext from disk.
+            doc = pymupdf.open(stream=_content_bytes(target), filetype="pdf")
+        else:
+            doc = pymupdf.open(str(target))
         if p >= len(doc):
             doc.close()
             raise HTTPException(status_code=404, detail=f"Page {p} does not exist")
@@ -1684,7 +1794,10 @@ async def static_files(path: str) -> Any:
         "media-src 'self' blob:; style-src 'unsafe-inline'; "
         "frame-ancestors http://127.0.0.1:* http://localhost:*"
     )
-    return FileResponse(
+    # Transparent decrypt-on-serve: an at-rest media file is streamed decrypted
+    # (chunk by chunk) when the portal is unlocked, and refused (403) when locked.
+    # A plaintext (un-migrated) file serves exactly as before.
+    return _content_file_response(
         target,
         headers={
             "Content-Disposition": f'{disposition}; filename="{target.name}"',
@@ -3447,8 +3560,13 @@ async def epub_resource(path: str) -> Response:
     internal = posixpath.normpath(internal).lstrip("/")
     if internal.startswith(".."):
         raise HTTPException(status_code=403, detail="Forbidden")
+    from . import at_rest
+    # An encrypted-at-rest EPUB is decrypted into memory (raises 403 if locked) and
+    # the zip is read from there; a plaintext EPUB is opened from disk as before.
+    zf_source: Any = io.BytesIO(_content_bytes(epub_abs)) \
+        if at_rest.file_is_encrypted(epub_abs) else epub_abs
     try:
-        with zipfile.ZipFile(epub_abs, "r") as zf:
+        with zipfile.ZipFile(zf_source, "r") as zf:
             data = zf.read(internal)
     except (KeyError, zipfile.BadZipFile):
         raise HTTPException(status_code=404, detail="Resource not found in EPUB")
