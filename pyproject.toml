@@ -57,6 +57,10 @@ web = [
     "fastapi>=0.100.0",
     "uvicorn[standard]>=0.23.0",
     "httpx>=0.24.0",
+    "python-multipart>=0.0.6",  # FastAPI form parsing for the lock-screen POSTs
+                                # (setup-passphrase / unlock / change-passphrase).
+                                # Was only in CI deps; a clean `[web]` install on the
+                                # phone had no form parser and every unlock 500'd.
     "pymupdf>=1.24.0",  # server-side PDF-to-PNG rendering (WebKitGTK freezes
                         # on any client-side approach; PyMuPDF renders pages as
                         # images the browser displays as plain <img> tags)

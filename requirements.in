@@ -9,6 +9,7 @@ libzim==3.11.0
 fastapi==0.139.2
 uvicorn[standard]==0.51.0
 httpx==0.28.1
+python-multipart==0.0.20  # FastAPI form parsing for the lock-screen POSTs
 # Note: xapian-bindings is provisioned via custom wheel, not from PyPI
 
 # Content rendering + sandbox provisioning (audit P4: these are declared in
