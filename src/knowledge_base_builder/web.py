@@ -460,8 +460,20 @@ def _stick_has_passphrase() -> bool:
 
 
 def _portal_is_locked() -> bool:
-    """True if the portal should show the lock screen."""
-    return _stick_has_passphrase() and _CONTENT_KEY is None
+    """True if the portal should show the lock screen.
+
+    Two cases:
+    1. Fresh stick (no salt) → force first-login passphrase setup (mandatory)
+    2. Existing stick (salt exists, key not derived) → force unlock
+    Both gate the portal until the operator authenticates.
+    If _CONTENT_KEY is already set (programmatic unlock), the portal is open.
+    """
+    if BUCKET is None:
+        return False
+    if _CONTENT_KEY is not None:
+        return False
+    # No salt = first use OR salt exists but key not derived = locked
+    return True
 
 
 _LOCK_EXEMPT_PATHS = frozenset({
@@ -473,6 +485,10 @@ _LOCK_EXEMPT_PATHS = frozenset({
 async def enforce_lock_screen(request: Request, call_next):
     """Gate access when the portal is locked (passphrase not yet entered)."""
     if _portal_is_locked() and request.url.path not in _LOCK_EXEMPT_PATHS:
+        # Sandbox assets are fetched by the QEMU guest at boot (no human to
+        # enter a passphrase), so they bypass the lock like they bypass auth.
+        if SANDBOX_ASSETS and request.url.path.startswith(_SANDBOX_PREFIX):
+            return await call_next(request)
         if request.url.path.startswith("/api/"):
             return JSONResponse({"detail": "portal locked"}, status_code=401)
         from starlette.responses import RedirectResponse

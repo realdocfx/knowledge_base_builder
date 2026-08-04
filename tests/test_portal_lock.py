@@ -286,14 +286,19 @@ class TestCloneIsolation:
 
 
 # ---------------------------------------------------------------------------
-# Backward compatibility
+# Mandatory first-login
 # ---------------------------------------------------------------------------
-class TestBackwardCompat:
-    def test_no_salt_file_portal_runs_unlocked(self, unencrypted_stick):
-        """A stick with no encryption must NOT show a lock screen."""
+class TestMandatoryFirstLogin:
+    def test_fresh_stick_redirects_to_lock(self, fresh_stick):
+        """A fresh stick (no salt) MUST redirect to the lock screen for setup."""
+        r = TestClient(web.app).get("/", follow_redirects=False)
+        assert r.status_code in (200, 302, 307), r.status_code
+        if r.status_code in (302, 307):
+            assert "/lock" in r.headers.get("location", "")
+
+    def test_fresh_stick_api_returns_401(self, fresh_stick):
+        """A fresh stick gates API access until passphrase is set."""
         r = TestClient(web.app).get("/api/stats")
-        # Should work without any passphrase (backward compat)
-        # The existing auth token mechanism still applies, but no lock screen
-        assert r.status_code != 403 or "lock" not in r.text.lower(), (
-            "unencrypted stick shows a lock screen"
+        assert r.status_code == 401, (
+            f"fresh stick served API without passphrase setup: {r.status_code}"
         )

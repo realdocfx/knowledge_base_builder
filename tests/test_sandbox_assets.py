@@ -41,6 +41,9 @@ def stick(tmp_path, monkeypatch):
     (apks / "APKINDEX.tar.gz").write_bytes(b"\x1f\x8b index")
     (tmp_path / "secret.txt").write_text("operator data")
     monkeypatch.setattr(web, "BUCKET", bucket)
+    # Bypass the mandatory lock screen — these tests verify sandbox auth, not
+    # the passphrase gate. A dummy key makes _portal_is_locked() return False.
+    monkeypatch.setattr(web, "_CONTENT_KEY", b"\x00" * 32)
     return tmp_path
 
 
