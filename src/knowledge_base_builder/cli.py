@@ -914,9 +914,11 @@ exit "$rc"
 
 _KBB_START_SH = r'''#!/data/data/com.termux/files/usr/bin/bash
 # Start the KBB portal on the phone. Pass the content directory (holding the ZIMs,
-# the encrypted media, and .kb_state/ with the crypto tokens). Default: ~/kbb-content.
+# the encrypted media, and .kb_state/ with the crypto tokens). Default: the shared
+# storage bucket -- NOT $HOME/kbb-content, which is empty and would make the portal
+# show a fresh first-run "create passphrase" screen instead of unlocking the library.
 set -euo pipefail
-CONTENT="${1:-$HOME/kbb-content}"
+CONTENT="${1:-/storage/emulated/0/kbb-content}"
 
 # kiwix-serve reads a single .zim; the library ships split slices (.zimaa...), so
 # reassemble any that are not yet joined. NOTE: this transiently needs ~2x the ZIM
