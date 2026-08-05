@@ -5129,6 +5129,39 @@
           "content": "71c6c3bb88a9d621d9be1fbb6609f61f0bc74de04c75d8a549dea28b81823b8a"
         }
       ]
+    },
+    {
+      "bom-ref": "python-multipart==0.0.20",
+      "description": "A streaming multipart parser for Python",
+      "externalReferences": [
+        {
+          "comment": "from packaging metadata Project-URL: Homepage",
+          "type": "website",
+          "url": "https://github.com/Kludex/python-multipart"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "acknowledgement": "declared",
+            "id": "Apache-2.0"
+          }
+        }
+      ],
+      "name": "python-multipart",
+      "purl": "pkg:pypi/python-multipart@0.0.20",
+      "type": "library",
+      "version": "0.0.20",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "8a62d3a8335e06589fe01f2a3e178cdcc632f3fbe0d492ad9ee0ec35aab1f104"
+        },
+        {
+          "alg": "SHA-256",
+          "content": "8dd0cab45b8e23064ae09147625994d090fa46f5b0d1e13af944c331a7fa9d13"
+        }
+      ]
     }
   ],
   "dependencies": [
@@ -5343,7 +5376,8 @@
         "requests==2.34.2",
         "rich==15.0.0",
         "typer==0.27.1",
-        "uvicorn==0.52.1"
+        "uvicorn==0.52.1",
+        "python-multipart==0.0.20"
       ],
       "ref": "root-component"
     },
@@ -5408,6 +5442,10 @@
     },
     {
       "ref": "websockets==17.0.1"
+    },
+    {
+      "ref": "python-multipart==0.0.20",
+      "dependsOn": []
     }
   ],
   "metadata": {
