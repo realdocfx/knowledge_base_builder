@@ -917,8 +917,15 @@ _KBB_START_SH = r'''#!/data/data/com.termux/files/usr/bin/bash
 # the encrypted media, and .kb_state/ with the crypto tokens). Default: the shared
 # storage bucket -- NOT $HOME/kbb-content, which is empty and would make the portal
 # show a fresh first-run "create passphrase" screen instead of unlocking the library.
-set -euo pipefail
+set -uo pipefail
 CONTENT="${1:-/storage/emulated/0/kbb-content}"
+
+# Idempotent: stop any portal already running so repeated launches (e.g. the app
+# firing RUN_COMMAND more than once, or a reopen) cannot race for port 8080 and
+# crash-loop. This runs in native Termux, so it kills the OLD proot portal, not us.
+pkill -f 'kb-builder portal' 2>/dev/null || true
+pkill -9 -f 'proot.*debian' 2>/dev/null || true
+sleep 1
 
 # kiwix-serve reads a single .zim; the library ships split slices (.zimaa...), so
 # reassemble any that are not yet joined. NOTE: this transiently needs ~2x the ZIM
