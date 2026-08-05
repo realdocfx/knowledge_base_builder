@@ -88,10 +88,18 @@ builds without the NDK. This machine has no Android toolchain, so it is built in
   adb install -r app-debug.apk
   ```
 
-Start the portal in Termux first (`bash kbb-start.sh …`), then open **KBB Portal** — it
-waits for the backend, then shows the portal full-screen. (On-device behaviour is not
-verifiable from the build host; the WebView shell is deliberately minimal so it is easy
-to adjust.)
+Open **KBB Portal** and it **starts the backend for you** — it probes
+`127.0.0.1:8080` and, if nothing is serving, asks Termux to run `kbb-start.sh` (at the
+correct `/storage/emulated/0/kbb-content` bucket) via the `RUN_COMMAND` intent, then
+loads the portal full-screen. That needs a **one-time** Termux flag; in Termux run:
+
+```bash
+mkdir -p ~/.termux && echo 'allow-external-apps=true' >> ~/.termux/termux.properties && termux-reload-settings
+```
+
+If that flag is off (or Termux is missing), the app instead shows a **"Copy start
+command"** button (paste it into Termux) and an **"Open Termux"** button — so it never
+strands you at a blank screen. Either way, no manual `kb-builder` typing is needed.
 
 ## Notes
 
