@@ -5,6 +5,7 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.view.Gravity
@@ -17,6 +18,8 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
 import java.net.HttpURLConnection
 import java.net.URL
 import kotlin.concurrent.thread
@@ -55,10 +58,37 @@ class MainActivity : AppCompatActivity() {
             }
         })
 
+        // Termux's RUN_COMMAND is a *dangerous* permission (installs granted=false) and
+        // its RunCommandService is permission-protected, so firing the auto-start intent
+        // without the grant throws SecurityException. Ask for it once, up front; the
+        // grant callback continues into the same start flow. If denied, startFlow() still
+        // runs -- probe fails, the intent is skipped, and the manual buttons remain.
+        if (hasRunCommandPermission()) {
+            startFlow()
+        } else {
+            ActivityCompat.requestPermissions(this, arrayOf(RUN_COMMAND_PERMISSION), REQ_RUN_COMMAND)
+        }
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray,
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == REQ_RUN_COMMAND) startFlow()
+    }
+
+    private fun hasRunCommandPermission(): Boolean =
+        ContextCompat.checkSelfPermission(this, RUN_COMMAND_PERMISSION) ==
+            PackageManager.PERMISSION_GRANTED
+
+    private fun startFlow() {
         thread {
             // Start the backend only if it is not already serving (avoid two portals
-            // racing for the port).
-            if (!probe()) tryStartBackendViaTermux()
+            // racing for the port), and only bother Termux if we actually hold the
+            // permission (otherwise the intent would just SecurityException).
+            if (!probe() && hasRunCommandPermission()) tryStartBackendViaTermux()
             var ok = false
             var tries = 0
             while (!ok && tries < 240) {          // up to ~120 s
@@ -152,5 +182,10 @@ class MainActivity : AppCompatActivity() {
         setContentView(wv)
         wv.loadUrl(portalUrl)
         webView = wv
+    }
+
+    private companion object {
+        const val RUN_COMMAND_PERMISSION = "com.termux.permission.RUN_COMMAND"
+        const val REQ_RUN_COMMAND = 1001
     }
 }

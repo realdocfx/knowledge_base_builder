@@ -91,13 +91,25 @@ builds without the NDK. This machine has no Android toolchain, so it is built in
 Open **KBB Portal** and it **starts the backend for you** — it probes
 `127.0.0.1:8080` and, if nothing is serving, asks Termux to run `kbb-start.sh` (at the
 correct `/storage/emulated/0/kbb-content` bucket) via the `RUN_COMMAND` intent, then
-loads the portal full-screen. That needs a **one-time** Termux flag; in Termux run:
+loads the portal full-screen. Two **one-time** grants make this work:
 
-```bash
-mkdir -p ~/.termux && echo 'allow-external-apps=true' >> ~/.termux/termux.properties && termux-reload-settings
-```
+1. **On first launch the app asks for "Run commands in Termux" — tap Allow.** Termux
+   declares `RUN_COMMAND` as a *dangerous* permission, so it is not granted at install;
+   the app requests it at runtime. Without it the auto-start intent is blocked
+   (`SecurityException`) and you'd be stuck on the buttons. If you dismissed the dialog,
+   grant it in **Settings → Apps → KBB Portal → Permissions**, or over adb:
 
-If that flag is off (or Termux is missing), the app instead shows a **"Copy start
+   ```bash
+   adb shell pm grant org.kbb.portal com.termux.permission.RUN_COMMAND
+   ```
+
+2. **The Termux side must allow external apps** (one-time); in Termux run:
+
+   ```bash
+   mkdir -p ~/.termux && echo 'allow-external-apps=true' >> ~/.termux/termux.properties && termux-reload-settings
+   ```
+
+If the permission is denied or Termux is missing, the app instead shows a **"Copy start
 command"** button (paste it into Termux) and an **"Open Termux"** button — so it never
 strands you at a blank screen. Either way, no manual `kb-builder` typing is needed.
 
